@@ -10,9 +10,10 @@ import (
 // 通过类型断言捕获可选的 Queue/ZSet 能力。对未实现的能力返回 ErrUnsupported，
 // 调用方可用 Capabilities 提前探测，或直接类型断言底层 KvProvider 使用能力接口。
 type DB struct {
-	p core.KvProvider
-	q core.QueueProvider
-	z core.ZSetProvider
+	p     core.KvProvider
+	q     core.QueueProvider
+	z     core.ZSetProvider
+	batch core.BatchProvider
 }
 
 // Wrap 将任意 KvProvider 包装为适配器 DB；可选能力在构造时一次性探测。
@@ -20,12 +21,13 @@ func Wrap(p core.KvProvider) *DB {
 	db := &DB{p: p}
 	db.q, _ = p.(core.QueueProvider)
 	db.z, _ = p.(core.ZSetProvider)
+	db.batch, _ = p.(core.BatchProvider)
 	return db
 }
 
-// Capabilities 报告底层基座是否实现了 queue / zset 可选能力。
-func (db *DB) Capabilities() (hasQueue, hasZSet bool) {
-	return db.q != nil, db.z != nil
+// Capabilities 报告底层基座是否实现了 queue / zset / batch 可选能力。
+func (db *DB) Capabilities() (hasQueue, hasZSet, hasBatch bool) {
+	return db.q != nil, db.z != nil, db.batch != nil
 }
 
 // KvProvider 返回底层基座，便于使用能力接口做类型断言。

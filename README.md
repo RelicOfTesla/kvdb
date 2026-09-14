@@ -18,7 +18,31 @@
 | PostgreSQL | `kvdb/pg` | ✅ | ✅ | ✅ | 共享 `kvdb/sqlstore` 实现 |
 
 想要更多数据结构的组合在接口层就绪：`KvProvider`（KV）之上增加
-`QueueProvider` / `ZSetProvider` 可选能力接口，消费者用类型断言或适配器接入。
+`QueueProvider` / `ZSetProvider` / `BatchProvider` 可选能力接口，消费者用类型断言
+或适配器接入；集齐全部能力与生命周期的基座可整体声明 `FullProvider`
+（KvProvider + QueueProvider + ZSetProvider + BatchProvider + Closer）。
+
+### 批量写（BatchProvider）
+
+设计为「共享收集器 + 基座只实现提交」：根包的 `kvdb.Batch` 负责收集，
+基座只实现 `ApplyBatch(ctx, ops)`——收集逻辑只写一遍，各基座把整批映射到自己的
+原生机制（SQL=一个事务、Redis=一次 MULTI/EXEC、SSDB=一次流水线、jsonl=一次
+flush、mem=单次持锁）。
+
+```go
+err := db.Batch(ctx, func(b *kvdb.Batch) error {
+    b.Set("k", value)
+    b.QPush("jobs", payload)
+    b.ZIncr("rank", "alice", 1)
+    return nil          // 返回 nil 才提交；返回错误或收集期校验失败则整批不生效
+})
+```
+
+- 批内只允许**无条件写**（Set/SetEx/Del/Expire/QPush/QPushFront/ZSet/ZDel/ZIncr）；
+  `Incr`/`QPop` 依赖键的当前状态、需先校验再提交，混入会破坏「整批原子」，故需单独调用；
+- 原子性：mysql/sqlite/pg（事务）、redis（MULTI/EXEC）、mem/jsonl（进程内原子）
+  保证提交失败时整批不生效；**SSDB 无事务**，流水线失败可能部分生效（其价值在减少往返）；
+- `DB.Capabilities()` 现返回 `(hasQueue, hasZSet, hasBatch)`。
 
 ### 基座接入：注册表默认空，按需 import
 
@@ -100,6 +124,10 @@ SSDB 认证（对应 `ssdb.conf` 的 `server.auth`，密码须 >=32 字符）：
 整数编码为十进制，与 `Incr` 互操作——`B(int64)` 写入、`Incr` 累加、
 `D[int64]` 读回全链路自洽）：
 
+写路径的持久性语义：单条操作返回成功时记录已 Flush 交给 OS（`sync=1` 时已 fsync；
+崩溃只可能丢"尚未返回成功"的写）；jsonl 遵循 **WAL 顺序**——先写日志、再改内存，
+写日志失败时内存不变，因此内存与日志始终一致（重启回放不会回退已报错的操作）。
+
 ```go
 // 1) 写路径内联编码：Set(x, B(v), ...)
 db.Set(ctx, "n", kvdb.B(int64(42)))
@@ -150,7 +178,7 @@ string、bool、`[]byte`（恒等）。`P[T]` 是单值解码；`D` 额外合并
 | Redis 无字节序范围扫描 | redis 基座全量 SCAN 游标 + 客户端过滤排序，**代价与 keyspace 大小相关** |
 | SQL 过期行 | 读取路径过滤；Open 时批量清理一次。长期运行可自行按 `expire_at` 清理 |
 | SQL 并发 | MySQL/PG 用行锁+幂等占位（Incr 事务）；PG/SQLite 的 QPush 用 `UPDATE ... RETURNING` 单语句分配序号（MySQL 走多语句兼容路径）；SQLite 内存库单连接、文件库多连接 + `_txlock=immediate` 写串行 |
-| JSONL | 单进程内嵌；日志增长需定期 `Compact()`；崩溃尾部半行容错回放；打开时流式回放（内存峰值限单行） |
+| JSONL | 单进程内嵌；日志增长需定期 `Compact()`；崩溃尾部半行容错回放；打开时流式回放（内存峰值限单行）；写路径为 WAL（日志先行，失败则内存不变）；支持显式批写 |
 | SSDB 连接 | 连接池（默认 8，`Config.PoolSize` 可调）：每操作借还连接，池满阻塞等待；单连接时代并发无提升 |
 
 ## 扩展：自定义持久化基座
@@ -214,13 +242,35 @@ SQL 基座的写入瓶颈是**每事务一次的持久化 fsync**（InnoDB redo 
 | 场景 | 量级 | 说明 |
 |---|---|---|
 | InnoDB / PG 并发写·多 key | 700-2,200 op/s | **组提交**自动合并 fsync，连接池越大越快（默认 32） |
+| 批量写（每 100 条一次提交） | 见下表 | 整批一次提交，摊薄 fsync 与往返 |
 | InnoDB / PG 单 key 计数器 | 90-160 / 240-512 op/s | 行锁串行 + 每次提交 fsync |
 | MyISAM（无事务） | ~2× InnoDB | 破坏原子性，不采用 |
 | SSDB / Redis 基座 | 3,500-11,000 op/s | 高频写请用这两个基座 |
 
+jsonl 支持**显式批写**（`NewBatch`/`Commit`/`WriteBatch`）：一批操作合并为一次
+`Write`+`Flush`（Sync 模式一次 fsync），提交失败则整批不生效。实测每 100 条提交
+一次：tmpfs 1.8×（18万→33万 op/s），真实盘 **86×**（1,498→129,390 op/s）——
+系统调用开销在真实存储上占绝对主导。批内仅提供无条件操作（Set/SetEx/Del/Expire/
+QPush/QPushFront/ZSet/ZDel/ZIncr）；`Incr`/`QPop` 依赖当前状态、需先校验再写日志，
+混入会破坏整批原子性，故需单独调用。
+
 jsonl 的写吞吐取决于文件系统介质：WSL 挂载盘(drvfs)实测约 1.5-2k op/s，
 WSL 原生盘/ext4 约 20 万 op/s（内部封装 mem，读路径与 mem 同级；写差距是
 每 op 一次文件追加的 WAL 固有成本）。JSONL 适合低频/中等写入的进程内持久化。
+
+批量写实测收益（1000 次 Set，每 100 条提交一次）：
+
+| 基座 | 逐条 | 批写 100 | 提升 |
+|---|---|---|---|
+| MySQL | 130 op/s | 793 op/s | 6.1× |
+| PostgreSQL | 521 op/s | 1,715 op/s | 3.3× |
+| SQLite | 124 op/s | 6,167 op/s | 49.7× |
+| JSONL | 1,764 op/s | 117,052 op/s | 66.4× |
+| Redis | 2,329 op/s | 88,027 op/s | 37.8× |
+| SSDB | 612 op/s | 3,979 op/s | 6.5× |
+
+（SQL 批内仍是逐条语句、往返未减少，故提升小于 Redis/jsonl；后续可把连续 Set
+合并为多行 INSERT 进一步减少往返。）
 
 已落地优化：
 - **连接池**：mysql/pg 默认 `SetMaxOpenConns(32)`，多 key 并发写吃满组提交；
@@ -277,6 +327,7 @@ CGO/gcc/交叉编译成本而无性能损失——SDK 不引入 CGO 依赖。
 ```
 kvdb/                   根包：DB 适配器 + Open/Register 注册表（默认空）+ 契约再导出
 all/                    聚合注册包：import _ 即接入全部内置基座
+batch.go                批量写共享收集器 + DB.Batch 分发
 bytes.go                字节 <-> T 泛型辅助（B/P/D/DMust）
 core/                   契约：KvProvider/FullProvider/Queue/ZSet/Closer/哨兵错误/常量
 mem|jsonl|ssdb|redis|mysql|sqlite|pg/   各基座实现与测试

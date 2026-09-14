@@ -462,3 +462,76 @@ func normalizeLimit(limit int) int {
 	}
 	return limit
 }
+
+// ---- Batch ----
+
+// ApplyBatch 实现 core.BatchProvider：整批命令用一次 MULTI/EXEC（TxPipeline）
+// 发出，N 次往返压缩为 1 次。Redis 的 EXEC 不因单条命令运行时错误回滚
+// （命令级语义），但本基座的批操作均为无条件写，正常路径下不会失败；
+// 网络/协议错误则整批不返回成功，调用方可按失败处理。
+func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
+	if err := p.check(); err != nil {
+		return err
+	}
+	if len(ops) == 0 {
+		return nil
+	}
+	for _, op := range ops {
+		switch op.Kind {
+		case core.BatchSetEx, core.BatchExpire:
+			if op.TTL <= 0 {
+				return core.ErrInvalidTTL
+			}
+		}
+	}
+
+	_, err := p.rd.TxPipelined(ctx, func(pipe goredis.Pipeliner) error {
+		for _, op := range ops {
+			switch op.Kind {
+			case core.BatchSet:
+				if err := pipe.Set(ctx, op.Key, op.Value, 0).Err(); err != nil {
+					return err
+				}
+			case core.BatchSetEx:
+				if err := pipe.Set(ctx, op.Key, op.Value, time.Duration(op.TTL)*time.Second).Err(); err != nil {
+					return err
+				}
+			case core.BatchDel:
+				if err := pipe.Del(ctx, op.Key).Err(); err != nil {
+					return err
+				}
+			case core.BatchExpire:
+				if err := pipe.Expire(ctx, op.Key, time.Duration(op.TTL)*time.Second).Err(); err != nil {
+					return err
+				}
+			case core.BatchQPush:
+				if err := pipe.RPush(ctx, op.Key, op.Value).Err(); err != nil {
+					return err
+				}
+			case core.BatchQPushFront:
+				if err := pipe.LPush(ctx, op.Key, op.Value).Err(); err != nil {
+					return err
+				}
+			case core.BatchZSet:
+				if err := pipe.ZAdd(ctx, op.Key, goredis.Z{Score: f64(op.Score), Member: op.Member}).Err(); err != nil {
+					return err
+				}
+			case core.BatchZDel:
+				if err := pipe.ZRem(ctx, op.Key, op.Member).Err(); err != nil {
+					return err
+				}
+			case core.BatchZIncr:
+				if err := pipe.ZIncrBy(ctx, op.Key, f64(op.Delta), op.Member).Err(); err != nil {
+					return err
+				}
+			default:
+				return fmt.Errorf("redis: unknown batch op %d", op.Kind)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("redis: batch: %w", err)
+	}
+	return nil
+}

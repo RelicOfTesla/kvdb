@@ -75,13 +75,54 @@ type Closer interface {
 	Close() error
 }
 
+// BatchOpKind 标识批内操作类型。批内只允许"无条件写"——它们不依赖键的当前
+// 状态，因此可以先写日志/先入缓冲，再在提交时统一生效。
+type BatchOpKind uint8
+
+const (
+	BatchSet        BatchOpKind = iota + 1 // Key, Value
+	BatchSetEx                             // Key, Value, TTL
+	BatchDel                               // Key
+	BatchExpire                            // Key, TTL
+	BatchQPush                             // Key(队列名), Value
+	BatchQPushFront                        // Key(队列名), Value
+	BatchZSet                              // Key(zset 名), Member, Score
+	BatchZDel                              // Key, Member
+	BatchZIncr                             // Key, Member, Delta
+)
+
+// BatchOp 是一条待批量提交的写操作。字段按 Kind 取用，未用字段忽略。
+type BatchOp struct {
+	Kind   BatchOpKind
+	Key    string // kv key / 队列名 / zset 名
+	Member string // zset 成员
+	Value  []byte
+	TTL    int64 // SetEx / Expire
+	Score  int64 // ZSet
+	Delta  int64 // ZIncr
+}
+
+// BatchProvider 是可选的批量写能力：把一批操作以一次提交发出，降低往返与
+// 持久化开销（SQL 一次事务一次 fsync、Redis 一次 MULTI/EXEC、SSDB 一次流水线、
+// jsonl 一次 flush）。收集逻辑由根包共享的 Batch 提供，基座只需实现 ApplyBatch。
+//
+// 提交语义：
+//   - 整批按 ops 顺序生效；空批为空操作；
+//   - 提交失败时：具备事务能力的基座（mysql/sqlite/pg/redis/jsonl/mem）保证整批
+//     不生效；SSDB 无事务，采用流水线，失败时可能部分生效（其价值在于减少往返）；
+//   - 批内不含 Incr/QPop 这类依赖当前状态的操作（需先校验再写），如需请单独调用。
+type BatchProvider interface {
+	ApplyBatch(ctx context.Context, ops []BatchOp) error
+}
+
 // FullProvider 是集齐全部能力与生命周期的"完整基座"组合接口，
-// 供实现 KV + Queue + ZSet + Closer 的基座整体声明（编译期校验），
+// 供实现 KV + Queue + ZSet + Batch + Closer 的基座整体声明（编译期校验），
 // 或业务方按完整能力持有具体基座。
 type FullProvider interface {
 	KvProvider
 	QueueProvider
 	ZSetProvider
+	BatchProvider
 	Closer
 }
 

@@ -50,8 +50,8 @@ func main() {
 	}
 	defer db.Close()
 
-	hasQ, hasZ := db.Capabilities()
-	fmt.Printf("== 基座 %s（queue=%v zset=%v） ==\n", *uri, hasQ, hasZ)
+	hasQ, hasZ, hasBatch := db.Capabilities()
+	fmt.Printf("== 基座 %s（queue=%v zset=%v batch=%v） ==\n", *uri, hasQ, hasZ, hasBatch)
 
 	// ---- KV ----
 	if err := db.Set(ctx, "user:1", []byte("alice")); err != nil {
@@ -110,6 +110,26 @@ func main() {
 		fmt.Println()
 	} else {
 		fmt.Println("（该基座未实现 ZSet，跳过）")
+	}
+
+	// ---- Batch（可选能力）：一批操作一次提交 ----
+	if hasBatch {
+		err := db.Batch(ctx, func(b *kvdb.Batch) error {
+			b.Set("batch:1", []byte("v1"))
+			b.QPush("jobs", []byte("job-batch"))
+			b.ZIncr("rank", "alice", 5)
+			return nil
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+		alice, _, err := db.ZGet(ctx, "rank", "alice")
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("Batch 提交 3 条操作（jobs=%d, alice=%d）\n", must(db.QSize(ctx, "jobs")), alice)
+	} else {
+		fmt.Println("（该基座未实现 Batch，跳过）")
 	}
 }
 

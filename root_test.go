@@ -121,7 +121,7 @@ func TestCustomScheme(t *testing.T) {
 	if v, ok, _ := db.Get(ctx, "k"); !ok || string(v) != "v" {
 		t.Fatalf("Get = %q,%v", v, ok)
 	}
-	if hasQ, hasZ := db.Capabilities(); hasQ || hasZ {
+	if hasQ, hasZ, hasB := db.Capabilities(); hasQ || hasZ || hasB {
 		t.Fatalf("kvOnly 不应上报能力, got q=%v z=%v", hasQ, hasZ)
 	}
 	if _, _, err := db.QPop(ctx, "q"); !errors.Is(err, core.ErrUnsupported) {

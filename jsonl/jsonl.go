@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -205,11 +206,25 @@ func (p *Provider) apply(rec op, now int64) error {
 
 // appendOp 追加一条记录并落缓冲（Sync 模式下立即 fsync）。
 func (p *Provider) appendOp(rec op) error {
-	b, err := json.Marshal(rec)
-	if err != nil {
-		return fmt.Errorf("jsonl: marshal: %w", err)
+	return p.appendOps([]op{rec})
+}
+
+// appendOps 把一批记录写入缓冲后只做一次 Flush（Sync 模式下一次 fsync）。
+// 单条与批量共用此路径，保证"成功返回 = 已交给 OS"的语义一致。
+func (p *Provider) appendOps(recs []op) error {
+	if len(recs) == 0 {
+		return nil
 	}
-	if _, err := p.bw.Write(append(b, '\n')); err != nil {
+	var buf []byte
+	for _, rec := range recs {
+		b, err := json.Marshal(rec)
+		if err != nil {
+			return fmt.Errorf("jsonl: marshal: %w", err)
+		}
+		buf = append(buf, b...)
+		buf = append(buf, '\n')
+	}
+	if _, err := p.bw.Write(buf); err != nil {
 		return err
 	}
 	if err := p.bw.Flush(); err != nil {
@@ -221,6 +236,77 @@ func (p *Provider) appendOp(rec op) error {
 	return nil
 }
 
+// ---- Batch ----
+
+// ApplyBatch 实现 core.BatchProvider：整批先写成一条日志（一次 Flush，Sync 模式
+// 一次 fsync），成功后再按序应用到内存。写日志失败时内存不变，整批不生效。
+func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
+	if len(ops) == 0 {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return core.ErrClosed
+	}
+	recs := make([]op, 0, len(ops))
+	now := time.Now().Unix()
+	for _, o := range ops {
+		rec, err := toRecord(o, now)
+		if err != nil {
+			return err
+		}
+		recs = append(recs, rec)
+	}
+	// 日志先行：失败则内存不变。
+	if err := p.appendOps(recs); err != nil {
+		return err
+	}
+	for _, rec := range recs {
+		if err := p.apply(rec, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// toRecord 把契约批操作翻译成日志记录（与单条写路径共用同一记录格式，
+// 回放逻辑因此完全一致）。批内均为无条件写，此处只需校验 TTL。
+func toRecord(o core.BatchOp, now int64) (op, error) {
+	switch o.Kind {
+	case core.BatchSet:
+		v, b64 := enc(o.Value)
+		return op{Op: "set", K: o.Key, V: v, B64: b64}, nil
+	case core.BatchSetEx:
+		if o.TTL <= 0 {
+			return op{}, core.ErrInvalidTTL
+		}
+		v, b64 := enc(o.Value)
+		return op{Op: "setx", K: o.Key, V: v, B64: b64, At: now + o.TTL}, nil
+	case core.BatchDel:
+		return op{Op: "del", K: o.Key}, nil
+	case core.BatchExpire:
+		if o.TTL <= 0 {
+			return op{}, core.ErrInvalidTTL
+		}
+		return op{Op: "expire", K: o.Key, At: now + o.TTL}, nil
+	case core.BatchQPush:
+		v, b64 := enc(o.Value)
+		return op{Op: "qpush", K: o.Key, V: v, B64: b64}, nil
+	case core.BatchQPushFront:
+		v, b64 := enc(o.Value)
+		return op{Op: "qpush", K: o.Key, V: v, B64: b64, F: true}, nil
+	case core.BatchZSet:
+		return op{Op: "zset", K: o.Key, M: o.Member, S: o.Score}, nil
+	case core.BatchZDel:
+		return op{Op: "zdel", K: o.Key, M: o.Member}, nil
+	case core.BatchZIncr:
+		return op{Op: "zincr", K: o.Key, M: o.Member, D: o.Delta}, nil
+	default:
+		return op{}, fmt.Errorf("jsonl: unknown batch op %d", o.Kind)
+	}
+}
+
 // ---- KV ----
 
 func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
@@ -229,11 +315,13 @@ func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 	if p.closed {
 		return core.ErrClosed
 	}
-	if err := p.mem.Set(ctx, key, value); err != nil {
+	// WAL 顺序：先写日志、再改内存。若写日志失败则内存不变，二者始终一致
+	//（反序会出现"内存已改、日志缺失"，重启回放后状态回退）。
+	s, b64 := enc(value)
+	if err := p.appendOp(op{Op: "set", K: key, V: s, B64: b64}); err != nil {
 		return err
 	}
-	s, b64 := enc(value)
-	return p.appendOp(op{Op: "set", K: key, V: s, B64: b64})
+	return p.mem.Set(ctx, key, value)
 }
 
 // SetEx 写入 value 并覆盖 TTL（对应 Redis SETEX / SSDB setx）；
@@ -247,11 +335,11 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
-	if err := p.mem.SetEx(ctx, key, value, ttl); err != nil {
+	s, b64 := enc(value)
+	if err := p.appendOp(op{Op: "setx", K: key, V: s, B64: b64, At: time.Now().Unix() + ttl}); err != nil {
 		return err
 	}
-	s, b64 := enc(value)
-	return p.appendOp(op{Op: "setx", K: key, V: s, B64: b64, At: time.Now().Unix() + ttl})
+	return p.mem.SetEx(ctx, key, value, ttl)
 }
 
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
@@ -269,10 +357,10 @@ func (p *Provider) Del(ctx context.Context, key string) error {
 	if p.closed {
 		return core.ErrClosed
 	}
-	if err := p.mem.Del(ctx, key); err != nil {
+	if err := p.appendOp(op{Op: "del", K: key}); err != nil {
 		return err
 	}
-	return p.appendOp(op{Op: "del", K: key})
+	return p.mem.Del(ctx, key)
 }
 
 func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
@@ -290,11 +378,19 @@ func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, er
 	if p.closed {
 		return 0, core.ErrClosed
 	}
-	n, err := p.mem.Incr(ctx, key, delta)
-	if err != nil {
+	// 先校验既有值可解析为整数：若直接写日志再应用，日志里会留下一条
+	// 回放必然失败的记录（毒化日志）；校验通过后再写日志，应用阶段不会失败。
+	if cur, ok, err := p.mem.Get(ctx, key); err != nil {
+		return 0, err
+	} else if ok {
+		if _, perr := strconv.ParseInt(string(cur), 10, 64); perr != nil {
+			return 0, core.ErrNotInteger
+		}
+	}
+	if err := p.appendOp(op{Op: "incr", K: key, D: delta}); err != nil {
 		return 0, err
 	}
-	return n, p.appendOp(op{Op: "incr", K: key, D: delta})
+	return p.mem.Incr(ctx, key, delta)
 }
 
 func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte, error) {
@@ -324,10 +420,10 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
-	if err := p.mem.Expire(ctx, key, ttl); err != nil {
+	if err := p.appendOp(op{Op: "expire", K: key, At: time.Now().Unix() + ttl}); err != nil {
 		return err
 	}
-	return p.appendOp(op{Op: "expire", K: key, At: time.Now().Unix() + ttl})
+	return p.mem.Expire(ctx, key, ttl)
 }
 
 func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
@@ -355,15 +451,14 @@ func (p *Provider) qpush(ctx context.Context, name string, value []byte, front b
 	if p.closed {
 		return core.ErrClosed
 	}
-	if front {
-		if err := p.mem.QPushFront(ctx, name, value); err != nil {
-			return err
-		}
-	} else if err := p.mem.QPush(ctx, name, value); err != nil {
+	s, b64 := enc(value)
+	if err := p.appendOp(op{Op: "qpush", K: name, V: s, B64: b64, F: front}); err != nil {
 		return err
 	}
-	s, b64 := enc(value)
-	return p.appendOp(op{Op: "qpush", K: name, V: s, B64: b64, F: front})
+	if front {
+		return p.mem.QPushFront(ctx, name, value)
+	}
+	return p.mem.QPush(ctx, name, value)
 }
 
 func (p *Provider) QPop(ctx context.Context, name string) ([]byte, bool, error) {
@@ -380,18 +475,24 @@ func (p *Provider) qpop(ctx context.Context, name string, back bool) ([]byte, bo
 	if p.closed {
 		return nil, false, core.ErrClosed
 	}
-	var v []byte
-	var ok bool
-	var err error
+	// 空队列不写日志（否则回放时多出一条无对应元素的 qpop）。
+	// 已持写锁，peek 与 pop 之间无并发插入。
+	var peek func(context.Context, string) ([]byte, bool, error)
 	if back {
-		v, ok, err = p.mem.QPopBack(ctx, name)
+		peek = p.mem.QBack
 	} else {
-		v, ok, err = p.mem.QPop(ctx, name)
+		peek = p.mem.QFront
 	}
-	if err != nil || !ok {
-		return v, ok, err
+	if _, ok, err := peek(ctx, name); err != nil || !ok {
+		return nil, false, err
 	}
-	return v, ok, p.appendOp(op{Op: "qpop", K: name, F: back})
+	if err := p.appendOp(op{Op: "qpop", K: name, F: back}); err != nil {
+		return nil, false, err
+	}
+	if back {
+		return p.mem.QPopBack(ctx, name)
+	}
+	return p.mem.QPop(ctx, name)
 }
 
 func (p *Provider) QSize(ctx context.Context, name string) (int64, error) {
@@ -429,10 +530,10 @@ func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) erro
 	if p.closed {
 		return core.ErrClosed
 	}
-	if err := p.mem.ZSet(ctx, name, key, score); err != nil {
+	if err := p.appendOp(op{Op: "zset", K: name, M: key, S: score}); err != nil {
 		return err
 	}
-	return p.appendOp(op{Op: "zset", K: name, M: key, S: score})
+	return p.mem.ZSet(ctx, name, key, score)
 }
 
 func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, error) {
@@ -450,10 +551,10 @@ func (p *Provider) ZDel(ctx context.Context, name, key string) error {
 	if p.closed {
 		return core.ErrClosed
 	}
-	if err := p.mem.ZDel(ctx, name, key); err != nil {
+	if err := p.appendOp(op{Op: "zdel", K: name, M: key}); err != nil {
 		return err
 	}
-	return p.appendOp(op{Op: "zdel", K: name, M: key})
+	return p.mem.ZDel(ctx, name, key)
 }
 
 func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
@@ -489,11 +590,10 @@ func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (in
 	if p.closed {
 		return 0, core.ErrClosed
 	}
-	n, err := p.mem.ZIncr(ctx, name, key, delta)
-	if err != nil {
+	if err := p.appendOp(op{Op: "zincr", K: name, M: key, D: delta}); err != nil {
 		return 0, err
 	}
-	return n, p.appendOp(op{Op: "zincr", K: name, M: key, D: delta})
+	return p.mem.ZIncr(ctx, name, key, delta)
 }
 
 // Compact 将日志压缩为当前状态的等价操作序列：先写临时文件，fsync 后原子改名，

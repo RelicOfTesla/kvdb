@@ -22,9 +22,25 @@ type (
 	FullProvider  = core.FullProvider
 	QueueProvider = core.QueueProvider
 	ZSetProvider  = core.ZSetProvider
+	BatchProvider = core.BatchProvider
 	Closer        = core.Closer
 	KeyValue      = core.KeyValue
 	ZItem         = core.ZItem
+	BatchOp       = core.BatchOp
+	BatchOpKind   = core.BatchOpKind
+)
+
+// 批量操作类型常量（core.BatchOpKind）。
+const (
+	BatchSet        = core.BatchSet
+	BatchSetEx      = core.BatchSetEx
+	BatchDel        = core.BatchDel
+	BatchExpire     = core.BatchExpire
+	BatchQPush      = core.BatchQPush
+	BatchQPushFront = core.BatchQPushFront
+	BatchZSet       = core.BatchZSet
+	BatchZDel       = core.BatchZDel
+	BatchZIncr      = core.BatchZIncr
 )
 
 const DefaultScanLimit = core.DefaultScanLimit

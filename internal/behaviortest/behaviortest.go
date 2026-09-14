@@ -19,6 +19,7 @@ func Run(t *testing.T, factory func(t *testing.T) core.KvProvider) {
 	t.Run("KV", func(t *testing.T) { TestKV(t, newDB(t, factory)) })
 	t.Run("Queue", func(t *testing.T) { TestQueue(t, newDB(t, factory)) })
 	t.Run("ZSet", func(t *testing.T) { TestZSet(t, newDB(t, factory)) })
+	t.Run("Batch", func(t *testing.T) { TestBatch(t, newDB(t, factory)) })
 }
 
 func newDB(t *testing.T, factory func(t *testing.T) core.KvProvider) *kvdb.DB {
@@ -229,7 +230,7 @@ func TestKV(t *testing.T, db *kvdb.DB) {
 
 func TestQueue(t *testing.T, db *kvdb.DB) {
 	ctx := context.Background()
-	hasQueue, _ := db.Capabilities()
+	hasQueue, _, _ := db.Capabilities()
 	if !hasQueue {
 		t.Skip("基座未实现 Queue 能力")
 	}
@@ -280,7 +281,7 @@ func TestQueue(t *testing.T, db *kvdb.DB) {
 
 func TestZSet(t *testing.T, db *kvdb.DB) {
 	ctx := context.Background()
-	_, hasZSet := db.Capabilities()
+	_, hasZSet, _ := db.Capabilities()
 	if !hasZSet {
 		t.Skip("基座未实现 ZSet 能力")
 	}
@@ -354,5 +355,91 @@ func TestZSet(t *testing.T, db *kvdb.DB) {
 	}
 	if n, _ := db.ZSize(ctx, "r"); n != 4 {
 		t.Fatalf("ZDel 后 ZSize = %d", n)
+	}
+}
+
+// TestBatch 覆盖批量写契约：一次提交内混合 KV/Queue/ZSet 操作，
+// 验证顺序、覆盖语义、TTL、以及与逐条读的一致性。
+func TestBatch(t *testing.T, db *kvdb.DB) {
+	ctx := context.Background()
+	if _, _, hasBatch := db.Capabilities(); !hasBatch {
+		t.Skip("基座未实现 Batch 能力")
+	}
+
+	// 一批混合操作
+	err := db.Batch(ctx, func(b *kvdb.Batch) error {
+		b.Set("bk1", []byte("v1"))
+		b.Set("bk2", []byte("old"))
+		b.Set("bk2", []byte("new")) // 同批内覆盖：后者生效
+		b.SetEx("bk3", []byte("v3"), 100)
+		b.QPush("bq", []byte("a"))
+		b.QPush("bq", []byte("b"))
+		b.QPushFront("bq", []byte("z"))
+		b.ZSet("bz", "m1", 5)
+		b.ZIncr("bz", "m1", 3)
+		b.Set("bk4", []byte("v4"))
+		b.Del("bk4")
+		b.Expire("bk1", 50)
+		if b.Len() != 12 {
+			t.Fatalf("收集操作数 = %d, want 12", b.Len())
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Batch: %v", err)
+	}
+
+	if v, ok, _ := db.Get(ctx, "bk1"); !ok || string(v) != "v1" {
+		t.Fatalf("bk1 = %q,%v", v, ok)
+	}
+	if v, ok, _ := db.Get(ctx, "bk2"); !ok || string(v) != "new" {
+		t.Fatalf("同批覆盖应取后者, bk2 = %q,%v", v, ok)
+	}
+	if secs, has, _ := db.TTL(ctx, "bk3"); !has || secs <= 0 || secs > 100 {
+		t.Fatalf("bk3 TTL = %d,%v", secs, has)
+	}
+	if secs, has, _ := db.TTL(ctx, "bk1"); !has || secs <= 0 || secs > 50 {
+		t.Fatalf("bk1 批内 Expire = %d,%v", secs, has)
+	}
+	if ok, _ := db.Exists(ctx, "bk4"); ok {
+		t.Fatal("批内 Del 应生效")
+	}
+	// 队列顺序：z, a, b
+	for _, want := range []string{"z", "a", "b"} {
+		if v, ok, _ := db.QPop(ctx, "bq"); !ok || string(v) != want {
+			t.Fatalf("批内队列顺序 QPop = %q,%v; want %q", v, ok, want)
+		}
+	}
+	if s, ok, _ := db.ZGet(ctx, "bz", "m1"); !ok || s != 8 {
+		t.Fatalf("批内 ZSet+ZIncr = %d,%v (5+3=8)", s, ok)
+	}
+
+	// 空批：无操作、无错误
+	if err := db.Batch(ctx, func(b *kvdb.Batch) error { return nil }); err != nil {
+		t.Fatalf("空批应无错: %v", err)
+	}
+
+	// 回调返回错误 -> 整批不提交
+	sentinel := errors.New("abort")
+	if err := db.Batch(ctx, func(b *kvdb.Batch) error {
+		b.Set("bk9", []byte("x"))
+		return sentinel
+	}); !errors.Is(err, sentinel) {
+		t.Fatalf("回调错误应原样返回, got %v", err)
+	}
+	if ok, _ := db.Exists(ctx, "bk9"); ok {
+		t.Fatal("回调出错时不应提交")
+	}
+
+	// 收集期校验失败 -> 整批不提交
+	if err := db.Batch(ctx, func(b *kvdb.Batch) error {
+		b.Set("bk10", []byte("x"))
+		b.SetEx("bk11", []byte("y"), 0)
+		return nil
+	}); !errors.Is(err, core.ErrInvalidTTL) {
+		t.Fatalf("非法 TTL 应 ErrInvalidTTL, got %v", err)
+	}
+	if ok, _ := db.Exists(ctx, "bk10"); ok {
+		t.Fatal("校验失败时整批不应生效")
 	}
 }

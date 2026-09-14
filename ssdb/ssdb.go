@@ -753,3 +753,97 @@ func normalizeLimit(limit int) int {
 	}
 	return limit
 }
+
+// ---- Batch ----
+
+// ApplyBatch 实现 core.BatchProvider：整批命令以**流水线**发出（写入全部请求后
+// 一次 Flush，再按序读取全部响应），把 N 次往返压缩为 1 次。
+//
+// 注意：SSDB 没有事务，流水线不提供整批原子性——个别命令失败时其余仍会生效。
+// 需要原子性的场景请使用 SQL 基座（事务）或 Redis（MULTI/EXEC）。
+func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
+	if err := p.check(); err != nil {
+		return err
+	}
+	if len(ops) == 0 {
+		return nil
+	}
+	reqs := make([][][]byte, 0, len(ops))
+	for _, op := range ops {
+		args, err := batchArgs(op)
+		if err != nil {
+			return err
+		}
+		reqs = append(reqs, args)
+	}
+
+	c, err := p.acquire(ctx)
+	if err != nil {
+		return err
+	}
+	resps, err := c.pipeline(ctx, reqs)
+	if err != nil {
+		// 连接级错误：丢弃该连接，避免污染后续请求。
+		c.c.Close()
+		p.total.Add(-1)
+		return err
+	}
+	p.put(c)
+
+	for i, r := range resps {
+		switch r.status {
+		case "ok", "not_found":
+			// not_found 对 expire 等指令属正常（与单条路径一致）。
+		default:
+			return fmt.Errorf("ssdb: batch op %d (kind %d): %w", i, ops[i].Kind, errFrom(firstPayload(r.payload)))
+		}
+	}
+	return nil
+}
+
+// batchArgs 把契约批操作翻译为 SSDB 命令参数。
+func batchArgs(op core.BatchOp) ([][]byte, error) {
+	b := func(parts ...string) [][]byte {
+		out := make([][]byte, len(parts))
+		for i, s := range parts {
+			out[i] = []byte(s)
+		}
+		return out
+	}
+	switch op.Kind {
+	case core.BatchSet:
+		return [][]byte{[]byte("set"), []byte(op.Key), op.Value}, nil
+	case core.BatchSetEx:
+		if op.TTL <= 0 {
+			return nil, core.ErrInvalidTTL
+		}
+		return [][]byte{[]byte("setx"), []byte(op.Key), op.Value, []byte(strconv.FormatInt(op.TTL, 10))}, nil
+	case core.BatchDel:
+		return b("del", op.Key), nil
+	case core.BatchExpire:
+		if op.TTL <= 0 {
+			return nil, core.ErrInvalidTTL
+		}
+		return b("expire", op.Key, strconv.FormatInt(op.TTL, 10)), nil
+	case core.BatchQPush:
+		return [][]byte{[]byte("qpush"), []byte(op.Key), op.Value}, nil
+	case core.BatchQPushFront:
+		return [][]byte{[]byte("qpush_front"), []byte(op.Key), op.Value}, nil
+	case core.BatchZSet:
+		return b("zset", op.Key, op.Member, strconv.FormatInt(op.Score, 10)), nil
+	case core.BatchZDel:
+		return b("zdel", op.Key, op.Member), nil
+	case core.BatchZIncr:
+		return b("zincr", op.Key, op.Member, strconv.FormatInt(op.Delta, 10)), nil
+	default:
+		return nil, fmt.Errorf("ssdb: unknown batch op %d", op.Kind)
+	}
+}
+
+// firstPayload 取首条负载，缺省为空字节串。
+func firstPayload(payload [][]byte) []byte {
+	if len(payload) > 0 {
+		return payload[0]
+	}
+	return nil
+}

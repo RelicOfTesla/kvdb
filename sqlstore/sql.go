@@ -686,15 +686,42 @@ func (p *Provider) qpush(ctx context.Context, name string, value []byte, front b
 	if err := p.check(); err != nil {
 		return err
 	}
-	if p.st.qSeqBumpBack != "" {
-		return p.qpushReturning(ctx, name, value, front)
-	}
-
 	tx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("sqlstore: qpush begin: %w", err)
 	}
 	defer tx.Rollback()
+	if err := p.qpushTx(ctx, tx, name, value, front); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqlstore: qpush commit: %w", err)
+	}
+	return nil
+}
+
+// qpushTx 在给定事务内完成一次入队：分配序号并写入数据行。
+// RETURNING 方言用一条 UPDATE ... RETURNING 原子分配（同时推进 next/prev）；
+// 其他方言（MySQL）走"确保行存在 + 行锁读 + 更新 + 插入"的多语句路径。
+// 供单条 QPush 与批量 ApplyBatch 共用（批量时整批共享一个事务与一次提交）。
+func (p *Provider) qpushTx(ctx context.Context, tx *sql.Tx, name string, value []byte, front bool) error {
+	if p.st.qSeqBumpBack != "" {
+		if _, err := tx.ExecContext(ctx, p.st.qSeqEnsure, bs(name)); err != nil {
+			return fmt.Errorf("sqlstore: qpush ensure: %w", err)
+		}
+		bump := p.st.qSeqBumpBack
+		if front {
+			bump = p.st.qSeqBumpFront
+		}
+		var seq int64
+		if err := tx.QueryRowContext(ctx, bump, bs(name)).Scan(&seq); err != nil {
+			return fmt.Errorf("sqlstore: qpush bump: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, p.st.qItemInsert, bs(name), seq, value); err != nil {
+			return fmt.Errorf("sqlstore: qpush insert: %w", err)
+		}
+		return nil
+	}
 
 	if _, err := tx.ExecContext(ctx, p.st.qSeqEnsure, bs(name)); err != nil {
 		return fmt.Errorf("sqlstore: qpush ensure: %w", err)
@@ -716,41 +743,6 @@ func (p *Provider) qpush(ctx context.Context, name string, value []byte, front b
 	}
 	if _, err := tx.ExecContext(ctx, p.st.qItemInsert, bs(name), seq, value); err != nil {
 		return fmt.Errorf("sqlstore: qpush insert: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("sqlstore: qpush commit: %w", err)
-	}
-	return nil
-}
-
-// qpushReturning 是 PostgreSQL/SQLite 的快路径：事务内两条语句——
-// UPDATE ... RETURNING 分配 seq（原子自增，无显式行锁往返），再插入数据行。
-// 单条 UPDATE ... RETURNING 同时推进 next/prev 并按方向返回分配到的序号，
-// 相比多语句路径省去 SELECT ... FOR UPDATE 与独立 UPDATE 两次往返。
-func (p *Provider) qpushReturning(ctx context.Context, name string, value []byte, front bool) error {
-	tx, err := p.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("sqlstore: qpush begin: %w", err)
-	}
-	defer tx.Rollback()
-
-	// 保证 q_seq 行存在（该语句幂等，且与后续 UPDATE 同事务）。
-	if _, err := tx.ExecContext(ctx, p.st.qSeqEnsure, bs(name)); err != nil {
-		return fmt.Errorf("sqlstore: qpush ensure: %w", err)
-	}
-	bump := p.st.qSeqBumpBack
-	if front {
-		bump = p.st.qSeqBumpFront
-	}
-	var seq int64
-	if err := tx.QueryRowContext(ctx, bump, bs(name)).Scan(&seq); err != nil {
-		return fmt.Errorf("sqlstore: qpush bump: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, p.st.qItemInsert, bs(name), seq, value); err != nil {
-		return fmt.Errorf("sqlstore: qpush insert: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("sqlstore: qpush commit: %w", err)
 	}
 	return nil
 }
@@ -968,4 +960,87 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// ---- Batch ----
+
+// ApplyBatch 实现 core.BatchProvider：整批操作在**一个事务**内执行，提交时
+// 只产生一次持久化（InnoDB redo / WAL fsync），把 N 次提交开销摊成 1 次。
+// 任一步失败即回滚，整批不生效。SQLite 仍受进程内写锁串行化。
+func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
+	if err := p.check(); err != nil {
+		return err
+	}
+	if len(ops) == 0 {
+		return nil
+	}
+	defer p.writeLock()()
+
+	// 先校验 TTL，避免事务做到一半才发现参数非法（虽然会回滚，但省一次往返）。
+	for _, op := range ops {
+		switch op.Kind {
+		case core.BatchSetEx, core.BatchExpire:
+			if op.TTL <= 0 {
+				return core.ErrInvalidTTL
+			}
+		}
+	}
+
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqlstore: batch begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	now := time.Now().Unix()
+	for i, op := range ops {
+		if err := p.batchOp(ctx, tx, op, now); err != nil {
+			return fmt.Errorf("sqlstore: batch op %d (kind %d): %w", i, op.Kind, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqlstore: batch commit: %w", err)
+	}
+	return nil
+}
+
+// batchOp 在事务内执行单条批操作。
+func (p *Provider) batchOp(ctx context.Context, tx *sql.Tx, op core.BatchOp, now int64) error {
+	switch op.Kind {
+	case core.BatchSet:
+		args := []any{bs(op.Key), op.Value}
+		if p.hasNumCol {
+			args = append(args, numProjection(op.Value))
+		}
+		_, err := tx.ExecContext(ctx, p.st.kvUpsert, args...)
+		return err
+	case core.BatchSetEx:
+		args := []any{bs(op.Key), op.Value, now + op.TTL}
+		if p.hasNumCol {
+			args = append(args, numProjection(op.Value))
+		}
+		_, err := tx.ExecContext(ctx, p.st.kvSetEx, args...)
+		return err
+	case core.BatchDel:
+		_, err := tx.ExecContext(ctx, p.st.kvDel, bs(op.Key))
+		return err
+	case core.BatchExpire:
+		_, err := tx.ExecContext(ctx, p.st.kvExpire, now+op.TTL, bs(op.Key))
+		return err
+	case core.BatchQPush:
+		return p.qpushTx(ctx, tx, op.Key, op.Value, false)
+	case core.BatchQPushFront:
+		return p.qpushTx(ctx, tx, op.Key, op.Value, true)
+	case core.BatchZSet:
+		_, err := tx.ExecContext(ctx, p.st.zUpsert(false), bs(op.Key), bs(op.Member), op.Score)
+		return err
+	case core.BatchZDel:
+		_, err := tx.ExecContext(ctx, p.st.zDel, bs(op.Key), bs(op.Member))
+		return err
+	case core.BatchZIncr:
+		_, err := tx.ExecContext(ctx, p.st.zUpsert(true), bs(op.Key), bs(op.Member), op.Delta)
+		return err
+	default:
+		return fmt.Errorf("unknown batch op kind %d", op.Kind)
+	}
 }

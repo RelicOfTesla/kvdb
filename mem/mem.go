@@ -5,6 +5,7 @@ package mem
 import (
 	"container/list"
 	"context"
+	"fmt"
 	"net/url"
 	"sort"
 	"strconv"
@@ -76,12 +77,17 @@ func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 	if err := p.checkOpen(); err != nil {
 		return err
 	}
+	p.setLocked(key, value)
+	return nil
+}
+
+// setLocked 写入值（保留既有 TTL），调用方需持有 p.mu。
+func (p *Provider) setLocked(key string, value []byte) {
 	if e, ok := p.kv[key]; ok {
 		e.val = append([]byte(nil), value...)
-		return nil
+		return
 	}
 	p.kv[key] = &entry{val: append([]byte(nil), value...)}
-	return nil
 }
 
 // SetEx 写入 value 并覆盖 TTL（对应 Redis SETEX / SSDB setx）。
@@ -95,8 +101,13 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 	if err := p.checkOpen(); err != nil {
 		return err
 	}
-	p.kv[key] = &entry{val: append([]byte(nil), value...), exp: time.Now().Unix() + ttl}
+	p.setExLocked(key, value, ttl)
 	return nil
+}
+
+// setExLocked 写入值并覆盖 TTL，调用方需持有 p.mu。
+func (p *Provider) setExLocked(key string, value []byte, ttl int64) {
+	p.kv[key] = &entry{val: append([]byte(nil), value...), exp: time.Now().Unix() + ttl}
 }
 
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
@@ -120,9 +131,12 @@ func (p *Provider) Del(ctx context.Context, key string) error {
 	if err := p.checkOpen(); err != nil {
 		return err
 	}
-	delete(p.kv, key)
+	p.delLocked(key)
 	return nil
 }
+
+// delLocked 删除键，调用方需持有 p.mu。
+func (p *Provider) delLocked(key string) { delete(p.kv, key) }
 
 func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 	_ = ctx
@@ -218,10 +232,15 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	if err := p.checkOpen(); err != nil {
 		return err
 	}
+	p.expireLocked(key, ttl)
+	return nil
+}
+
+// expireLocked 设置 TTL，调用方需持有 p.mu。
+func (p *Provider) expireLocked(key string, ttl int64) {
 	if e, ok := p.alive(key, time.Now().Unix()); ok {
 		e.exp = time.Now().Unix() + ttl
 	}
-	return nil
 }
 
 func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
@@ -309,6 +328,12 @@ func (p *Provider) qpush(_ context.Context, name string, value []byte, front boo
 	if err := p.checkOpen(); err != nil {
 		return err
 	}
+	p.qpushLocked(name, value, front)
+	return nil
+}
+
+// qpushLocked 追加/插入队列元素，调用方需持有 p.mu。
+func (p *Provider) qpushLocked(name string, value []byte, front bool) {
 	l := p.queue[name]
 	if l == nil {
 		l = list.New()
@@ -320,7 +345,6 @@ func (p *Provider) qpush(_ context.Context, name string, value []byte, front boo
 	} else {
 		l.PushBack(v)
 	}
-	return nil
 }
 
 func (p *Provider) QPop(ctx context.Context, name string) ([]byte, bool, error) {
@@ -395,13 +419,18 @@ func (p *Provider) ZSet(_ context.Context, name, key string, score int64) error 
 	if err := p.checkOpen(); err != nil {
 		return err
 	}
+	p.zsetLocked(name, key, score)
+	return nil
+}
+
+// zsetLocked 写入 zset 成员分数，调用方需持有 p.mu。
+func (p *Provider) zsetLocked(name, key string, score int64) {
 	m := p.zset[name]
 	if m == nil {
 		m = make(map[string]int64)
 		p.zset[name] = m
 	}
 	m[key] = score
-	return nil
 }
 
 func (p *Provider) ZGet(_ context.Context, name, key string) (int64, bool, error) {
@@ -420,10 +449,15 @@ func (p *Provider) ZDel(_ context.Context, name, key string) error {
 	if err := p.checkOpen(); err != nil {
 		return err
 	}
+	p.zdelLocked(name, key)
+	return nil
+}
+
+// zdelLocked 删除 zset 成员，调用方需持有 p.mu。
+func (p *Provider) zdelLocked(name, key string) {
 	if m := p.zset[name]; m != nil {
 		delete(m, key)
 	}
-	return nil
 }
 
 func (p *Provider) ZSize(_ context.Context, name string) (int64, error) {
@@ -480,13 +514,18 @@ func (p *Provider) ZIncr(_ context.Context, name, key string, delta int64) (int6
 	if err := p.checkOpen(); err != nil {
 		return 0, err
 	}
+	return p.zincrLocked(name, key, delta), nil
+}
+
+// zincrLocked 累加 zset 成员分数，调用方需持有 p.mu。
+func (p *Provider) zincrLocked(name, key string, delta int64) int64 {
 	m := p.zset[name]
 	if m == nil {
 		m = make(map[string]int64)
 		p.zset[name] = m
 	}
 	m[key] += delta
-	return m[key], nil
+	return m[key]
 }
 
 // ---- 工具 ----
@@ -529,4 +568,54 @@ func sliceRange(items []core.ZItem, start, stop int64) []core.ZItem {
 		stop = n - 1
 	}
 	return items[start : stop+1]
+}
+
+// ---- Batch ----
+
+// ApplyBatch 在单次持锁内按序应用整批操作：要么全部生效，要么（参数非法时）
+// 一条都不生效。批内均为无条件写，故正常情况下不会失败。
+func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
+	_ = ctx
+	if len(ops) == 0 {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.checkOpen(); err != nil {
+		return err
+	}
+	// 先校验整批（TTL 合法性），避免"应用一半才发现参数非法"。
+	for _, op := range ops {
+		switch op.Kind {
+		case core.BatchSetEx, core.BatchExpire:
+			if op.TTL <= 0 {
+				return core.ErrInvalidTTL
+			}
+		}
+	}
+	for _, op := range ops {
+		switch op.Kind {
+		case core.BatchSet:
+			p.setLocked(op.Key, op.Value)
+		case core.BatchSetEx:
+			p.setExLocked(op.Key, op.Value, op.TTL)
+		case core.BatchDel:
+			p.delLocked(op.Key)
+		case core.BatchExpire:
+			p.expireLocked(op.Key, op.TTL)
+		case core.BatchQPush:
+			p.qpushLocked(op.Key, op.Value, false)
+		case core.BatchQPushFront:
+			p.qpushLocked(op.Key, op.Value, true)
+		case core.BatchZSet:
+			p.zsetLocked(op.Key, op.Member, op.Score)
+		case core.BatchZDel:
+			p.zdelLocked(op.Key, op.Member)
+		case core.BatchZIncr:
+			p.zincrLocked(op.Key, op.Member, op.Delta)
+		default:
+			return fmt.Errorf("mem: unknown batch op %d", op.Kind)
+		}
+	}
+	return nil
 }

@@ -36,33 +36,77 @@ func dial(ctx context.Context, addr string) (*conn, error) {
 
 // request 发送命令并读取完整响应。返回状态与负载记录；响应结束由空行判定。
 func (c *conn) request(ctx context.Context, args ...[]byte) (status string, payload [][]byte, err error) {
-	if dl, ok := ctx.Deadline(); ok {
-		c.c.SetDeadline(dl)
-	} else {
-		c.c.SetDeadline(time.Time{})
-	}
-
-	for _, a := range args {
-		if _, err := c.bw.WriteString(strconv.Itoa(len(a))); err != nil {
-			return "", nil, err
-		}
-		if err := c.bw.WriteByte('\n'); err != nil {
-			return "", nil, err
-		}
-		if _, err := c.bw.Write(a); err != nil {
-			return "", nil, err
-		}
-		if err := c.bw.WriteByte('\n'); err != nil {
-			return "", nil, err
-		}
-	}
-	if err := c.bw.WriteByte('\n'); err != nil { // 报文结束空行
+	c.setDeadline(ctx)
+	if err := c.writeReq(args); err != nil {
 		return "", nil, err
 	}
 	if err := c.bw.Flush(); err != nil {
 		return "", nil, err
 	}
+	return c.readOne()
+}
 
+// resp 是一条命令的响应。
+type resp struct {
+	status  string
+	payload [][]byte
+}
+
+// pipeline 以流水线方式发送多条命令：先全部写入并只 Flush 一次，再按序读取
+// 全部响应。SSDB 无事务，流水线只降低往返次数，不提供整批原子性。
+func (c *conn) pipeline(ctx context.Context, reqs [][][]byte) ([]resp, error) {
+	if len(reqs) == 0 {
+		return nil, nil
+	}
+	c.setDeadline(ctx)
+	for _, args := range reqs {
+		if err := c.writeReq(args); err != nil {
+			return nil, err
+		}
+	}
+	if err := c.bw.Flush(); err != nil {
+		return nil, err
+	}
+	out := make([]resp, len(reqs))
+	for i := range reqs {
+		st, payload, err := c.readOne()
+		if err != nil {
+			return nil, err
+		}
+		out[i] = resp{status: st, payload: payload}
+	}
+	return out, nil
+}
+
+func (c *conn) setDeadline(ctx context.Context) {
+	if dl, ok := ctx.Deadline(); ok {
+		c.c.SetDeadline(dl)
+	} else {
+		c.c.SetDeadline(time.Time{})
+	}
+}
+
+// writeReq 按帧写入一条命令（不 Flush）。
+func (c *conn) writeReq(args [][]byte) error {
+	for _, a := range args {
+		if _, err := c.bw.WriteString(strconv.Itoa(len(a))); err != nil {
+			return err
+		}
+		if err := c.bw.WriteByte('\n'); err != nil {
+			return err
+		}
+		if _, err := c.bw.Write(a); err != nil {
+			return err
+		}
+		if err := c.bw.WriteByte('\n'); err != nil {
+			return err
+		}
+	}
+	return c.bw.WriteByte('\n') // 报文结束空行
+}
+
+// readOne 读取一条完整响应（状态 + 负载）。
+func (c *conn) readOne() (string, [][]byte, error) {
 	recs, err := c.readRecs()
 	if err != nil {
 		return "", nil, err
@@ -73,6 +117,7 @@ func (c *conn) request(ctx context.Context, args ...[]byte) (status string, payl
 	return string(recs[0]), recs[1:], nil
 }
 
+// readRecs 读取一条完整报文（多条记录，空行结束）。
 func (c *conn) readRecs() ([][]byte, error) {
 	var recs [][]byte
 	for {

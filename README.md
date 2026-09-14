@@ -22,6 +22,40 @@
 或适配器接入；集齐全部能力与生命周期的基座可整体声明 `FullProvider`
 （KvProvider + QueueProvider + ZSetProvider + BatchProvider + Closer）。
 
+### 返回接口，便于 mock
+
+`kvdb.Open` / `kvdb.Wrap` 返回的 `kvdb.DB` 是**接口**（具体适配器为非导出实现），
+业务代码依赖接口即可在测试中替换为 mock。`DB` 直接组合 `core` 已有的能力接口，
+不重复定义方法集：
+
+```go
+type DB interface {
+    KvProvider      // core：KV 能力（11 个方法）
+    QueueProvider   // core：队列能力
+    ZSetProvider    // core：zset 能力
+    Batcher         // 根包：db.Batch(ctx, fn) 回调式批写（core 无对应形态）
+    Closer          // core：Close
+    Capabilities() (hasQueue, hasZSet, hasBatch bool)
+}
+```
+
+**窄依赖写法**：业务函数只需用到多窄的能力就声明多窄的参数，测试里实现对应
+方法即可（无需实现整个 DB）：
+
+```go
+func upsertUser(ctx context.Context, store kvdb.KvProvider, name string, visits int64) (int64, error) {
+    if err := store.Set(ctx, "user:"+name, []byte(name)); err != nil { return 0, err }
+    return store.Incr(ctx, "visits:"+name, visits)
+}
+
+// 真实基座：db（kvdb.DB）满足 KvProvider；测试：一个 map 支撑的 fake 即可
+n, err := upsertUser(ctx, db, "alice", 3)
+n, err := upsertUser(ctx, newFakeKV(), "alice", 3)
+```
+
+`kvdb.Unwrap(db)` 可取回适配器背后的基座（需要直接使用 `core.QueueProvider`
+等接口时使用；非适配器实现返回 nil）。参考 `mock_test.go`。
+
 ### 批量写（BatchProvider）
 
 设计为「共享收集器 + 基座只实现提交」：根包的 `kvdb.Batch` 负责收集，

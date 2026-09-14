@@ -66,7 +66,7 @@ func Schemes() []string {
 }
 
 // open 是 Open 的内部实现（Open 在 provider.go 再导出一层便于文档聚合）。
-func open(ctx context.Context, uri string) (*DB, error) {
+func open(ctx context.Context, uri string) (DB, error) {
 	u, err := url.Parse(uri)
 	if err != nil {
 		return nil, fmt.Errorf("kvdb: parse uri %q: %w", uri, err)

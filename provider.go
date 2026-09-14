@@ -53,7 +53,8 @@ var (
 	ErrNotFound    = core.ErrNotFound
 )
 
-// Open 按 URI 的 scheme 选择基座并包装为适配器 DB（注册表见 registry.go）。
-func Open(ctx context.Context, uri string) (*DB, error) {
+// Open 按 URI 的 scheme 选择基座并返回适配器接口 DB（注册表见 registry.go）。
+// 返回接口而非具体类型，便于业务依赖并在测试中替换为 mock。
+func Open(ctx context.Context, uri string) (DB, error) {
 	return open(ctx, uri)
 }

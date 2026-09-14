@@ -22,7 +22,7 @@ func Run(t *testing.T, factory func(t *testing.T) core.KvProvider) {
 	t.Run("Batch", func(t *testing.T) { TestBatch(t, newDB(t, factory)) })
 }
 
-func newDB(t *testing.T, factory func(t *testing.T) core.KvProvider) *kvdb.DB {
+func newDB(t *testing.T, factory func(t *testing.T) core.KvProvider) kvdb.DB {
 	t.Helper()
 	p := factory(t)
 	t.Cleanup(func() {
@@ -34,7 +34,7 @@ func newDB(t *testing.T, factory func(t *testing.T) core.KvProvider) *kvdb.DB {
 	return kvdb.Wrap(p)
 }
 
-func TestKV(t *testing.T, db *kvdb.DB) {
+func TestKV(t *testing.T, db kvdb.DB) {
 	ctx := context.Background()
 
 	// 基本读写与缺失
@@ -228,7 +228,7 @@ func TestKV(t *testing.T, db *kvdb.DB) {
 	}
 }
 
-func TestQueue(t *testing.T, db *kvdb.DB) {
+func TestQueue(t *testing.T, db kvdb.DB) {
 	ctx := context.Background()
 	hasQueue, _, _ := db.Capabilities()
 	if !hasQueue {
@@ -279,7 +279,7 @@ func TestQueue(t *testing.T, db *kvdb.DB) {
 	}
 }
 
-func TestZSet(t *testing.T, db *kvdb.DB) {
+func TestZSet(t *testing.T, db kvdb.DB) {
 	ctx := context.Background()
 	_, hasZSet, _ := db.Capabilities()
 	if !hasZSet {
@@ -360,7 +360,7 @@ func TestZSet(t *testing.T, db *kvdb.DB) {
 
 // TestBatch 覆盖批量写契约：一次提交内混合 KV/Queue/ZSet 操作，
 // 验证顺序、覆盖语义、TTL、以及与逐条读的一致性。
-func TestBatch(t *testing.T, db *kvdb.DB) {
+func TestBatch(t *testing.T, db kvdb.DB) {
 	ctx := context.Background()
 	if _, _, hasBatch := db.Capabilities(); !hasBatch {
 		t.Skip("基座未实现 Batch 能力")

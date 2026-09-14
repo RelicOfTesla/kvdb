@@ -97,8 +97,8 @@ func (b *Batch) fail(err error) {
 //	    b.ZIncr("rank", "alice", 1)
 //	    return nil
 //	})
-func (db *DB) Batch(ctx context.Context, fn func(b *Batch) error) error {
-	if db.batch == nil {
+func (a *adapter) Batch(ctx context.Context, fn func(b *Batch) error) error {
+	if a.batch == nil {
 		return ErrUnsupported
 	}
 	b := NewBatch()
@@ -111,13 +111,13 @@ func (db *DB) Batch(ctx context.Context, fn func(b *Batch) error) error {
 	if len(b.ops) == 0 {
 		return nil
 	}
-	return db.batch.ApplyBatch(ctx, b.ops)
+	return a.batch.ApplyBatch(ctx, b.ops)
 }
 
 // BatchProvider 返回底层基座的批量能力（无则返回 nil）。
-func (db *DB) BatchProvider() BatchProvider {
-	if db.batch == nil {
+func (a *adapter) BatchProvider() BatchProvider {
+	if a.batch == nil {
 		return nil
 	}
-	return db.batch
+	return a.batch
 }

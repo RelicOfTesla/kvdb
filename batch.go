@@ -3,7 +3,7 @@ package kvdb
 import (
 	"context"
 
-	"kvdb/core"
+	"github.com/RelicOfTesla/kvdb/core"
 )
 
 // Batch 是跨基座共享的批量写收集器：在 DB.Batch 的回调内收集操作，

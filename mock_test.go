@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"kvdb"
+	"github.com/RelicOfTesla/kvdb"
 )
 
 // fakeKV 是只实现 KV 能力的最小 mock：证明业务函数可以只依赖窄接口

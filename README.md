@@ -29,17 +29,14 @@ n, err := db.Incr(ctx, "visits", 1)
 
 ## 引入方式
 
-模块路径为本地名 `kvdb`。从 GitHub 使用时，把 `go.mod` 的 `module` 改为你的仓库
-路径（或在上游用 `replace`），再按新路径 import，例如：
-
 ```bash
-go get github.com/<you>/kvdb
+go get github.com/RelicOfTesla/kvdb
 ```
 
 ```go
 import (
-    "github.com/<you>/kvdb"
-    _ "github.com/<you>/kvdb/sqlite"   // 按需接入基座
+    "github.com/RelicOfTesla/kvdb"
+    _ "github.com/RelicOfTesla/kvdb/sqlite"   // 按需接入基座
 )
 ```
 
@@ -48,8 +45,9 @@ import (
 ```go
 import (
     "context"
-    "kvdb"
-    _ "kvdb/sqlite"     // 只接入 sqlite；或用 _ "kvdb/all" 一次接入全部基座
+
+    "github.com/RelicOfTesla/kvdb"
+    _ "github.com/RelicOfTesla/kvdb/sqlite"  // 只接入 sqlite；或 _ .../all 一次接入全部
 )
 
 ctx := context.Background()
@@ -92,15 +90,17 @@ ssdb://:password@host:8888         # 服务端启用 server.auth 时
 
 ## 内置基座
 
-| 基座 | package | KV | Queue | ZSet | 说明 |
+| 基座 | 子包 | KV | Queue | ZSet | 说明 |
 |---|---|---|---|---|---|
-| 纯内存 | `kvdb/mem` | ✅ | ✅ | ✅ | 不落盘，测试/缓存 |
-| JSONL 日志 | `kvdb/jsonl` | ✅ | ✅ | ✅ | append-only WAL，打开时回放，支持 `Compact()`；单进程内嵌 |
-| SQLite | `kvdb/sqlite` | ✅ | ✅ | ✅ | 纯 Go 驱动（modernc），无 CGO |
-| MySQL | `kvdb/mysql` | ✅ | ✅ | ✅ | 共享 `kvdb/sqlstore` |
-| PostgreSQL | `kvdb/pg` | ✅ | ✅ | ✅ | 共享 `kvdb/sqlstore` |
-| Redis | `kvdb/redis` | ✅ | ✅ | ✅ | String / List / Sorted Set 原生映射 |
-| SSDB | `kvdb/ssdb` | ✅ | ✅ | ✅ | 原生文本协议客户端，连接池 + 认证 |
+| 纯内存 | `mem` | ✅ | ✅ | ✅ | 不落盘，测试/缓存 |
+| JSONL 日志 | `jsonl` | ✅ | ✅ | ✅ | append-only WAL，打开时回放，支持 `Compact()`；单进程内嵌 |
+| SQLite | `sqlite` | ✅ | ✅ | ✅ | 纯 Go 驱动（modernc），无 CGO |
+| MySQL | `mysql` | ✅ | ✅ | ✅ | 共享 `sqlstore` |
+| PostgreSQL | `pg` | ✅ | ✅ | ✅ | 共享 `sqlstore` |
+| Redis | `redis` | ✅ | ✅ | ✅ | String / List / Sorted Set 原生映射 |
+| SSDB | `ssdb` | ✅ | ✅ | ✅ | 原生文本协议客户端，连接池 + 认证 |
+
+导入路径为 `github.com/RelicOfTesla/kvdb/<子包>`，另有聚合包 `.../all`。
 
 ## 能力模型
 
@@ -276,6 +276,8 @@ KVDB_TEST_REDIS_ADDR=127.0.0.1:6379 \
 含并发原子性）；SSDB 另用进程内假服务器交叉验证线协议编码。
 
 ## 目录结构
+
+模块根 `github.com/RelicOfTesla/kvdb`：
 
 ```
 core/                  契约：KvProvider / Queue- / ZSet- / BatchProvider / Closer / FullProvider

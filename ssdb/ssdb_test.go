@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"kvdb/core"
-	"kvdb/internal/behaviortest"
-	"kvdb/ssdb"
+	"github.com/RelicOfTesla/kvdb/core"
+	"github.com/RelicOfTesla/kvdb/internal/behaviortest"
+	"github.com/RelicOfTesla/kvdb/ssdb"
 )
 
 // fakeSSDB 是进程内 SSDB 服务器替身：按 SSDB wiki/源码（link.cpp）定义的

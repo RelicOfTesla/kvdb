@@ -23,8 +23,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"kvdb"
-	_ "kvdb/all" // 示例需要全部基座可用；正式服务可按需 import 单个基座包
+	"github.com/RelicOfTesla/kvdb"
+	_ "github.com/RelicOfTesla/kvdb/all" // 示例需要全部基座可用；正式服务可按需 import 单个基座包
 )
 
 func main() {

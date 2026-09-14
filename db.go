@@ -3,7 +3,7 @@ package kvdb
 import (
 	"context"
 
-	"kvdb/core"
+	"github.com/RelicOfTesla/kvdb/core"
 )
 
 // Batcher 是调用方视角的批量写接口（回调式收集 + 一次提交）。

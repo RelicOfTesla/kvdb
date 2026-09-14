@@ -12,9 +12,9 @@ import (
 	"strings"
 	"testing"
 
-	"kvdb/core"
-	"kvdb/internal/behaviortest"
-	"kvdb/ssdb"
+	"github.com/RelicOfTesla/kvdb/core"
+	"github.com/RelicOfTesla/kvdb/internal/behaviortest"
+	"github.com/RelicOfTesla/kvdb/ssdb"
 )
 
 // TestRealSSDB 仅在显式设置 KVDB_TEST_SSDB_ADDR 时对真实 SSDB 服务跑行为用例：

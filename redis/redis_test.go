@@ -8,9 +8,9 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	goredis "github.com/redis/go-redis/v9"
 
-	"kvdb/core"
-	"kvdb/internal/behaviortest"
-	"kvdb/redis"
+	"github.com/RelicOfTesla/kvdb/core"
+	"github.com/RelicOfTesla/kvdb/internal/behaviortest"
+	"github.com/RelicOfTesla/kvdb/redis"
 )
 
 // TestBehavior 用 miniredis（进程内 Redis 替身）验证基座行为。

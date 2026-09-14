@@ -1,7 +1,7 @@
 // Package core 定义 kvdb 的持久化契约：Provider 接口、可选能力接口、
 // 哨兵错误与共享常量。本包不依赖任何基座实现，基座包（kvdb/mem、kvdb/ssdb 等）
 // 仅引用本包，从而避免根包聚合注册表与基座包之间的循环导入。
-// 根包 kvdb 通过类型/变量别名原样再导出这些符号，业务代码 import "kvdb" 即可。
+// 根包 kvdb 通过类型/变量别名原样再导出这些符号，业务代码 import "github.com/RelicOfTesla/kvdb" 即可。
 package core
 
 import (

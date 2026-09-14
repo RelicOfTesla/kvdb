@@ -12,9 +12,9 @@ import (
 
 	_ "modernc.org/sqlite" // 注册 "sqlite" 驱动
 
-	"kvdb"
-	"kvdb/core"
-	"kvdb/sqlstore"
+	"github.com/RelicOfTesla/kvdb"
+	"github.com/RelicOfTesla/kvdb/core"
+	"github.com/RelicOfTesla/kvdb/sqlstore"
 )
 
 func init() { kvdb.MustRegister("sqlite", OpenURI) }

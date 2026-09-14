@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"kvdb"
-	"kvdb/core"
+	"github.com/RelicOfTesla/kvdb"
+	"github.com/RelicOfTesla/kvdb/core"
 )
 
 func init() { kvdb.MustRegister("mem", OpenURI) }

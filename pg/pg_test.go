@@ -8,9 +8,9 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
-	"kvdb/core"
-	"kvdb/internal/behaviortest"
-	"kvdb/pg"
+	"github.com/RelicOfTesla/kvdb/core"
+	"github.com/RelicOfTesla/kvdb/internal/behaviortest"
+	"github.com/RelicOfTesla/kvdb/pg"
 )
 
 // TestBehavior 仅在显式设置 KVDB_TEST_PG_DSN 时运行真实 PostgreSQL 用例：

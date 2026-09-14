@@ -11,9 +11,9 @@ import (
 
 	_ "github.com/go-sql-driver/mysql" // 注册 "mysql" 驱动
 
-	"kvdb"
-	"kvdb/core"
-	"kvdb/sqlstore"
+	"github.com/RelicOfTesla/kvdb"
+	"github.com/RelicOfTesla/kvdb/core"
+	"github.com/RelicOfTesla/kvdb/sqlstore"
 )
 
 func init() { kvdb.MustRegister("mysql", OpenURI) }

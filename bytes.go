@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"strconv"
 
-	"kvdb/core"
+	"github.com/RelicOfTesla/kvdb/core"
 )
 
 // BytesAble 是 B/P/D/DMust 支持的标量集合：整数家族（含 ~ 底层类型别名、

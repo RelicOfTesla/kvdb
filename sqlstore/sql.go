@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"kvdb/core"
+	"github.com/RelicOfTesla/kvdb/core"
 )
 
 var (

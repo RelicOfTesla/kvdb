@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"kvdb"
-	"kvdb/core"
+	"github.com/RelicOfTesla/kvdb"
+	"github.com/RelicOfTesla/kvdb/core"
 )
 
 // TestWriteFailureKeepsMemoryConsistent 验证写日志失败时内存不变：

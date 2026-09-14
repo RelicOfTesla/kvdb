@@ -10,9 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	"kvdb"
-	"kvdb/core"
-	"kvdb/mem" // 只接入 mem：验证按需注册
+	"github.com/RelicOfTesla/kvdb"
+	"github.com/RelicOfTesla/kvdb/core"
+	"github.com/RelicOfTesla/kvdb/mem" // 只接入 mem：验证按需注册
 )
 
 // kvOnly 是仅实现 KV 能力的自定义基座，用于验证可选能力降级路径

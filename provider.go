@@ -12,10 +12,10 @@ package kvdb
 import (
 	"context"
 
-	"kvdb/core"
+	"github.com/RelicOfTesla/kvdb/core"
 )
 
-// 再导出 core 契约符号，业务代码 import "kvdb" 即可使用；errors.Is 判等
+// 再导出 core 契约符号，业务代码 import "github.com/RelicOfTesla/kvdb" 即可使用；errors.Is 判等
 // 与常量身份均指向 core 中的同一实例。
 type (
 	KvProvider    = core.KvProvider

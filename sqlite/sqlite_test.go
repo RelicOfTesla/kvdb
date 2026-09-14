@@ -9,9 +9,9 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"kvdb/core"
-	"kvdb/internal/behaviortest"
-	"kvdb/sqlite"
+	"github.com/RelicOfTesla/kvdb/core"
+	"github.com/RelicOfTesla/kvdb/internal/behaviortest"
+	"github.com/RelicOfTesla/kvdb/sqlite"
 )
 
 // TestBehavior 用内存 SQLite 验证 sqlstore 共享实现的完整行为。

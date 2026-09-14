@@ -22,9 +22,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"kvdb"
-	"kvdb/core"
-	"kvdb/mem"
+	"github.com/RelicOfTesla/kvdb"
+	"github.com/RelicOfTesla/kvdb/core"
+	"github.com/RelicOfTesla/kvdb/mem"
 )
 
 func init() { kvdb.MustRegister("jsonl", OpenURI) }

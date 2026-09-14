@@ -9,8 +9,8 @@ import (
 	"sync"
 	"testing"
 
-	"kvdb"
-	"kvdb/core"
+	"github.com/RelicOfTesla/kvdb"
+	"github.com/RelicOfTesla/kvdb/core"
 )
 
 // Run 对 factory 产出的新实例依次跑 KV/Queue/ZSet 三套用例；

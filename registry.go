@@ -7,7 +7,7 @@ import (
 	"sort"
 	"sync"
 
-	"kvdb/core"
+	"github.com/RelicOfTesla/kvdb/core"
 )
 
 // OpenFunc 按解析后的 URI 构造一个基座。自定义基座通过 Register 接入后，
@@ -17,8 +17,8 @@ type OpenFunc func(ctx context.Context, u *url.URL) (core.KvProvider, error)
 // registry 默认**为空**：根包不绑定任何基座实现，因而不引入任何驱动依赖。
 // 各基座包在 init 中自行注册（显式注册模式），接入方式二选一：
 //
-//	import _ "kvdb/sqlite"              // 只接入需要的基座（推荐：依赖最小）
-//	import _ "kvdb/all"                 // 一次性接入全部内置基座
+//	import _ "github.com/RelicOfTesla/kvdb/sqlite"              // 只接入需要的基座（推荐：依赖最小）
+//	import _ "github.com/RelicOfTesla/kvdb/all"                 // 一次性接入全部内置基座
 //
 // 同一 kvdb.Open(ctx, "sqlite://./db") 的调用方代码在两种方式下完全一致。
 var (
@@ -76,7 +76,7 @@ func open(ctx context.Context, uri string) (DB, error) {
 	registryMu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("kvdb: unknown provider scheme %q (registered: %v); "+
-			"import the backend package (e.g. _ \"kvdb/%s\") or _ \"kvdb/all\"",
+			"import the backend package (e.g. _ \"github.com/RelicOfTesla/kvdb/%s\") or _ \"github.com/RelicOfTesla/kvdb/all\"",
 			u.Scheme, Schemes(), u.Scheme)
 	}
 	p, err := opener(ctx, u)
@@ -88,7 +88,7 @@ func open(ctx context.Context, uri string) (DB, error) {
 
 // 内置基座的 URI 约定（各 scheme 由对应基座包注册，见各包 OpenURI）：
 //
-//	import _ "kvdb/mem"      // 或 import _ "kvdb/all" 一次性全部接入
+//	import _ "github.com/RelicOfTesla/kvdb/mem"      // 或 import _ "github.com/RelicOfTesla/kvdb/all" 一次性全部接入
 //
 //	kvdb.Open(ctx, "mem://")
 //	kvdb.Open(ctx, "jsonl://./data.jsonl?sync=1")

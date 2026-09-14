@@ -17,8 +17,8 @@ import (
 
 	goredis "github.com/redis/go-redis/v9"
 
-	"kvdb"
-	"kvdb/core"
+	"github.com/RelicOfTesla/kvdb"
+	"github.com/RelicOfTesla/kvdb/core"
 )
 
 func init() { kvdb.MustRegister("redis", OpenURI) }

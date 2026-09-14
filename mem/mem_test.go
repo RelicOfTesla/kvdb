@@ -4,9 +4,9 @@ import (
 	"context"
 	"testing"
 
-	"kvdb/core"
-	"kvdb/internal/behaviortest"
-	"kvdb/mem"
+	"github.com/RelicOfTesla/kvdb/core"
+	"github.com/RelicOfTesla/kvdb/internal/behaviortest"
+	"github.com/RelicOfTesla/kvdb/mem"
 )
 
 func TestBehavior(t *testing.T) {

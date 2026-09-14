@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"kvdb/core"
-	"kvdb/internal/behaviortest"
-	"kvdb/jsonl"
+	"github.com/RelicOfTesla/kvdb/core"
+	"github.com/RelicOfTesla/kvdb/internal/behaviortest"
+	"github.com/RelicOfTesla/kvdb/jsonl"
 )
 
 // factory 每个用例使用独立临时文件。

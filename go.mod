@@ -1,4 +1,4 @@
-module kvdb
+module github.com/RelicOfTesla/kvdb
 
 go 1.25.0
 

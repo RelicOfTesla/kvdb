@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	"kvdb"
-	"kvdb/core"
+	"github.com/RelicOfTesla/kvdb"
+	"github.com/RelicOfTesla/kvdb/core"
 )
 
 type myID int64 // 自定义底层类型别名，验证 ~int64 约束

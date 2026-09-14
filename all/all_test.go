@@ -1,4 +1,4 @@
-// Package all_test 验证 import _ "kvdb/all" 后全部内置 scheme 均已注册，
+// Package all_test 验证 import _ "github.com/RelicOfTesla/kvdb/all" 后全部内置 scheme 均已注册，
 // 且文件型/内存型基座可经 kvdb.Open 真正打开（服务型基座仅校验注册与解析，
 // 不在单测中要求外部服务在线）。
 package all_test
@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"kvdb"
-	_ "kvdb/all" // 被测对象：一次性注册全部内置基座
+	"github.com/RelicOfTesla/kvdb"
+	_ "github.com/RelicOfTesla/kvdb/all" // 被测对象：一次性注册全部内置基座
 )
 
 func TestAllSchemesRegistered(t *testing.T) {

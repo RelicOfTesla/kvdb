@@ -8,9 +8,9 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 
-	"kvdb/core"
-	"kvdb/internal/behaviortest"
-	"kvdb/mysql"
+	"github.com/RelicOfTesla/kvdb/core"
+	"github.com/RelicOfTesla/kvdb/internal/behaviortest"
+	"github.com/RelicOfTesla/kvdb/mysql"
 )
 
 // TestBehavior 仅在显式设置 KVDB_TEST_MYSQL_DSN 时运行真实 MySQL 用例：

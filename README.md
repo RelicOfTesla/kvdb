@@ -2,7 +2,7 @@
 
 以 **Redis / SSDB 命令语义为原型**的 Go 持久化适配器 SDK：对外提供统一的
 **KV + Queue + ZSet** 接口，底层可插拔切换不同持久化基座（内存 / 文件日志 /
-SQL / Redis / SSDB），并内置批量写与字节编解码辅助。
+SQL / Redis / SSDB / BoltDB），并内置批量写与字节编解码辅助。
 
 ```go
 db, _ := kvdb.Open(ctx, "sqlite://./data.db")
@@ -14,7 +14,7 @@ n, err := db.Incr(ctx, "visits", 1)
 
 ## 特性
 
-- **7 个内置基座**，同一套 API：`mem` / `jsonl` / `sqlite` / `mysql` / `pg` / `redis` / `ssdb`
+- **8 个内置基座**，同一套 API：`mem` / `jsonl` / `bolt` / `sqlite` / `mysql` / `pg` / `redis` / `ssdb`
 - **能力可选、按需探测**：KV 必选；Queue / ZSet / Batch / 生命周期为可选能力，
   未实现时返回 `ErrUnsupported`，可用 `Capabilities()` 探测
 - **注册表默认空**：用哪个基座就 `import _` 哪个包，根包不引入任何驱动依赖
@@ -26,7 +26,7 @@ n, err := db.Incr(ctx, "visits", 1)
 
 需要 Go 1.25+。依赖按基座引入：`sqlite`（modernc.org/sqlite）、`mysql`
 （go-sql-driver/mysql）、`pg`（jackc/pgx）、`redis`（redis/go-redis）；
-`mem` / `jsonl` / `ssdb` 仅用标准库。
+`bolt`（go.etcd.io/bbolt）、`mem` / `jsonl` / `ssdb` 仅用标准库或纯 Go 库。
 
 ## 引入方式
 
@@ -80,6 +80,7 @@ URI 一览（各包也提供等价的直接构造函数，如 `sqlite.Open`）�
 mem://
 jsonl://./data.jsonl?sync=1        # sync=1 每次写 fsync
 sqlite://./data.db
+bolt://./data.bolt?nosync=1        # nosync=1 关闭 fsync（更快，崩溃可能丢最近提交）
 mysql://user:pass@host:3306/dbname?parseTime=true
 pg://user:pass@host:5432/dbname?sslmode=disable
 redis://:password@host:6379/0
@@ -95,6 +96,7 @@ ssdb://:password@host:8888         # 服务端启用 server.auth 时
 |---|---|---|---|---|---|
 | 纯内存 | `mem` | ✅ | ✅ | ✅ | 不落盘，测试/缓存 |
 | JSONL 日志 | `jsonl` | ✅ | ✅ | ✅ | append-only WAL，打开时回放，支持 `Compact()`；单进程内嵌 |
+| BoltDB | `bolt` | ✅ | ✅ | ✅ | bbolt 单文件 B+tree（纯 Go）；每写一次事务提交，批写整批一次提交 |
 | SQLite | `sqlite` | ✅ | ✅ | ✅ | 纯 Go 驱动（modernc），无 CGO |
 | MySQL | `mysql` | ✅ | ✅ | ✅ | 共享 `sqlstore` |
 | PostgreSQL | `pg` | ✅ | ✅ | ✅ | 共享 `sqlstore` |
@@ -241,6 +243,7 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 | Redis 无字节序范围扫描 | redis 基座全量 SCAN + 客户端过滤排序，**代价与 keyspace 大小相关** |
 | SQL 过期行 | 读取路径过滤，开库时清理一次 |
 | SQLite 并发写 | 进程内写串行化（单写者），WAL 保留读并行 |
+| BoltDB 并发写 | 单写者、多读者（MVCC）；写操作按 bbolt 事务串行提交 |
 | Redis 的 `Set` | 用 `SET ... KEEPTTL` 保持既有 TTL（需 Redis ≥ 6.0） |
 | SQL 键长 | MySQL 键列上限 255 字节（兼容 5.6 默认索引前缀）；PostgreSQL/SQLite 用 BYTEA/BLOB 无此限制 |
 

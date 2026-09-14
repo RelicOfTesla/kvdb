@@ -4,3 +4,4 @@
 .gotmp/
 .ref/
 /.docker
+.gomodcache-w/

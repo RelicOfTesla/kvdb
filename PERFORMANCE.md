@@ -30,6 +30,8 @@
 | jsonl（tmpfs） | ~40k | ~2.6M | ~**200k** | — |
 | sqlite（drvfs(9p)） | ~600 | ~2.4k | ~120–136 | ~91–95 |
 | sqlite（tmpfs） | ~24k | ~25k | ~10.6k | ~6.1k |
+| bolt（sync） | ~58k | ~900k | ~57k | ~27k |
+| bolt（nosync） | ~50k | ~500k | ~54k | ~35k |
 | ssdb | ~1.7k–3.7k | ~1.6k–4.0k | ~1.8k–3.8k | ~1.6k–3.4k |
 | redis | ~2.1k–4.2k | ~2.3k–4.1k | ~2.4k–4.6k | ~2.0k–3.6k |
 | mysql（8.0） | ~900 | ~1.0k | ~90–160 | ~83–105 |
@@ -48,12 +50,12 @@
 
 ## 3. 写入成本模型（每操作）
 
-| 操作 | mem | jsonl | sqlite / pg | mysql | redis | ssdb |
-|---|---|---|---|---|---|---|
-| Set | map 写 | 1 次 append+flush | 1 条 upsert | 1 条 upsert | 1 命令 | 1 往返 |
-| Incr | map 写 | 1 次 append+flush | 1 条 upsert+`RETURNING` | 事务：3 条语句 | 1 命令 | 1 往返 |
-| QPush | map 写 | 1 次 append+flush | 事务：2 条语句 | 事务：4 条语句 | 1 命令 | 1 往返 |
-| Batch(N) | N 次写（1 次持锁） | 1 次 write+flush | **1 个事务** | **1 个事务** | 1 次 MULTI/EXEC | 1 次流水线 |
+| 操作 | mem | jsonl | bolt | sqlite / pg | mysql | redis | ssdb |
+|---|---|---|---|---|---|---|---|
+| Set | map 写 | 1 次 append+flush | 1 个事务（1 fsync） | 1 条 upsert | 1 条 upsert | 1 命令 | 1 往返 |
+| Incr | map 写 | 1 次 append+flush | 1 个事务 | 1 条 upsert+`RETURNING` | 事务：3 条语句 | 1 命令 | 1 往返 |
+| QPush | map 写 | 1 次 append+flush | 1 个事务 | 事务：2 条语句 | 事务：4 条语句 | 1 命令 | 1 往返 |
+| Batch(N) | N 次写（1 次持锁） | 1 次 write+flush | **1 个事务** | **1 个事务** | **1 个事务** | 1 次 MULTI/EXEC | 1 次流水线 |
 
 SQL 写入的瓶颈是**每个事务一次持久化（fsync）**，而不是语句条数。同机隔离实验
 （MySQL，300 次单语句自增）：
@@ -72,6 +74,7 @@ SQL 写入的瓶颈是**每个事务一次持久化（fsync）**，而不是语�
 |---|---|---|---|
 | mem | ~250k | ~2.4M | 锁竞争 vs 无竞争 |
 | ssdb | ~10.9k | ~12.3k | 连接池后可并行（见 §7） |
+| bolt | ~47k | ~45k | 单写者按事务串行（多 key 无额外收益） |
 | redis | ~10.5k | ~11.8k | go-redis 连接池 |
 | jsonl | ~1.8k | ~1.8k | 写路径必须串行（单日志文件） |
 | sqlite | ~120 | ~120 | 进程内写串行化（单写者） |
@@ -90,6 +93,7 @@ SQL 写入的瓶颈是**每个事务一次持久化（fsync）**，而不是语�
 |---|---|---|---|
 | MySQL | 130 op/s | 793 op/s | **6.1×** |
 | PostgreSQL | 521 op/s | 1,715 op/s | **3.3×** |
+| BoltDB | 57,800 op/s | **446,000 op/s** | **7.7×** |
 | SQLite | 124 op/s | 6,167 op/s | **49.7×** |
 | JSONL | 1,764 op/s | 117,052 op/s | **66.4×** |
 | Redis | 2,329 op/s | 88,027 op/s | **37.8×** |
@@ -99,13 +103,40 @@ SQL 写入的瓶颈是**每个事务一次持久化（fsync）**，而不是语�
 jsonl=一次 flush），是**唯一能跨数量级提升写入的手段**，且不牺牲原子性
 （提交失败整批不生效；SSDB 无事务，流水线失败可能部分生效）。
 
+> 口径说明：BoltDB/SQLite 行来自 `./bench`（进程内基座，同机同盘）；MySQL/PG/Redis/SSDB
+> 行来自另一组对比探针（容器 + 9p 挂载），两者绝对值不可直接横比，只用于各自的前后对比。
 > 表中 SQLite / JSONL 的绝对值是在 drvfs(9p) 挂载上测得的；同一份代码在 tmpfs 上更高
-> （例如 SQLite 批写约 48k op/s），差异来自存储介质而非实现（见 §2、§6）。
+> （例如 SQLite 批写约 48k op/s），差异来自存储介质而非实现（见 §2、§7）。
 
 SQL 的批内仍是逐条语句、往返次数未减少，所以提升小于 Redis/jsonl；后续可把
 连续 `Set` 合并为多行 `INSERT` 进一步压缩往返。
 
-## 6. SQLite 驱动选择：纯 Go vs CGO
+## 6. BoltDB 基座（bbolt）
+
+`bolt` 基座基于 `go.etcd.io/bbolt`（纯 Go 单文件 B+tree），同机同盘（9p）对比 SQLite：
+
+| 基准 | bolt（默认） | bolt（nosync=1） | sqlite | 相对 sqlite |
+|---|---|---|---|---|
+| Set | 17.3 µs（58k/s） | 20.0 µs | 30.1 µs | **1.7×** |
+| Get | **1.1 µs（900k/s）** | 2.0 µs | 31.1 µs | **28×** |
+| Incr（单键） | 17.4 µs（57k/s） | 18.4 µs | 72.2 µs | **4.1×** |
+| Incr 并发热点 | 21.3 µs | 23.5 µs | 96.4 µs | **4.5×** |
+| Incr 并发多 key | 22.0 µs | 22.5 µs | 98.3 µs | **4.5×** |
+| BatchSet100（单 iter=100 写） | 224 µs（2.2 µs/写） | 174 µs | 2,161 µs（21.6 µs/写） | **9.6×** |
+| QPush | 37.6 µs | 28.3 µs | 117.7 µs | **3.1×** |
+
+要点：
+
+- **读极快**：bbolt 走 mmap/B+tree 查找，Get 在 µs 级；SQLite 每条查询都有语句准备与解析开销。
+- **写由事务提交支配**：与 SQL 同因（一次提交一次 fsync），故单键 Incr 与 Set 同量级。
+- **批写收益明显**：`db.Batch` 落到单个 bbolt 事务，100 条只提交一次（2.2 µs/写）。
+- `nosync=1` 关闭 fsync：本轮多数项在噪声内（Batch/QPush 略快，Set/Get 略慢），
+  收益不显著而牺牲崩溃持久性，**不建议默认开启**。
+- 选型：需要"嵌入式 + 单文件 + 强于 SQLite 的点查/批量写"时选 `bolt`；
+  需要 SQL、复杂查询或多进程共享同一文件时选 `sqlite`/`mysql`/`pg`
+  （bbolt 文件同时只能被一个进程以写模式打开）。
+
+## 7. SQLite 驱动选择：纯 Go vs CGO
 
 同一 `sqlstore` 实现，仅替换底层驱动（pure-Go = `modernc.org/sqlite`，
 CGO = `mattn/go-sqlite3`）：
@@ -120,7 +151,7 @@ CGO = `mattn/go-sqlite3`）：
 CGO 只在 I/O 免费时快 1.6–1.8×；真实存储上两者基本一致（瓶颈是每事务持久化，
 而非驱动实现）。因此本项目选用纯 Go 驱动，免去 CGO/gcc/交叉编译成本。
 
-## 7. 其他已落地的优化与实测效果
+## 8. 其他已落地的优化与实测效果
 
 | 优化 | 效果 |
 |---|---|
@@ -132,7 +163,7 @@ CGO 只在 I/O 免费时快 1.6–1.8×；真实存储上两者基本一致（�
 | jsonl 流式回放 | 打开时内存峰值从 ~2× 文件降到单行 |
 | SQLite 进程内写串行化 | 消除多连接并发写的 `SQLITE_BUSY` |
 
-## 8. 选型建议
+## 9. 选型建议
 
 1. **高频写 / 队列 / 计数器**：`redis` 或 `ssdb`（单操作 2–4k op/s，并发 10k+）；
    需要持久化到文件且单进程内嵌时用 `jsonl`（写受介质限制）。
@@ -146,7 +177,7 @@ CGO 只在 I/O 免费时快 1.6–1.8×；真实存储上两者基本一致（�
 5. **不要为性能换存储引擎**：同机实验里 MyISAM 约为 InnoDB 的 2×，但无事务、
    崩溃易损毁，本项目不采用；MySQL 官方发行版亦无 RocksDB 引擎。
 
-## 9. 复现
+## 10. 复现
 
 基准位于 `./bench/`，通过 `KVDB_BENCH_URI` 指定基座；未设置时自动跳过（不影响 `go test ./...`）：
 
@@ -155,6 +186,8 @@ CGO 只在 I/O 免费时快 1.6–1.8×；真实存储上两者基本一致（�
 KVDB_BENCH_URI=mem://                  go test -bench . -benchtime 2000x ./bench/
 KVDB_BENCH_URI=jsonl://./bench.jsonl   go test -bench . -benchtime 2000x ./bench/
 KVDB_BENCH_URI=sqlite://./bench.db     go test -bench . -benchtime 2000x ./bench/
+KVDB_BENCH_URI=bolt://./bench.bolt     go test -bench . -benchtime 2000x ./bench/
+KVDB_BENCH_URI='bolt://./bench.bolt?nosync=1' go test -bench . -benchtime 2000x ./bench/
 
 # 服务型基座（先起容器，见 README「测试」）
 KVDB_BENCH_URI=redis://127.0.0.1:6379/0            go test -bench . -benchtime 2000x ./bench/

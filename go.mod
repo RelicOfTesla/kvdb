@@ -7,6 +7,7 @@ require (
 	github.com/go-sql-driver/mysql v1.10.1
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/redis/go-redis/v9 v9.22.0
+	go.etcd.io/bbolt v1.5.0
 	modernc.org/sqlite v1.58.0
 )
 

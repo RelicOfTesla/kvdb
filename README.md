@@ -21,6 +21,7 @@ n, err := db.Incr(ctx, "visits", 1)
 - **接口化返回**：`kvdb.Open` 返回接口 `DB`，业务可窄依赖 `KvProvider` 等子接口，便于 mock
 - **批量写**：一批操作映射到各基座原生机制（事务 / MULTI/EXEC / 流水线 / 单次 flush）
 - **字节 ↔ 泛型辅助**：`B` / `P` / `D` / `DMust` 支持标量与结构体（默认 JSON，编解码可替换），标量编码与 `Incr` 互操作
+- **Go 1.27+ 可选薄壳**：`kvdb.Typed(db)` 提供 `db.Get[T](...)` 泛型方法（构建约束隔离，不影响旧版本）
 - 纯 Go 依赖，无 CGO
 
 需要 Go 1.25+。依赖按基座引入：`sqlite`（modernc.org/sqlite）、`mysql`
@@ -192,6 +193,28 @@ func init() {
 ```
 
 注意 `B` 对编码失败会 panic（不返回 error）；需要错误处理时直接调用 `Marshal`。
+
+### Go 1.27+：`TypedDB` 薄壳（`db.Get[T](...)`）
+
+用 Go 1.27+ 构建时会额外提供 `TypedDB` 薄壳，把「取字节 + 解码」合并为泛型方法
+（Go 1.27 起支持方法级类型参数）：
+
+```go
+tdb := kvdb.Typed(db)
+u, err := tdb.Get[User](ctx, "user:1")    // = kvdb.D[User](db.Get(ctx, "user:1"))
+n, err := tdb.Get[int64](ctx, "visits")
+job, err := tdb.QPop[string](ctx, "jobs")
+ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
+```
+
+- 提供 `Get` / `GetOK` / `MGet` / `QPop` / `QPopBack` / `QFront` / `QBack`；
+  缺失的 key 返回 `ErrNotFound`（`GetOK` 保留 `ok` 语义）；
+- 编码解码复用 `B`/`P` 与可替换的 `Marshal`/`Unmarshal`，标量仍与 `Incr` 互操作；
+- 其余方法（`Set` / `QPush` / `ZSet` / `Batch` / `Close` …）经内嵌 `DB` 直接透传；
+  但泛型方法会遮蔽同名方法，**`TypedDB` 不再满足 `DB` 接口**，需要 DB 语义时用
+  `tdb.DB` 或保留原始 `db`；
+- 实现放在带 `//go:build go1.27` 约束的文件中，**模块的 go 指令无需抬高**：
+  Go < 1.27 的工具链不编译该文件，`TypedDB` / `Typed` 不存在，其余功能不受影响。
 
 ## 语义要点
 

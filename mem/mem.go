@@ -33,7 +33,7 @@ type entry struct {
 
 // Provider 是内存基座。并发安全；ctx 仅用于接口一致，不参与调度。
 type Provider struct {
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	kv     map[string]*entry
 	queue  map[string]*list.List
 	zset   map[string]map[string]int64
@@ -101,8 +101,8 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	_ = ctx
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if err := p.checkOpen(); err != nil {
 		return nil, false, err
 	}
@@ -126,8 +126,8 @@ func (p *Provider) Del(ctx context.Context, key string) error {
 
 func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 	_ = ctx
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if err := p.checkOpen(); err != nil {
 		return false, err
 	}
@@ -159,8 +159,8 @@ func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, er
 
 func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte, error) {
 	_ = ctx
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if err := p.checkOpen(); err != nil {
 		return nil, err
 	}
@@ -176,8 +176,8 @@ func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte,
 
 func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]core.KeyValue, error) {
 	_ = ctx
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if err := p.checkOpen(); err != nil {
 		return nil, err
 	}
@@ -226,8 +226,8 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 
 func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
 	_ = ctx
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if err := p.checkOpen(); err != nil {
 		return 0, false, err
 	}
@@ -258,8 +258,8 @@ type Snapshot struct {
 }
 
 func (p *Provider) Snapshot() Snapshot {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	now := time.Now().Unix()
 	s := Snapshot{
 		KV:    make(map[string][]byte, len(p.kv)),
@@ -352,8 +352,8 @@ func (p *Provider) qpop(_ context.Context, name string, back bool) ([]byte, bool
 }
 
 func (p *Provider) QSize(_ context.Context, name string) (int64, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if err := p.checkOpen(); err != nil {
 		return 0, err
 	}
@@ -372,8 +372,8 @@ func (p *Provider) QBack(ctx context.Context, name string) ([]byte, bool, error)
 }
 
 func (p *Provider) qfront(_ context.Context, name string, back bool) ([]byte, bool, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if err := p.checkOpen(); err != nil {
 		return nil, false, err
 	}
@@ -405,8 +405,8 @@ func (p *Provider) ZSet(_ context.Context, name, key string, score int64) error 
 }
 
 func (p *Provider) ZGet(_ context.Context, name, key string) (int64, bool, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if err := p.checkOpen(); err != nil {
 		return 0, false, err
 	}
@@ -427,8 +427,8 @@ func (p *Provider) ZDel(_ context.Context, name, key string) error {
 }
 
 func (p *Provider) ZSize(_ context.Context, name string) (int64, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if err := p.checkOpen(); err != nil {
 		return 0, err
 	}
@@ -436,8 +436,8 @@ func (p *Provider) ZSize(_ context.Context, name string) (int64, error) {
 }
 
 func (p *Provider) ZRank(_ context.Context, name, key string) (int64, bool, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if err := p.checkOpen(); err != nil {
 		return 0, false, err
 	}
@@ -455,8 +455,8 @@ func (p *Provider) ZRank(_ context.Context, name, key string) (int64, bool, erro
 }
 
 func (p *Provider) ZRange(_ context.Context, name string, start, stop int64) ([]core.ZItem, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if err := p.checkOpen(); err != nil {
 		return nil, err
 	}

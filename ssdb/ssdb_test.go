@@ -565,3 +565,73 @@ func TestAuth(t *testing.T) {
 		defer p.Close()
 	})
 }
+
+// TestPoolConcurrency 验证连接池下并发读写的正确性与互不串扰：
+// 多 goroutine 各自读写私有 key，最终值必须与各自写入一致
+// （单连接时代的串行化不会暴露连接间状态残留，池化后必须验证）。
+func TestPoolConcurrency(t *testing.T) {
+	srv := newFakeSSDB(t)
+	p, err := ssdb.OpenWithConfig(context.Background(), ssdb.Config{
+		Addr:     srv.addr(),
+		PoolSize: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	ctx := context.Background()
+
+	const g, per = 6, 50
+	var wg sync.WaitGroup
+	errs := make(chan error, g)
+	for i := 0; i < g; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			key := fmt.Sprintf("k%d", id)
+			val := []byte(fmt.Sprintf("v%d", id))
+			for j := 0; j < per; j++ {
+				if err := p.Set(ctx, key, val); err != nil {
+					errs <- err
+					return
+				}
+				got, ok, err := p.Get(ctx, key)
+				if err != nil {
+					errs <- err
+					return
+				}
+				if !ok || string(got) != string(val) {
+					errs <- fmt.Errorf("goroutine %d: Get = %q,%v want %q", id, got, ok, val)
+					return
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+}
+
+// TestPoolCloseDuringOps 验证关闭后不再接受新操作且不 panic。
+func TestPoolCloseDuringOps(t *testing.T) {
+	srv := newFakeSSDB(t)
+	p, err := ssdb.OpenWithConfig(context.Background(), ssdb.Config{Addr: srv.addr(), PoolSize: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := p.Set(ctx, "k", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Set(ctx, "k", []byte("v")); !errors.Is(err, core.ErrClosed) {
+		t.Fatalf("关闭后应 ErrClosed, got %v", err)
+	}
+	if err := p.Close(); err != nil { // 幂等
+		t.Fatalf("重复 Close 应无错, got %v", err)
+	}
+}

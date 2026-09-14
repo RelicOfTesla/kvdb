@@ -68,7 +68,7 @@ type op struct {
 
 // Provider 是 JSONL 基座。并发安全；ctx 仅用于接口一致。
 type Provider struct {
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	mem    *mem.Provider
 	file   *os.File
 	bw     *bufio.Writer
@@ -98,35 +98,57 @@ func Open(ctx context.Context, path string, cfg Config) (*Provider, error) {
 	return p, nil
 }
 
-// replay 打开时回放日志。遇首个无法解析的行即停止：尾部半行是崩溃残留，
-// 属正常容错；若坏行之后还有完整行则说明日志损坏，返回错误。
+// replay 打开时流式回放日志（内存峰值限单行，不缓存全文件）。
+// 容错规则：最后一行无法解析视为崩溃残留的半行直接忽略；
+// 若坏行之后还有完整行，则说明日志损坏，返回错误。
+// 实现采用"延迟一行"策略：读入新行时先应用上一行——上一行若坏且仍读到
+// 后续行即为中间损坏；EOF 时上行的解析结果决定是否容忍。
 func (p *Provider) replay() error {
 	if _, err := p.file.Seek(0, 0); err != nil {
 		return fmt.Errorf("jsonl: seek: %w", err)
 	}
 	sc := bufio.NewScanner(p.file)
 	sc.Buffer(make([]byte, 0, 64*1024), 64*1024*1024) // 单值上限 64MiB
-	var lines []string
+
+	now := time.Now().Unix()
+	// deferred 是暂缓的一行及其序号：读入下一行前应用它，
+	// 以便区分"坏行是最后一行（容忍）"与"坏行在中间（报错）"。
+	var deferred *string
+	lineNo := 0
+	flush := func() error {
+		if deferred == nil {
+			return nil
+		}
+		defer func() { deferred = nil }()
+		if *deferred == "" {
+			return nil
+		}
+		var rec op
+		if err := json.Unmarshal([]byte(*deferred), &rec); err != nil {
+			return fmt.Errorf("jsonl: replay line %d: %w", lineNo, err)
+		}
+		return p.apply(rec, now)
+	}
 	for sc.Scan() {
-		lines = append(lines, sc.Text())
+		lineNo++
+		// 先应用上一行；坏行若在此报错说明它后面还有行（中间损坏）。
+		if err := flush(); err != nil {
+			return err
+		}
+		line := sc.Text()
+		deferred = &line
 	}
 	if err := sc.Err(); err != nil {
 		return fmt.Errorf("jsonl: read: %w", err)
 	}
-	now := time.Now().Unix()
-	for i, line := range lines {
-		if line == "" {
-			continue
-		}
+	// EOF：deferred 为最后一行。坏行（如写入中断的半行）按崩溃残留容忍；
+	// 完整行正常应用。
+	if err := flush(); err != nil && deferred != nil {
+		// 最后一行坏：仅当确实是 JSON 解析失败时忽略，其余错误（应用失败）
+		// 仍应上报。
 		var rec op
-		if err := json.Unmarshal([]byte(line), &rec); err != nil {
-			if i == len(lines)-1 {
-				break // 容忍崩溃残留的尾部半行
-			}
-			return fmt.Errorf("jsonl: replay line %d: %w", i+1, err)
-		}
-		if err := p.apply(rec, now); err != nil {
-			return fmt.Errorf("jsonl: replay line %d: %w", i+1, err)
+		if uerr := json.Unmarshal([]byte(*deferred), &rec); uerr == nil {
+			return err
 		}
 	}
 	return nil
@@ -233,8 +255,8 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 }
 
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if p.closed {
 		return nil, false, core.ErrClosed
 	}
@@ -254,8 +276,8 @@ func (p *Provider) Del(ctx context.Context, key string) error {
 }
 
 func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if p.closed {
 		return false, core.ErrClosed
 	}
@@ -276,8 +298,8 @@ func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, er
 }
 
 func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if p.closed {
 		return nil, core.ErrClosed
 	}
@@ -285,8 +307,8 @@ func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte,
 }
 
 func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]core.KeyValue, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if p.closed {
 		return nil, core.ErrClosed
 	}
@@ -309,8 +331,8 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 }
 
 func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if p.closed {
 		return 0, false, core.ErrClosed
 	}
@@ -373,8 +395,8 @@ func (p *Provider) qpop(ctx context.Context, name string, back bool) ([]byte, bo
 }
 
 func (p *Provider) QSize(ctx context.Context, name string) (int64, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if p.closed {
 		return 0, core.ErrClosed
 	}
@@ -382,8 +404,8 @@ func (p *Provider) QSize(ctx context.Context, name string) (int64, error) {
 }
 
 func (p *Provider) QFront(ctx context.Context, name string) ([]byte, bool, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if p.closed {
 		return nil, false, core.ErrClosed
 	}
@@ -391,8 +413,8 @@ func (p *Provider) QFront(ctx context.Context, name string) ([]byte, bool, error
 }
 
 func (p *Provider) QBack(ctx context.Context, name string) ([]byte, bool, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if p.closed {
 		return nil, false, core.ErrClosed
 	}
@@ -414,8 +436,8 @@ func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) erro
 }
 
 func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if p.closed {
 		return 0, false, core.ErrClosed
 	}
@@ -435,8 +457,8 @@ func (p *Provider) ZDel(ctx context.Context, name, key string) error {
 }
 
 func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if p.closed {
 		return 0, core.ErrClosed
 	}
@@ -444,8 +466,8 @@ func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
 }
 
 func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if p.closed {
 		return 0, false, core.ErrClosed
 	}
@@ -453,8 +475,8 @@ func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, er
 }
 
 func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) ([]core.ZItem, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if p.closed {
 		return nil, core.ErrClosed
 	}

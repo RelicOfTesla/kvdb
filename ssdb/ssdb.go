@@ -52,15 +52,24 @@ type Config struct {
 	Addr string
 	// Password 非空时在 Open 阶段自动执行 auth；密码错返回 ErrAuth。
 	Password string
+	// PoolSize 是并发连接上限，<=0 取 DefaultPoolSize。SSDB 单连接为串行
+	// 请求-应答，池化让并发调用真正并行（此前单连接下并发无提升）。
+	PoolSize int
 }
 
-// Provider 是 SSDB 基座。并发安全（请求级互斥）；ctx 可携带超时。
+// DefaultPoolSize 是未显式配置时的连接池大小。
+const DefaultPoolSize = 8
+
+// Provider 是 SSDB 基座。连接池并发安全：每次操作借一条连接串行收发，
+// 用毕归还；池空时阻塞等待（受 ctx 约束）。ctx 可携带超时。
 type Provider struct {
-	mu     sync.Mutex
-	c      *conn
-	addr   string
-	authed bool
-	closed bool
+	addr      string
+	password  string
+	idle      chan *conn    // 空闲连接队列，容量即池大小
+	slots     chan struct{} // 并发名额（在借连接数 + 池内连接数）
+	poolSize  int
+	closed    chan struct{}
+	closeOnce sync.Once
 }
 
 // Open 连接到 addr（host:port；缺省端口补 8888），不带认证。
@@ -68,33 +77,125 @@ func Open(ctx context.Context, addr string) (*Provider, error) {
 	return OpenWithConfig(ctx, Config{Addr: addr})
 }
 
-// OpenWithConfig 按配置连接；Password 非空时自动完成认证。
+// OpenWithConfig 按配置建立连接池；Password 非空时每条连接建立后先认证。
 func OpenWithConfig(ctx context.Context, cfg Config) (*Provider, error) {
 	addr := cfg.Addr
 	if !strings.Contains(addr, ":") {
 		addr = addr + ":8888"
 	}
-	c, err := dial(ctx, addr)
+	size := cfg.PoolSize
+	if size <= 0 {
+		size = DefaultPoolSize
+	}
+	p := &Provider{
+		addr:     addr,
+		password: cfg.Password,
+		idle:     make(chan *conn, size),
+		slots:    make(chan struct{}, size),
+		poolSize: size,
+		closed:   make(chan struct{}),
+	}
+	// 预建一条连接用于启动期连通性/认证校验，失败即报错（保留原语义）。
+	c, err := p.openConn(ctx)
 	if err != nil {
 		return nil, err
 	}
-	p := &Provider{c: c, addr: addr}
-	if cfg.Password != "" {
-		if err := p.Auth(ctx, cfg.Password); err != nil {
+	p.idle <- c
+	return p, nil
+}
+
+// openConn 新建一条连接并按需认证。
+func (p *Provider) openConn(ctx context.Context) (*conn, error) {
+	c, err := dial(ctx, p.addr)
+	if err != nil {
+		return nil, err
+	}
+	if p.password != "" {
+		st, recs, err := c.request(ctx, []byte("auth"), []byte(p.password))
+		if err != nil {
 			c.c.Close()
 			return nil, err
 		}
+		if st != "ok" {
+			c.c.Close()
+			return nil, fmt.Errorf("%w: %s", ErrAuth, firstOr(recs, st))
+		}
 	}
-	return p, nil
+	return c, nil
+}
+
+// acquire 借出一条已认证连接；池空且已达上限时阻塞等待空闲连接或 ctx 结束。
+func (p *Provider) acquire(ctx context.Context) (*conn, error) {
+	select {
+	case <-p.closed:
+		return nil, core.ErrClosed
+	default:
+	}
+	select {
+	case c := <-p.idle:
+		return c, nil
+	default:
+	}
+	// 池内暂无空闲：若尚未达上限则新建，否则等待归还。
+	if p.tryReserve() {
+		c, err := p.openConn(ctx)
+		if err != nil {
+			p.release()
+			return nil, err
+		}
+		return c, nil
+	}
+	select {
+	case c := <-p.idle:
+		return c, nil
+	case <-p.closed:
+		return nil, core.ErrClosed
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// release 释放一个并发名额（归还或新建失败时调用）。
+func (p *Provider) release() {
+	select {
+	case p.slots <- struct{}{}:
+	default:
+	}
+}
+
+// tryReserve 尝试占用一个并发名额，成功返回 true。
+func (p *Provider) tryReserve() bool {
+	select {
+	case p.slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// put 归还连接；Provider 已关闭则直接关闭连接。
+func (p *Provider) put(c *conn) {
+	select {
+	case <-p.closed:
+		c.c.Close()
+		p.release()
+		return
+	default:
+	}
+	select {
+	case p.idle <- c:
+	default:
+		// 池已满（理论上不会：名额与容量一致），保守丢弃。
+		c.c.Close()
+		p.release()
+	}
 }
 
 // Auth 以 password 认证当前连接（SSDB auth 命令）。服务端未配置 auth 时
 // SSDB 一律返回 ok；密码错误返回 ErrAuth。
 func (p *Provider) Auth(ctx context.Context, password string) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.closed {
-		return core.ErrClosed
+	if err := p.check(); err != nil {
+		return err
 	}
 	st, recs, err := p.do(ctx, "auth", password)
 	if err != nil {
@@ -104,34 +205,54 @@ func (p *Provider) Auth(ctx context.Context, password string) error {
 		// 服务端回复 error + "invalid password"（见 SSDB net/server.cpp proc_auth）。
 		return fmt.Errorf("%w: %s", ErrAuth, firstOr(recs, st))
 	}
-	p.authed = true
 	return nil
 }
 
 func (p *Provider) Close() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.closed {
-		return nil
-	}
-	p.closed = true
-	return p.c.c.Close()
+	p.closeOnce.Do(func() {
+		close(p.closed)
+		// 关闭池内空闲连接；借出中的连接在归还时自行关闭。
+		for {
+			select {
+			case c := <-p.idle:
+				c.c.Close()
+				p.release()
+			default:
+				return
+			}
+		}
+	})
+	return nil
 }
 
 // do 执行一次命令并返回 (status, payload)。
 func (p *Provider) do(ctx context.Context, args ...string) (string, [][]byte, error) {
+	c, err := p.acquire(ctx)
+	if err != nil {
+		return "", nil, err
+	}
 	bs := make([][]byte, len(args))
 	for i, a := range args {
 		bs[i] = []byte(a)
 	}
-	return p.c.request(ctx, bs...)
+	st, recs, err := c.request(ctx, bs...)
+	if err != nil {
+		// 连接级错误（含超时/断开）：丢弃该连接，避免污染后续请求。
+		c.c.Close()
+		p.release()
+		return "", nil, err
+	}
+	p.put(c)
+	return st, recs, nil
 }
 
 func (p *Provider) check() error {
-	if p.closed {
+	select {
+	case <-p.closed:
 		return core.ErrClosed
+	default:
+		return nil
 	}
-	return nil
 }
 
 // errFrom 将服务端错误状态转换为错误。SSDB incr/zincr 失败固定回复
@@ -159,8 +280,6 @@ func firstOr(recs [][]byte, fallback string) string {
 // ---- KV ----
 
 func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -176,8 +295,6 @@ func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 
 // SetEx 写入 value 并设置 TTL（SSDB 原生命令 setx）。
 func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int64) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -195,8 +312,6 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 }
 
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if err := p.check(); err != nil {
 		return nil, false, err
 	}
@@ -220,8 +335,6 @@ func (p *Provider) getLocked(ctx context.Context, key string) ([]byte, bool, err
 }
 
 func (p *Provider) Del(ctx context.Context, key string) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -236,8 +349,6 @@ func (p *Provider) Del(ctx context.Context, key string) error {
 }
 
 func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if err := p.check(); err != nil {
 		return false, err
 	}
@@ -252,8 +363,6 @@ func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 }
 
 func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if err := p.check(); err != nil {
 		return 0, err
 	}
@@ -268,8 +377,6 @@ func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, er
 }
 
 func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if err := p.check(); err != nil {
 		return nil, err
 	}
@@ -289,8 +396,6 @@ func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte,
 }
 
 func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]core.KeyValue, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if err := p.check(); err != nil {
 		return nil, err
 	}
@@ -320,8 +425,6 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 }
 
 func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -339,8 +442,6 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 }
 
 func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if err := p.check(); err != nil {
 		return 0, false, err
 	}
@@ -373,8 +474,6 @@ func (p *Provider) QPushFront(ctx context.Context, name string, value []byte) er
 }
 
 func (p *Provider) qpush(ctx context.Context, name string, value []byte, cmd string) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -397,8 +496,6 @@ func (p *Provider) QPopBack(ctx context.Context, name string) ([]byte, bool, err
 }
 
 func (p *Provider) qpop(ctx context.Context, name, cmd string) ([]byte, bool, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if err := p.check(); err != nil {
 		return nil, false, err
 	}
@@ -417,8 +514,6 @@ func (p *Provider) qpop(ctx context.Context, name, cmd string) ([]byte, bool, er
 }
 
 func (p *Provider) QSize(ctx context.Context, name string) (int64, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if err := p.check(); err != nil {
 		return 0, err
 	}
@@ -441,8 +536,6 @@ func (p *Provider) QBack(ctx context.Context, name string) ([]byte, bool, error)
 }
 
 func (p *Provider) qpeek(ctx context.Context, name, cmd string) ([]byte, bool, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if err := p.check(); err != nil {
 		return nil, false, err
 	}
@@ -463,8 +556,6 @@ func (p *Provider) qpeek(ctx context.Context, name, cmd string) ([]byte, bool, e
 // ---- ZSet ----
 
 func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -479,8 +570,6 @@ func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) erro
 }
 
 func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if err := p.check(); err != nil {
 		return 0, false, err
 	}
@@ -500,8 +589,6 @@ func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, err
 }
 
 func (p *Provider) ZDel(ctx context.Context, name, key string) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -516,8 +603,6 @@ func (p *Provider) ZDel(ctx context.Context, name, key string) error {
 }
 
 func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if err := p.check(); err != nil {
 		return 0, err
 	}
@@ -532,8 +617,6 @@ func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
 }
 
 func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if err := p.check(); err != nil {
 		return 0, false, err
 	}
@@ -553,8 +636,6 @@ func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, er
 }
 
 func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) ([]core.ZItem, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if err := p.check(); err != nil {
 		return nil, err
 	}
@@ -618,8 +699,6 @@ func (p *Provider) zrangeArgs(ctx context.Context, name string, start, stop int6
 }
 
 func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (int64, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if err := p.check(); err != nil {
 		return 0, err
 	}

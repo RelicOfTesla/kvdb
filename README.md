@@ -149,8 +149,9 @@ string、bool、`[]byte`（恒等）。`P[T]` 是单值解码；`D` 额外合并
 | SSDB `scan` 为 start 开区间 | ssdb 基座对存在的 start 键做一次 get 补偿，对外仍闭区间 |
 | Redis 无字节序范围扫描 | redis 基座全量 SCAN 游标 + 客户端过滤排序，**代价与 keyspace 大小相关** |
 | SQL 过期行 | 读取路径过滤；Open 时批量清理一次。长期运行可自行按 `expire_at` 清理 |
-| SQL 并发 | MySQL/PG 用行锁+幂等占位（Incr/QPush 事务），SQLite 单写者串行化 |
-| JSONL | 单进程内嵌；日志增长需定期 `Compact()`；崩溃尾部半行容错回放 |
+| SQL 并发 | MySQL/PG 用行锁+幂等占位（Incr 事务）；PG/SQLite 的 QPush 用 `UPDATE ... RETURNING` 单语句分配序号（MySQL 走多语句兼容路径）；SQLite 内存库单连接、文件库多连接 + `_txlock=immediate` 写串行 |
+| JSONL | 单进程内嵌；日志增长需定期 `Compact()`；崩溃尾部半行容错回放；打开时流式回放（内存峰值限单行） |
+| SSDB 连接 | 连接池（默认 8，`Config.PoolSize` 可调）：每操作借还连接，池满阻塞等待；单连接时代并发无提升 |
 
 ## 扩展：自定义持久化基座
 
@@ -205,11 +206,36 @@ KVDB_TEST_SSDB_AUTH_ADDR=127.0.0.1:48889 KVDB_TEST_SSDB_AUTH_PASS=<强密码> \
 线编码；redis 用 miniredis；sqlstore 逻辑经 SQLite 内存库实测、MySQL/PG 经
 真实容器验证。
 
+## 性能要点（实测量级，WSL+容器环境）
+
+SQL 基座的写入瓶颈是**每事务一次的持久化 fsync**（InnoDB redo / PG WAL），
+不是语句数。实测（单机容器）：
+
+| 场景 | 量级 | 说明 |
+|---|---|---|
+| InnoDB / PG 并发写·多 key | 700-2,200 op/s | **组提交**自动合并 fsync，连接池越大越快（默认 32） |
+| InnoDB / PG 单 key 计数器 | 90-160 / 240-512 op/s | 行锁串行 + 每次提交 fsync |
+| MyISAM（无事务） | ~2× InnoDB | 破坏原子性，不采用 |
+| SSDB / Redis 基座 | 3,500-11,000 op/s | 高频写请用这两个基座 |
+
+已落地优化：
+- **连接池**：mysql/pg 默认 `SetMaxOpenConns(32)`，多 key 并发写吃满组提交；
+- **Incr 单语句化**：PG/SQLite 用 upsert + `RETURNING` 一条语句完成
+  「缺失按 0、原子累加、非整数报错、取回新值」，PG 实测 237→512 op/s（2.2×）；
+  MySQL 无 `RETURNING` 保持事务路径；
+- **QPush 单语句分配序号**：PG/SQLite 的 `UPDATE ... RETURNING`（4 条→2 条 SQL/事务）。
+
+部署侧可选项（**会缩短崩溃恢复窗口，需业务确认持久性等级**）：
+- MySQL `innodb_flush_log_at_trx_commit=2`、PG `synchronous_commit=off`：写入再提升 2-2.6×，
+  崩溃时可能丢最近约 1 秒已提交事务（原子性不受影响，持久性降级）；
+- 同 key 高频计数/队列的最终解法是 `Batch`（一个事务 N 条 = 1 次 fsync）或改用 ssdb/redis 基座。
+
 ## 已知边界（非缺陷，按契约行事）
 
 - sqlite/mysql/pg 的键是二进制列（BLOB/BYTEA/VARBINARY），超长键受列类型限制
   （可调 DDL，见 `sqlstore` 方言）；SSDB 原生也限制键长。
-- ssdb 基座单连接串行复用，连接断开返回错误不自动重连（业务层重新 Open）。
+- ssdb 基座用连接池提升并发（默认 8 连接），单条连接上的请求仍为串行请求-应答；
+  连接级错误会丢弃该连接（不重试），连接断开不自动重连（业务层重新 Open）。
 - jsonl 基座不跨进程共享同一文件（无文件锁）。
 
 ## 目录结构

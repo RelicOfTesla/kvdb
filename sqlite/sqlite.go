@@ -39,8 +39,15 @@ func Open(ctx context.Context, path string) (*Provider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: open: %w", err)
 	}
-	// SQLite 单写者：串行化连接避免 SQLITE_BUSY；busy_timeout 缓冲瞬时竞争。
-	db.SetMaxOpenConns(1)
+	// 连接数策略：
+	//   - :memory: 每个连接是独立库，必须单连接，否则并发请求落到空库；
+	//   - 文件库在 WAL 下写单写者、读可并行，放宽连接让并发读不排队，
+	//     写竞争由 busy_timeout 排队（见 sqliteDSN）。
+	if isMemory(path) {
+		db.SetMaxOpenConns(1)
+	} else {
+		db.SetMaxOpenConns(4)
+	}
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("sqlite: ping: %w", err)
@@ -51,6 +58,11 @@ func Open(ctx context.Context, path string) (*Provider, error) {
 		return nil, err
 	}
 	return p, nil
+}
+
+// isMemory 判断是否为进程内内存库（:memory: 及其 URI 形态）。
+func isMemory(path string) bool {
+	return path == ":memory:" || strings.Contains(path, "mode=memory")
 }
 
 func sqliteDSN(path string) string {
@@ -65,7 +77,10 @@ func sqliteDSN(path string) string {
 	if strings.Contains(path, "?") {
 		sep = "&"
 	}
-	return path + sep + "_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	// _pragma 参数由 modernc 驱动在**每条新连接**建立时执行，因此多连接下
+	// busy_timeout 依然生效；_txlock=immediate 让写事务一开始就取写锁，
+	// 避免"读事务升级写锁"在并发下直接返回 SQLITE_BUSY（不等待 busy_timeout）。
+	return path + sep + "_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_txlock=immediate"
 }
 
 var _ core.KvProvider = (*Provider)(nil)

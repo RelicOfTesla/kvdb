@@ -32,12 +32,19 @@ func OpenURI(ctx context.Context, u *url.URL) (core.KvProvider, error) {
 // Provider 是 PostgreSQL 基座（别名 sqlstore.Provider）。
 type Provider = sqlstore.Provider
 
+// DefaultMaxOpenConns 是连接池上限：并发事务由 PostgreSQL 组提交共享 WAL fsync，
+// 池越大吞吐越高（实测 8→32 并发仍有明显提升，见 README 性能一节）。
+const DefaultMaxOpenConns = 32
+
 // Open 连接 PostgreSQL 并执行建表（IF NOT EXISTS）与过期清理。
 func Open(ctx context.Context, dsn string) (*Provider, error) {
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("pg: open: %w", err)
 	}
+	// 显式放开连接池：避免驱动默认的空闲连接数过低导致并发写排队。
+	db.SetMaxOpenConns(DefaultMaxOpenConns)
+	db.SetMaxIdleConns(DefaultMaxOpenConns)
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("pg: ping: %w", err)

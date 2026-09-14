@@ -280,6 +280,8 @@ SQLite 采用纯 Go 驱动：实测在真实存储上，纯 Go 与 CGO（mattn/g
 
 ## 性能
 
+> 完整实测数据、各基座成本模型与选型建议见 **[PERFORMANCE.md](PERFORMANCE.md)**。
+
 写入瓶颈通常是**每次提交的持久化（fsync）**，而不是语句数量。要点：
 
 - **批量写收益最大**：1000 次 Set、每 100 条提交一次，实测提升
@@ -290,6 +292,7 @@ SQLite 采用纯 Go 驱动：实测在真实存储上，纯 Go 与 CGO（mattn/g
   适合低频到中等写入的进程内持久化。
 - 部署侧可调（会缩短崩溃恢复窗口，需自行确认持久性等级）：
   MySQL `innodb_flush_log_at_trx_commit=2`、PostgreSQL `synchronous_commit=off`。
+- 基准可自行复测：`KVDB_BENCH_URI=<uri> go test -bench . -benchtime 2000x ./bench/`
 
 ## 测试
 

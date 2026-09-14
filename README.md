@@ -20,7 +20,7 @@ n, err := db.Incr(ctx, "visits", 1)
 - **注册表默认空**：用哪个基座就 `import _` 哪个包，根包不引入任何驱动依赖
 - **接口化返回**：`kvdb.Open` 返回接口 `DB`，业务可窄依赖 `KvProvider` 等子接口，便于 mock
 - **批量写**：一批操作映射到各基座原生机制（事务 / MULTI/EXEC / 流水线 / 单次 flush）
-- **字节 ↔ 泛型辅助**：`B` / `P` / `D` / `DMust`，与 `Incr` 互操作
+- **字节 ↔ 泛型辅助**：`B` / `P` / `D` / `DMust` 支持标量与结构体（默认 JSON，编解码可替换），标量编码与 `Incr` 互操作
 - 纯 Go 依赖，无 CGO
 
 需要 Go 1.25+。依赖按基座引入：`sqlite`（modernc.org/sqlite）、`mysql`
@@ -153,22 +153,45 @@ err := db.Batch(ctx, func(b *kvdb.Batch) error {
 ## 字节 ↔ T 辅助
 
 ```go
-// 写：内联编码（整数为十进制，可与 Incr 互操作）
-db.Set(ctx, "n", kvdb.B(int64(42)))
-db.SetEx(ctx, "s", kvdb.B("token"), 3600)
+type User struct {
+    ID   int64    `json:"id"`
+    Name string   `json:"name"`
+    Tags []string `json:"tags"`
+}
+
+// 写：内联编码
+db.Set(ctx, "n", kvdb.B(int64(42)))     // 标量 -> 十进制文本
+db.Set(ctx, "u", kvdb.B(User{ID: 7}))   // 结构体 -> JSON
 
 // 读：D 合并 Get/QPop 的 (val, ok, err) 三返回值（缺失 -> ErrNotFound）
 n, err := kvdb.D[int64](db.Get(ctx, "n"))
+u, err := kvdb.D[User](db.Get(ctx, "u"))
 v, err := kvdb.D[string](db.QPop(ctx, "jobs"))
 
-// panic 变体
+// panic 变体 / 单值解码
 n := kvdb.DMust[int64](db.Get(ctx, "n"))
-
-// 单值解码；底层类型别名同样支持（type OrderID int64）
-n2, err := kvdb.P[int64](raw)
+raw, err := kvdb.P[User](b)
 ```
 
-支持整数家族（含 `~` 别名）、float32/64、string、bool、`[]byte`（恒等）。
+编码规则：
+
+| 类型 | 编码 | 说明 |
+|---|---|---|
+| 整数（含 `~` 别名）、float、string、bool | 文本 | 与 `Incr` 互操作（`B(int64)` → 十进制） |
+| `[]byte` | 恒等 | 不经过 JSON/base64 |
+| 结构体、切片、映射、指针、接口等 | `Marshal`（默认 JSON） | 支持嵌套结构体与 `json` tag；未导出字段忽略 |
+
+**编解码可替换**：`kvdb.Marshal` / `kvdb.Unmarshal` 是包级变量，默认 JSON，
+可在 init 中换成 msgpack / protobuf / gob 等；标量路径不受影响。
+
+```go
+func init() {
+    kvdb.Marshal = msgpack.Marshal
+    kvdb.Unmarshal = msgpack.Unmarshal
+}
+```
+
+注意 `B` 对编码失败会 panic（不返回 error）；需要错误处理时直接调用 `Marshal`。
 
 ## 语义要点
 

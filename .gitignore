@@ -1,0 +1,6 @@
+# 构建缓存与参考源码
+.gomodcache/
+.gocache/
+.gotmp/
+.ref/
+/.docker

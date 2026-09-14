@@ -1,0 +1,104 @@
+package ssdb
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// conn 是 SSDB 原生文本协议的单连接客户端。协议为多条
+// `<十进制长度>\n<body>\n` 记录序列，以空行 `\n` 结尾：
+// 请求首条记录是命令名，响应首条记录是状态（ok/not_found/error/client_error/fail）。
+// 与 SSDB 源码 net/link.cpp 的 Link::send/recv 编码一一对应。
+type conn struct {
+	c  net.Conn
+	br *bufio.Reader
+	bw *bufio.Writer
+}
+
+// dial 建立到 addr（host:port）的连接；ctx 控制拨号与后续每操作超时。
+func dial(ctx context.Context, addr string) (*conn, error) {
+	var d net.Dialer
+	nc, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("ssdb: dial %s: %w", addr, err)
+	}
+	if tcp, ok := nc.(*net.TCPConn); ok {
+		tcp.SetNoDelay(true)
+	}
+	return &conn{c: nc, br: bufio.NewReaderSize(nc, 32*1024), bw: bufio.NewWriterSize(nc, 32*1024)}, nil
+}
+
+// request 发送命令并读取完整响应。返回状态与负载记录；响应结束由空行判定。
+func (c *conn) request(ctx context.Context, args ...[]byte) (status string, payload [][]byte, err error) {
+	if dl, ok := ctx.Deadline(); ok {
+		c.c.SetDeadline(dl)
+	} else {
+		c.c.SetDeadline(time.Time{})
+	}
+
+	for _, a := range args {
+		if _, err := c.bw.WriteString(strconv.Itoa(len(a))); err != nil {
+			return "", nil, err
+		}
+		if err := c.bw.WriteByte('\n'); err != nil {
+			return "", nil, err
+		}
+		if _, err := c.bw.Write(a); err != nil {
+			return "", nil, err
+		}
+		if err := c.bw.WriteByte('\n'); err != nil {
+			return "", nil, err
+		}
+	}
+	if err := c.bw.WriteByte('\n'); err != nil { // 报文结束空行
+		return "", nil, err
+	}
+	if err := c.bw.Flush(); err != nil {
+		return "", nil, err
+	}
+
+	recs, err := c.readRecs()
+	if err != nil {
+		return "", nil, err
+	}
+	if len(recs) == 0 {
+		return "", nil, fmt.Errorf("ssdb: empty response")
+	}
+	return string(recs[0]), recs[1:], nil
+}
+
+func (c *conn) readRecs() ([][]byte, error) {
+	var recs [][]byte
+	for {
+		line, err := c.br.ReadString('\n')
+		if err != nil {
+			if err == io.EOF && line == "" {
+				return nil, fmt.Errorf("ssdb: connection closed by server")
+			}
+			return nil, err
+		}
+		line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+		if line == "" {
+			return recs, nil // 空行 = 报文结束
+		}
+		n, err := strconv.Atoi(line)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("ssdb: bad size line %q", line)
+		}
+		body := make([]byte, n)
+		if _, err := io.ReadFull(c.br, body); err != nil {
+			return nil, err
+		}
+		// 每条记录后的换行尾标
+		if _, err := c.br.ReadString('\n'); err != nil {
+			return nil, err
+		}
+		recs = append(recs, body)
+	}
+}

@@ -1,0 +1,646 @@
+// Package ssdb 提供以 SSDB 服务器（原生文本协议，8888 端口）为后端的基座，
+// 实现 KV + Queue + ZSet 三种能力，命令均对应 SSDB 原生命令。
+// 单连接串行复用；连接断开后返回错误，不自动重连（业务层可重新 Open）。
+//
+// 认证：服务端配置 server.auth 后，除 auth 外的命令都会得到 noauth 状态。
+// 用 Config.Password 在 Open 时自动认证，连接即处于已认证状态；
+// 也可显式调用 Auth（对应 SSDB auth 命令）。
+package ssdb
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+
+	"kvdb"
+	"kvdb/core"
+)
+
+func init() { kvdb.MustRegister("ssdb", OpenURI) }
+
+// OpenURI 解析 ssdb://[user:pass@]host:port（缺省端口 8888）；
+// URI 中的密码部分作为 auth 凭据，亦支持 ?password= 传参。
+func OpenURI(ctx context.Context, u *url.URL) (core.KvProvider, error) {
+	cfg := Config{Addr: u.Host}
+	if u.User != nil {
+		if pw, ok := u.User.Password(); ok {
+			cfg.Password = pw
+		} else if name := u.User.Username(); name != "" {
+			cfg.Password = name // 也接受 ssdb://password@host 形态
+		}
+	}
+	if cfg.Password == "" {
+		cfg.Password = u.Query().Get("password")
+	}
+	return OpenWithConfig(ctx, cfg)
+}
+
+var (
+	_ core.FullProvider = (*Provider)(nil)
+)
+
+// ErrAuth 表示 SSDB 认证失败（密码错误）或命令因未认证被拒（noauth）。
+var ErrAuth = errors.New("ssdb: authentication failed")
+
+// Config 是 SSDB 连接配置。
+type Config struct {
+	// Addr 为 host:port；缺省端口补 8888。
+	Addr string
+	// Password 非空时在 Open 阶段自动执行 auth；密码错返回 ErrAuth。
+	Password string
+}
+
+// Provider 是 SSDB 基座。并发安全（请求级互斥）；ctx 可携带超时。
+type Provider struct {
+	mu     sync.Mutex
+	c      *conn
+	addr   string
+	authed bool
+	closed bool
+}
+
+// Open 连接到 addr（host:port；缺省端口补 8888），不带认证。
+func Open(ctx context.Context, addr string) (*Provider, error) {
+	return OpenWithConfig(ctx, Config{Addr: addr})
+}
+
+// OpenWithConfig 按配置连接；Password 非空时自动完成认证。
+func OpenWithConfig(ctx context.Context, cfg Config) (*Provider, error) {
+	addr := cfg.Addr
+	if !strings.Contains(addr, ":") {
+		addr = addr + ":8888"
+	}
+	c, err := dial(ctx, addr)
+	if err != nil {
+		return nil, err
+	}
+	p := &Provider{c: c, addr: addr}
+	if cfg.Password != "" {
+		if err := p.Auth(ctx, cfg.Password); err != nil {
+			c.c.Close()
+			return nil, err
+		}
+	}
+	return p, nil
+}
+
+// Auth 以 password 认证当前连接（SSDB auth 命令）。服务端未配置 auth 时
+// SSDB 一律返回 ok；密码错误返回 ErrAuth。
+func (p *Provider) Auth(ctx context.Context, password string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return core.ErrClosed
+	}
+	st, recs, err := p.do(ctx, "auth", password)
+	if err != nil {
+		return err
+	}
+	if st != "ok" {
+		// 服务端回复 error + "invalid password"（见 SSDB net/server.cpp proc_auth）。
+		return fmt.Errorf("%w: %s", ErrAuth, firstOr(recs, st))
+	}
+	p.authed = true
+	return nil
+}
+
+func (p *Provider) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return nil
+	}
+	p.closed = true
+	return p.c.c.Close()
+}
+
+// do 执行一次命令并返回 (status, payload)。
+func (p *Provider) do(ctx context.Context, args ...string) (string, [][]byte, error) {
+	bs := make([][]byte, len(args))
+	for i, a := range args {
+		bs[i] = []byte(a)
+	}
+	return p.c.request(ctx, bs...)
+}
+
+func (p *Provider) check() error {
+	if p.closed {
+		return core.ErrClosed
+	}
+	return nil
+}
+
+// errFrom 将服务端错误状态转换为错误。SSDB incr/zincr 失败固定回复
+// "value is not an integer or out of range"，据此映射为 ErrNotInteger；
+// 未认证时服务端返回 noauth（net/server.cpp 的 AUTH 前置检查），映射为 ErrAuth。
+func errFrom(msg []byte) error {
+	s := string(msg)
+	if strings.Contains(s, "not an integer") {
+		return core.ErrNotInteger
+	}
+	if strings.Contains(s, "authentication required") {
+		return fmt.Errorf("%w: %s", ErrAuth, s)
+	}
+	return fmt.Errorf("ssdb: server error: %s", msg)
+}
+
+// firstOr 返回首条负载（无则回退到 fallback），用于拼接服务端错误说明。
+func firstOr(recs [][]byte, fallback string) string {
+	if len(recs) > 0 {
+		return string(recs[0])
+	}
+	return fallback
+}
+
+// ---- KV ----
+
+func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.check(); err != nil {
+		return err
+	}
+	st, _, err := p.do(ctx, "set", key, string(value))
+	if err != nil {
+		return err
+	}
+	if st != "ok" {
+		return fmt.Errorf("ssdb: set: status %q", st)
+	}
+	return nil
+}
+
+// SetEx 写入 value 并设置 TTL（SSDB 原生命令 setx）。
+func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.check(); err != nil {
+		return err
+	}
+	if ttl <= 0 {
+		return core.ErrInvalidTTL
+	}
+	st, _, err := p.do(ctx, "setx", key, string(value), strconv.FormatInt(ttl, 10))
+	if err != nil {
+		return err
+	}
+	if st != "ok" {
+		return fmt.Errorf("ssdb: setx: status %q", st)
+	}
+	return nil
+}
+
+func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.check(); err != nil {
+		return nil, false, err
+	}
+	return p.getLocked(ctx, key)
+}
+
+// getLocked 在调用方已持有 p.mu 时读取 key（Scan 补偿用）。
+func (p *Provider) getLocked(ctx context.Context, key string) ([]byte, bool, error) {
+	st, recs, err := p.do(ctx, "get", key)
+	if err != nil {
+		return nil, false, err
+	}
+	switch st {
+	case "ok":
+		return recs[0], true, nil
+	case "not_found":
+		return nil, false, nil
+	default:
+		return nil, false, errFrom(recs[0])
+	}
+}
+
+func (p *Provider) Del(ctx context.Context, key string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.check(); err != nil {
+		return err
+	}
+	st, _, err := p.do(ctx, "del", key)
+	if err != nil {
+		return err
+	}
+	if st != "ok" {
+		return fmt.Errorf("ssdb: del: status %q", st)
+	}
+	return nil
+}
+
+func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.check(); err != nil {
+		return false, err
+	}
+	st, recs, err := p.do(ctx, "exists", key)
+	if err != nil {
+		return false, err
+	}
+	if st != "ok" {
+		return false, fmt.Errorf("ssdb: exists: status %q", st)
+	}
+	return recs[0][0] == '1', nil
+}
+
+func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.check(); err != nil {
+		return 0, err
+	}
+	st, recs, err := p.do(ctx, "incr", key, strconv.FormatInt(delta, 10))
+	if err != nil {
+		return 0, err
+	}
+	if st != "ok" {
+		return 0, errFrom(recs[0])
+	}
+	return strconv.ParseInt(string(recs[0]), 10, 64)
+}
+
+func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.check(); err != nil {
+		return nil, err
+	}
+	args := append([]string{"multi_get"}, keys...)
+	st, recs, err := p.do(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	if st != "ok" {
+		return nil, fmt.Errorf("ssdb: multi_get: status %q", st)
+	}
+	out := make(map[string][]byte, len(recs)/2)
+	for i := 0; i+1 < len(recs); i += 2 {
+		out[string(recs[i])] = recs[i+1]
+	}
+	return out, nil
+}
+
+func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]core.KeyValue, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.check(); err != nil {
+		return nil, err
+	}
+	limit = normalizeLimit(limit)
+	// 真实 SSDB 的 scan 语义为 start 开区间、end 闭区间（分页便利），
+	// SDK 契约统一为闭区间，此处对存在的 start 键做一次 get 补偿。
+	st, recs, err := p.do(ctx, "scan", start, end, strconv.Itoa(limit))
+	if err != nil {
+		return nil, err
+	}
+	if st != "ok" {
+		return nil, fmt.Errorf("ssdb: scan: status %q", st)
+	}
+	out := make([]core.KeyValue, 0, len(recs)/2)
+	for i := 0; i+1 < len(recs); i += 2 {
+		out = append(out, core.KeyValue{Key: string(recs[i]), Value: recs[i+1]})
+	}
+	if start == "" || len(out) >= limit {
+		return out, nil
+	}
+	if v, ok, err := p.getLocked(ctx, start); err != nil {
+		return nil, err
+	} else if ok {
+		out = append([]core.KeyValue{{Key: start, Value: v}}, out...)
+	}
+	return out, nil
+}
+
+func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.check(); err != nil {
+		return err
+	}
+	if ttl <= 0 {
+		return core.ErrInvalidTTL
+	}
+	st, _, err := p.do(ctx, "expire", key, strconv.FormatInt(ttl, 10))
+	if err != nil {
+		return err
+	}
+	if st != "ok" {
+		return fmt.Errorf("ssdb: expire: status %q", st)
+	}
+	return nil
+}
+
+func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.check(); err != nil {
+		return 0, false, err
+	}
+	st, recs, err := p.do(ctx, "ttl", key)
+	if err != nil {
+		return 0, false, err
+	}
+	if st != "ok" {
+		return 0, false, fmt.Errorf("ssdb: ttl: status %q", st)
+	}
+	n, err := strconv.ParseInt(string(recs[0]), 10, 64)
+	if err != nil {
+		return 0, false, err
+	}
+	// SSDB ttl 对"无 TTL 或 key 不存在"均返回 -1，统一映射为 ok=false。
+	if n < 0 {
+		return -1, false, nil
+	}
+	return n, true, nil
+}
+
+// ---- Queue ----
+
+func (p *Provider) QPush(ctx context.Context, name string, value []byte) error {
+	return p.qpush(ctx, name, value, "qpush")
+}
+
+func (p *Provider) QPushFront(ctx context.Context, name string, value []byte) error {
+	return p.qpush(ctx, name, value, "qpush_front")
+}
+
+func (p *Provider) qpush(ctx context.Context, name string, value []byte, cmd string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.check(); err != nil {
+		return err
+	}
+	st, _, err := p.do(ctx, cmd, name, string(value))
+	if err != nil {
+		return err
+	}
+	if st != "ok" {
+		return fmt.Errorf("ssdb: %s: status %q", cmd, st)
+	}
+	return nil
+}
+
+func (p *Provider) QPop(ctx context.Context, name string) ([]byte, bool, error) {
+	return p.qpop(ctx, name, "qpop")
+}
+
+func (p *Provider) QPopBack(ctx context.Context, name string) ([]byte, bool, error) {
+	return p.qpop(ctx, name, "qpop_back")
+}
+
+func (p *Provider) qpop(ctx context.Context, name, cmd string) ([]byte, bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.check(); err != nil {
+		return nil, false, err
+	}
+	st, recs, err := p.do(ctx, cmd, name)
+	if err != nil {
+		return nil, false, err
+	}
+	switch st {
+	case "ok":
+		return recs[0], true, nil
+	case "not_found":
+		return nil, false, nil
+	default:
+		return nil, false, errFrom(recs[0])
+	}
+}
+
+func (p *Provider) QSize(ctx context.Context, name string) (int64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.check(); err != nil {
+		return 0, err
+	}
+	st, recs, err := p.do(ctx, "qsize", name)
+	if err != nil {
+		return 0, err
+	}
+	if st != "ok" {
+		return 0, fmt.Errorf("ssdb: qsize: status %q", st)
+	}
+	return strconv.ParseInt(string(recs[0]), 10, 64)
+}
+
+func (p *Provider) QFront(ctx context.Context, name string) ([]byte, bool, error) {
+	return p.qpeek(ctx, name, "qfront")
+}
+
+func (p *Provider) QBack(ctx context.Context, name string) ([]byte, bool, error) {
+	return p.qpeek(ctx, name, "qback")
+}
+
+func (p *Provider) qpeek(ctx context.Context, name, cmd string) ([]byte, bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.check(); err != nil {
+		return nil, false, err
+	}
+	st, recs, err := p.do(ctx, cmd, name)
+	if err != nil {
+		return nil, false, err
+	}
+	switch st {
+	case "ok":
+		return recs[0], true, nil
+	case "not_found":
+		return nil, false, nil
+	default:
+		return nil, false, errFrom(recs[0])
+	}
+}
+
+// ---- ZSet ----
+
+func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.check(); err != nil {
+		return err
+	}
+	st, _, err := p.do(ctx, "zset", name, key, strconv.FormatInt(score, 10))
+	if err != nil {
+		return err
+	}
+	if st != "ok" {
+		return fmt.Errorf("ssdb: zset: status %q", st)
+	}
+	return nil
+}
+
+func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.check(); err != nil {
+		return 0, false, err
+	}
+	st, recs, err := p.do(ctx, "zget", name, key)
+	if err != nil {
+		return 0, false, err
+	}
+	switch st {
+	case "ok":
+		s, err := strconv.ParseInt(string(recs[0]), 10, 64)
+		return s, err == nil, err
+	case "not_found":
+		return 0, false, nil
+	default:
+		return 0, false, errFrom(recs[0])
+	}
+}
+
+func (p *Provider) ZDel(ctx context.Context, name, key string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.check(); err != nil {
+		return err
+	}
+	st, _, err := p.do(ctx, "zdel", name, key)
+	if err != nil {
+		return err
+	}
+	if st != "ok" {
+		return fmt.Errorf("ssdb: zdel: status %q", st)
+	}
+	return nil
+}
+
+func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.check(); err != nil {
+		return 0, err
+	}
+	st, recs, err := p.do(ctx, "zsize", name)
+	if err != nil {
+		return 0, err
+	}
+	if st != "ok" {
+		return 0, fmt.Errorf("ssdb: zsize: status %q", st)
+	}
+	return strconv.ParseInt(string(recs[0]), 10, 64)
+}
+
+func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.check(); err != nil {
+		return 0, false, err
+	}
+	st, recs, err := p.do(ctx, "zrank", name, key)
+	if err != nil {
+		return 0, false, err
+	}
+	switch st {
+	case "ok":
+		r, err := strconv.ParseInt(string(recs[0]), 10, 64)
+		return r, err == nil, err
+	case "not_found":
+		return 0, false, nil
+	default:
+		return 0, false, errFrom(recs[0])
+	}
+}
+
+func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) ([]core.ZItem, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.check(); err != nil {
+		return nil, err
+	}
+	// SSDB 原生 zrange 为 offset/limit（无负索引）语义，客户端按
+	// Redis 风格 start/stop 索引换算：负索引先经 zsize 归一化。
+	offset, limit, err := p.zrangeArgs(ctx, name, start, stop)
+	if err != nil {
+		return nil, err
+	}
+	st, recs, err := p.do(ctx, "zrange", name, strconv.FormatInt(offset, 10), strconv.FormatInt(limit, 10))
+	if err != nil {
+		return nil, err
+	}
+	if st != "ok" {
+		return nil, fmt.Errorf("ssdb: zrange: status %q", st)
+	}
+	out := make([]core.ZItem, 0, len(recs)/2)
+	for i := 0; i+1 < len(recs); i += 2 {
+		s, err := strconv.ParseInt(string(recs[i+1]), 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, core.ZItem{Key: string(recs[i]), Score: s})
+	}
+	return out, nil
+}
+
+// zrangeArgs 把 redis 风格索引换算为 SSDB zrange 的 offset/limit。
+// 需在持有锁时调用（内部会发 zsize 命令）。
+func (p *Provider) zrangeArgs(ctx context.Context, name string, start, stop int64) (int64, int64, error) {
+	if start >= 0 && stop >= 0 {
+		if start > stop {
+			return 0, 0, nil
+		}
+		return start, stop - start + 1, nil
+	}
+	st, recs, err := p.do(ctx, "zsize", name)
+	if err != nil {
+		return 0, 0, err
+	}
+	if st != "ok" {
+		return 0, 0, fmt.Errorf("ssdb: zsize: status %q", st)
+	}
+	size, err := strconv.ParseInt(string(recs[0]), 10, 64)
+	if err != nil {
+		return 0, 0, err
+	}
+	if start < 0 {
+		start = size + start
+		if start < 0 {
+			start = 0
+		}
+	}
+	if stop < 0 {
+		stop = size + stop
+	}
+	if start > stop || stop < 0 {
+		return 0, 0, nil
+	}
+	return start, stop - start + 1, nil
+}
+
+func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (int64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.check(); err != nil {
+		return 0, err
+	}
+	st, recs, err := p.do(ctx, "zincr", name, key, strconv.FormatInt(delta, 10))
+	if err != nil {
+		return 0, err
+	}
+	if st != "ok" {
+		if errors.Is(errFrom(recs[0]), core.ErrNotInteger) {
+			return 0, core.ErrNotInteger
+		}
+		return 0, fmt.Errorf("ssdb: zincr: status %q", st)
+	}
+	return strconv.ParseInt(string(recs[0]), 10, 64)
+}
+
+// normalizeLimit 与 mem 基座相同的默认页大小约定（见 mem 包注释）。
+func normalizeLimit(limit int) int {
+	const defaultLimit = 100 // 与 core.DefaultScanLimit 对齐
+	if limit <= 0 {
+		return defaultLimit
+	}
+	return limit
+}

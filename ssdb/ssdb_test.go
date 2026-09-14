@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,13 +24,14 @@ import (
 // fakeSSDB 是进程内 SSDB 服务器替身：按 SSDB wiki/源码（link.cpp）定义的
 // 原生文本协议独立实现收发，用于交叉验证客户端编码与命令语义。
 type fakeSSDB struct {
-	mu       sync.Mutex
-	kv       map[string][]byte
-	exp      map[string]int64 // key -> 绝对过期秒
-	queue    map[string][][]byte
-	zset     map[string]map[string]int64
-	ln       net.Listener
-	password string // 非空则要求先 auth（对应 server.auth）
+	mu        sync.Mutex
+	kv        map[string][]byte
+	exp       map[string]int64 // key -> 绝对过期秒
+	queue     map[string][][]byte
+	zset      map[string]map[string]int64
+	ln        net.Listener
+	password  string       // 非空则要求先 auth（对应 server.auth）
+	dropAfter atomic.Int32 // >0 时每个连接处理完 N 条请求后主动断开（模拟服务器断连）
 }
 
 func newFakeSSDB(t *testing.T) *fakeSSDB {
@@ -124,7 +126,14 @@ func (f *fakeSSDB) handle(c net.Conn) {
 	bw := bufio.NewWriter(c)
 	rr := &recordReader{br}
 	authed := false
+	served := 0
 	for {
+		// 模拟服务器在处理 N 条请求后、读取下一条之前主动断开
+		//（如重启/超时）。放在 read 之前，保证断开时客户端尚未发出
+		// 下一条请求——死连接才会真的留在客户端池中等待探测。
+		if da := int(f.dropAfter.Load()); da > 0 && served >= da {
+			return
+		}
 		req, err := rr.read()
 		if err != nil {
 			return
@@ -132,6 +141,7 @@ func (f *fakeSSDB) handle(c net.Conn) {
 		if len(req) == 0 {
 			continue
 		}
+		served++
 		var reply [][]byte
 		cmd := string(req[0])
 		switch {
@@ -633,5 +643,87 @@ func TestPoolCloseDuringOps(t *testing.T) {
 	}
 	if err := p.Close(); err != nil { // 幂等
 		t.Fatalf("重复 Close 应无错, got %v", err)
+	}
+}
+
+// TestPoolReconnect 验证连接池的断连自愈：服务器每处理若干个请求就断开连接，
+// 池应丢弃已断开连接并新建（业务侧操作不受影响或最多瞬断一次）。
+func TestPoolReconnect(t *testing.T) {
+	srv := newFakeSSDB(t)
+	srv.dropAfter.Store(2) // 每个连接只服务 2 个请求后断开（模拟频繁重启）
+	p, err := ssdb.OpenWithConfig(context.Background(), ssdb.Config{Addr: srv.addr(), PoolSize: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	ctx := context.Background()
+
+	// 前两个请求在同一连接上完成，服务器随后断开该连接。
+	if err := p.Set(ctx, "k", []byte("v1")); err != nil {
+		t.Fatalf("set1: %v", err)
+	}
+	if err := p.Set(ctx, "k", []byte("v2")); err != nil {
+		t.Fatalf("set2: %v", err)
+	}
+
+	// 之后的请求必须自愈：连接断开时"刚好被复用到、FIN 尚未到达本地"的
+	// 请求会失败一次，随后连接被丢弃重建。核心断言是失败次数有界（若死连接
+	// 滞留池中则每次都会失败）且最终操作成功。
+	failures := 0
+	for i := 0; i < 6; i++ {
+		if err := p.Set(ctx, "k", []byte("v3")); err != nil {
+			failures++
+		}
+	}
+	if failures > 3 {
+		t.Fatalf("断连后 6 次操作失败 %d 次（无自愈时应为 6/6），有界失败才符合预期", failures)
+	}
+	// 最终读取：极端时序下最后一次请求也可能命中刚断开的连接，重试一次即可。
+	var v []byte
+	var ok bool
+	for attempt := 0; attempt < 3; attempt++ {
+		v, ok, _ = p.Get(ctx, "k")
+		if ok && string(v) == "v3" {
+			return
+		}
+	}
+	t.Fatalf("最终 Get = %q,%v", v, ok)
+}
+
+// TestPoolReconnectDeterministic 确定性验证断连自愈：服务器每处理 1 条请求后
+// 关闭连接并等待客户端观察到期（无竞态），后续请求必须全部成功。
+func TestPoolReconnectDeterministic(t *testing.T) {
+	srv := newFakeSSDB(t)
+	srv.dropAfter.Store(1) // 每连接只服务 1 条请求即断开
+	p, err := ssdb.OpenWithConfig(context.Background(), ssdb.Config{Addr: srv.addr(), PoolSize: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	ctx := context.Background()
+
+	// 第一条在预建连接上：成功（随后服务器断开该连接）。
+	if err := p.Set(ctx, "k", []byte("v")); err != nil {
+		t.Fatalf("set1: %v", err)
+	}
+	// 等服务端 CLOSE 传播到本地（FIN 到达后连接才算真的断开）。
+	time.Sleep(300 * time.Millisecond)
+
+	// 之后每条请求：池中连接已死 -> 探测丢弃 -> 新建。全部应成功。
+	//
+	// 注意：这里在每次操作前等待 FIN 到达本地。服务器配置为"每服务 1 条即断开"，
+	// 若紧接着复用（不等 FIN），请求会撞上"连接已断但本地尚未感知"的半开窗口——
+	// 那属于已被文档接受的边界（最多消耗一次失败请求，随后仍自愈），
+	// 由 TestPoolReconnect 覆盖。本用例严格断言探测路径：连接断开可观测时，
+	// 池必定丢弃并重建，业务零失败。
+	for i := 0; i < 5; i++ {
+		time.Sleep(50 * time.Millisecond) // 上一轮连接的 FIN 到达本地
+		if err := p.Set(ctx, "k", []byte("v2")); err != nil {
+			t.Fatalf("断连后第 %d 条 Set 失败: %v", i, err)
+		}
+		time.Sleep(50 * time.Millisecond) // 服务器服务完 1 条后断开该连接
+		if v, ok, _ := p.Get(ctx, "k"); !ok || string(v) != "v2" {
+			t.Fatalf("第 %d 条 Get = %q,%v", i, v, ok)
+		}
 	}
 }

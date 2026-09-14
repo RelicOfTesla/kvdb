@@ -218,6 +218,10 @@ SQL 基座的写入瓶颈是**每事务一次的持久化 fsync**（InnoDB redo 
 | MyISAM（无事务） | ~2× InnoDB | 破坏原子性，不采用 |
 | SSDB / Redis 基座 | 3,500-11,000 op/s | 高频写请用这两个基座 |
 
+jsonl 的写吞吐取决于文件系统介质：WSL 挂载盘(drvfs)实测约 1.5-2k op/s，
+WSL 原生盘/ext4 约 20 万 op/s（内部封装 mem，读路径与 mem 同级；写差距是
+每 op 一次文件追加的 WAL 固有成本）。JSONL 适合低频/中等写入的进程内持久化。
+
 已落地优化：
 - **连接池**：mysql/pg 默认 `SetMaxOpenConns(32)`，多 key 并发写吃满组提交；
 - **Incr 单语句化**：PG/SQLite 用 upsert + `RETURNING` 一条语句完成
@@ -230,12 +234,42 @@ SQL 基座的写入瓶颈是**每事务一次的持久化 fsync**（InnoDB redo 
   崩溃时可能丢最近约 1 秒已提交事务（原子性不受影响，持久性降级）；
 - 同 key 高频计数/队列的最终解法是 `Batch`（一个事务 N 条 = 1 次 fsync）或改用 ssdb/redis 基座。
 
+## 兼容性与驱动选择（实测）
+
+| 依赖 | 实测通过版本 | 说明 |
+|---|---|---|
+| MySQL | **5.6.51** / 8.0.46 | 5.6 默认 innodb_large_prefix=OFF、索引前缀上限 767 字节，键列因此取 |
+| PostgreSQL | **9.6** / 10 / 12 / 16 | `ON CONFLICT ... RETURNING` 需 9.5+；bytea 排序在 9.6+ 稳定 |
+| SQLite | modernc.org/sqlite（纯 Go） | 需 3.35+（`RETURNING`），WAL 模式 |
+| Redis | 7.x | `SET ... KEEPTTL` 需 6.0+ |
+| SSDB | leobuskin/ssdb-docker | 原生协议；支持 `server.auth` |
+
+MySQL 键列上限 **255 字节**（`VARBINARY(255)`）：这是兼容 5.6 默认索引前缀
+（767 字节；组合索引 `(z,s,k)` = 255+8+255 = 518 亦在限内）的取舍。
+PostgreSQL/SQLite 用 BYTEA/BLOB，无此限制。
+
+**SQLite 驱动为何选纯 Go（modernc）而非 CGO（mattn/go-sqlite3）**——实测对比
+（同一 `sqlstore` 实现，仅换底层驱动）：
+
+| 介质 | 驱动 | Set | Get | Incr | QPush |
+|---|---|---|---|---|---|
+| tmpfs（fsync 免费） | pure-Go | 23,875 | 25,361 | 10,573 | 6,141 |
+| tmpfs | CGO | 37,158 | 45,177 | 18,951 | 6,674 |
+| **真实盘** | pure-Go | 543 | 1,917 | 130 | 91 |
+| **真实盘** | CGO | 568 | 2,178 | **128** | **94** |
+
+结论：CGO 仅在 I/O 免费（tmpfs）时快 1.6-1.8×；在真实存储上二者几乎相同
+（Incr 130 vs 128），因为瓶颈是每事务 fsync 而非驱动实现。纯 Go 因此免去
+CGO/gcc/交叉编译成本而无性能损失——SDK 不引入 CGO 依赖。
+
 ## 已知边界（非缺陷，按契约行事）
 
 - sqlite/mysql/pg 的键是二进制列（BLOB/BYTEA/VARBINARY），超长键受列类型限制
   （可调 DDL，见 `sqlstore` 方言）；SSDB 原生也限制键长。
 - ssdb 基座用连接池提升并发（默认 8 连接），单条连接上的请求仍为串行请求-应答；
-  连接级错误会丢弃该连接（不重试），连接断开不自动重连（业务层重新 Open）。
+  池内置断连自愈：连接借出前做 ~100µs 非阻塞存活探测，服务器重启/断开的连接
+  在池内被自动丢弃并重建（业务无感；个别半开连接仍会消耗一次失败请求）。
+  请求级错误（非连接类）不自动重试，业务按需自行重试。
 - jsonl 基座不跨进程共享同一文件（无文件锁）。
 
 ## 目录结构

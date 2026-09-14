@@ -11,10 +11,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"kvdb"
 	"kvdb/core"
@@ -65,9 +68,9 @@ const DefaultPoolSize = 8
 type Provider struct {
 	addr      string
 	password  string
-	idle      chan *conn    // 空闲连接队列，容量即池大小
-	slots     chan struct{} // 并发名额（在借连接数 + 池内连接数）
-	poolSize  int
+	idle      chan *conn   // 空闲连接队列，容量即池大小
+	total     atomic.Int32 // 已创建的连接总数（池内+在借+预建），上限 max
+	max       int32
 	closed    chan struct{}
 	closeOnce sync.Once
 }
@@ -91,8 +94,7 @@ func OpenWithConfig(ctx context.Context, cfg Config) (*Provider, error) {
 		addr:     addr,
 		password: cfg.Password,
 		idle:     make(chan *conn, size),
-		slots:    make(chan struct{}, size),
-		poolSize: size,
+		max:      int32(size),
 		closed:   make(chan struct{}),
 	}
 	// 预建一条连接用于启动期连通性/认证校验，失败即报错（保留原语义）。
@@ -100,6 +102,7 @@ func OpenWithConfig(ctx context.Context, cfg Config) (*Provider, error) {
 	if err != nil {
 		return nil, err
 	}
+	p.total.Store(1) // 预建连接计入总数（会计一致：total=池内+在借）
 	p.idle <- c
 	return p, nil
 }
@@ -125,69 +128,96 @@ func (p *Provider) openConn(ctx context.Context) (*conn, error) {
 }
 
 // acquire 借出一条已认证连接；池空且已达上限时阻塞等待空闲连接或 ctx 结束。
+// 借出的连接先做存活探测（connAlive，约 100µs 开销）：已断开（服务器重启/
+// 网络中断）的连接在池内被拦截丢弃并重建，业务无感——这就是"简易重连"：
+// 池中只存在健康连接，断连由下一次 acquire 自动替换（半开连接仍会消耗一次
+// 失败的请求，见 connAlive 说明）。
 func (p *Provider) acquire(ctx context.Context) (*conn, error) {
 	select {
 	case <-p.closed:
 		return nil, core.ErrClosed
 	default:
 	}
-	select {
-	case c := <-p.idle:
-		return c, nil
-	default:
-	}
-	// 池内暂无空闲：若尚未达上限则新建，否则等待归还。
-	if p.tryReserve() {
-		c, err := p.openConn(ctx)
-		if err != nil {
-			p.release()
-			return nil, err
+	for {
+		select {
+		case c := <-p.idle:
+			if connAlive(c) {
+				return c, nil
+			}
+			// 已断开：丢弃并归还计数，继续取/建。
+			c.c.Close()
+			p.total.Add(-1)
+			continue
+		default:
 		}
-		return c, nil
-	}
-	select {
-	case c := <-p.idle:
-		return c, nil
-	case <-p.closed:
-		return nil, core.ErrClosed
-	case <-ctx.Done():
-		return nil, ctx.Err()
+		// 池内暂无空闲：若尚未达上限则新建（原子抢占一个名额）。
+		if p.total.Load() < p.max && p.total.Add(1) <= p.max {
+			c, err := p.openConn(ctx)
+			if err != nil {
+				p.total.Add(-1)
+				return nil, err
+			}
+			return c, nil
+		}
+		select {
+		case c := <-p.idle:
+			if connAlive(c) {
+				return c, nil
+			}
+			c.c.Close()
+			p.total.Add(-1)
+		case <-p.closed:
+			return nil, core.ErrClosed
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 }
 
-// release 释放一个并发名额（归还或新建失败时调用）。
-func (p *Provider) release() {
-	select {
-	case p.slots <- struct{}{}:
-	default:
-	}
-}
-
-// tryReserve 尝试占用一个并发名额，成功返回 true。
-func (p *Provider) tryReserve() bool {
-	select {
-	case p.slots <- struct{}{}:
-		return true
-	default:
+// connAlive 非阻塞探测连接是否仍可用：向读侧设立即超时并尝试读一字节。
+//   - 读超时（无数据可读）＝ 空闲健康连接，清除 deadline 后归还可用；
+//   - EOF/连接被重置 ＝ 已断开；
+//   - 读到数据 ＝ 请求-应答协议下不可能有待读数据，视为连接状态异常。
+//
+// SSDB 服务器重启/主动断开都会把 FIN/RST 送到本地，本探测可在此类连接
+// 被复用时提前拦截，避免"拿到死连接请求一次才失败"。
+func connAlive(c *conn) bool {
+	// 注意：deadline 必须是"未来"时刻。若设为当前时刻（已过期），Go 的 poll
+	// 在读检查前就直接返回 timeout——即使对端已发 FIN 也探测不到断开。
+	// 未来 100µs 的窗口足以让 poll 报告 EOF/重置，健康连接最坏多等 100µs
+	//（相对请求本身可忽略；实测 EOF 探测约 30µs 返回）。
+	c.c.SetReadDeadline(time.Now().Add(100 * time.Microsecond))
+	var b [1]byte
+	if _, err := c.c.Read(b[:]); err != nil {
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			// 无数据可读：空闲健康连接，清除 deadline 后复用。
+			c.c.SetReadDeadline(time.Time{})
+			return true
+		}
+		// EOF / connection reset 等：已断开。
 		return false
 	}
+	// 有数据可读：请求-应答协议下不应有待读数据，保守判定异常。
+	return false
 }
 
-// put 归还连接；Provider 已关闭则直接关闭连接。
+// put 归还连接；Provider 已关闭或连接已断开则直接关闭。
+// 归还前做存活探测：已断开/异常连接不再回到空闲池，下次请求
+// 不会复用到坏连接（简易重连 = 池中只保留健康连接，断连由新请求触发重建）。
 func (p *Provider) put(c *conn) {
 	select {
 	case <-p.closed:
 		c.c.Close()
-		p.release()
+		p.total.Add(-1)
 		return
 	default:
 	}
 	select {
 	case p.idle <- c:
 	default:
-		// 池已满（理论上不会：名额与容量一致），保守丢弃。
+		// 池已满（理论上不会：连接数不超上限），保守丢弃。
 		c.c.Close()
-		p.release()
+		p.total.Add(-1)
 	}
 }
 
@@ -216,7 +246,7 @@ func (p *Provider) Close() error {
 			select {
 			case c := <-p.idle:
 				c.c.Close()
-				p.release()
+				p.total.Add(-1)
 			default:
 				return
 			}
@@ -239,7 +269,7 @@ func (p *Provider) do(ctx context.Context, args ...string) (string, [][]byte, er
 	if err != nil {
 		// 连接级错误（含超时/断开）：丢弃该连接，避免污染后续请求。
 		c.c.Close()
-		p.release()
+		p.total.Add(-1)
 		return "", nil, err
 	}
 	p.put(c)

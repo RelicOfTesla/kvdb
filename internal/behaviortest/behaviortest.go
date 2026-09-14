@@ -5,6 +5,7 @@ package behaviortest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -143,6 +144,30 @@ func TestKV(t *testing.T, db *kvdb.DB) {
 		t.Fatalf("并发 Incr 结果 = %d, want %d", n, goroutines*per)
 	}
 
+	// 多 key 并发：每个 goroutine 只写自己的 key（互不重叠），
+	// 验证互不干扰且无丢更（组提交/行锁语义下不可串寄存器）。
+	const mkG, mkPer = 8, 25
+	var mkWg sync.WaitGroup
+	for g := 0; g < mkG; g++ {
+		mkWg.Add(1)
+		go func(id int) {
+			defer mkWg.Done()
+			key := fmt.Sprintf("mk%d", id)
+			for i := 0; i < mkPer; i++ {
+				if _, err := db.Incr(ctx, key, 1); err != nil {
+					t.Errorf("多key Incr(%s): %v", key, err)
+					return
+				}
+			}
+		}(g)
+	}
+	mkWg.Wait()
+	for g := 0; g < mkG; g++ {
+		if n, _ := db.Incr(ctx, fmt.Sprintf("mk%d", g), 0); n != mkPer {
+			t.Fatalf("多key 并发后 mk%d = %d, want %d", g, n, mkPer)
+		}
+	}
+
 	// MGet：只返回存在的 key
 	for i, k := range []string{"m1", "m2", "m3"} {
 		if err := db.Set(ctx, k, []byte("v"+string(rune('0'+i)))); err != nil {
@@ -185,9 +210,13 @@ func TestKV(t *testing.T, db *kvdb.DB) {
 			t.Fatalf("Scan[%d] = %s, want %s", i, kv.Key, want[i])
 		}
 	}
-	// 无上界：先清掉前面并发用例遗留的键（race/cnt/bad 等落在 k 区间外，
-	// race 恰在 k4 之后），保证断言只覆盖本用例写入的数据。
-	for _, k := range []string{"race", "cnt", "bad"} {
+	// 无上界：先清掉前面并发用例遗留的键（race/cnt/bad 及多 key 并发的 mk*，
+	// 它们落在 k4 之后会影响开区间断言），保证断言只覆盖本用例写入的数据。
+	clean := []string{"race", "cnt", "bad"}
+	for g := 0; g < 8; g++ {
+		clean = append(clean, fmt.Sprintf("mk%d", g))
+	}
+	for _, k := range clean {
 		if err := db.Del(ctx, k); err != nil {
 			t.Fatal(err)
 		}

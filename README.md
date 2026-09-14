@@ -21,7 +21,7 @@ n, err := db.Incr(ctx, "visits", 1)
 - **接口化返回**：`kvdb.Open` 返回接口 `DB`，业务可窄依赖 `KvProvider` 等子接口，便于 mock
 - **批量写**：一批操作映射到各基座原生机制（事务 / MULTI/EXEC / 流水线 / 单次 flush）
 - **字节 ↔ 泛型辅助**：`B` / `P` / `D` / `DMust` 支持标量与结构体（默认 JSON，编解码可替换），标量编码与 `Incr` 互操作
-- **Go 1.27+ 可选薄壳**：`kvdb.Typed(db)` 提供 `db.Get[T](...)` 泛型方法（构建约束隔离，不影响旧版本）
+- **Go 1.27.1+ 可选薄壳**：`kvdb.Typed(db)` 提供 `db.Get[T](...)` 泛型方法（构建约束隔离，不影响旧版本）
 - 纯 Go 依赖，无 CGO
 
 需要 Go 1.25+。依赖按基座引入：`sqlite`（modernc.org/sqlite）、`mysql`
@@ -196,10 +196,10 @@ func init() {
 
 注意 `B` 对编码失败会 panic（不返回 error）；需要错误处理时直接调用 `Marshal`。
 
-### Go 1.27+：`TypedDB` 薄壳（`db.Get[T](...)`）
+### Go 1.27.1+：`TypedDB` 薄壳（`db.Get[T](...)`）
 
-用 Go 1.27+ 构建时会额外提供 `TypedDB` 薄壳，把「取字节 + 解码」合并为泛型方法
-（Go 1.27 起支持方法级类型参数）：
+用 Go 1.27.1+ 构建时会额外提供 `TypedDB` 薄壳，把「取字节 + 解码」合并为泛型方法
+（方法级类型参数需 1.27.1+）：
 
 ```go
 tdb := kvdb.Typed(db)
@@ -215,8 +215,36 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 - 其余方法（`Set` / `QPush` / `ZSet` / `Batch` / `Close` …）经内嵌 `DB` 直接透传；
   但泛型方法会遮蔽同名方法，**`TypedDB` 不再满足 `DB` 接口**，需要 DB 语义时用
   `tdb.DB` 或保留原始 `db`；
-- 实现放在带 `//go:build go1.27` 约束的文件中，**模块的 go 指令无需抬高**：
-  Go < 1.27 的工具链不编译该文件，`TypedDB` / `Typed` 不存在，其余功能不受影响。
+- 需要 **Go 1.27.1+**（方法级类型参数自 1.27 起支持，但 1.27.0 有泛型方法相关的
+  编译器缺陷，如 [golang/go#81195](https://github.com/golang/go/issues/81195) 的
+  `malformed linker symbol`，已在 1.27.1 修复）。实现放在带 `//go:build go1.27`
+  约束的文件中，**本模块和消费方的 `go` 指令都无需抬高**：1.27 之前的工具链不编译
+  此文件，`TypedDB` / `Typed` 不存在，其余功能不受影响。
+
+版本/门禁实测矩阵（同一份探针代码，`go.mod` 写 `go 1.25.0`；✅ 编译、❌ 报错）：
+
+| 探针 | go1.25.1 | go1.26.5 | go1.26.6 | go1.27.1 |
+| --- | --- | --- | --- | --- |
+| 泛型方法，无构建标签 | ❌ `method must have no type parameters` | ❌ 同左 | ❌ 同左 | ❌ `generic method requires go1.27 or later (-lang was set to go1.25; check go.mod)` |
+| 泛型方法，`//go:build go1.27` | 文件被排除 | 文件被排除 | 文件被排除 | ✅ |
+| 泛型方法，`//go:build go1.26` | 文件被排除 | 文件被排除 | 文件被排除 | ❌ `generic method requires go1.27 or later (file declares //go:build go1.26)` |
+| 文件名 `xxx_go1.26.5.go` / `xxx_go1265.go` / `xxx_go1.99.go` | ✅ 全被编译 | ✅ | ✅ | ✅ |
+| 仅 `//go:build go1.26.5`（补丁级标签） | 文件被排除 | 文件被排除 | 文件被排除 | 文件被排除 |
+| `go.mod` 写 `go 1.26.5` / `go 1.26.6` | 合法，但要求 1.26.5+ 工具链 | ✅ | ✅ | ✅ |
+
+由此可确认三点：
+
+1. **补丁级构建标签不存在**：`ReleaseTags` 只有 `… go1.25` / `… go1.26` / `… go1.27`，
+   写 `//go:build go1.26.5` 永远不成立，而且**不报错**（静默排除文件），所以无法表达
+   "1.27.1+"，只能按 1.27 系列放行。`go.mod` 里写补丁级 `go` 指令倒合法，但那是工具链
+   下限，不是文件门禁。
+2. **文件名后缀不产生任何约束**：Go 只认 `*_GOOS` / `*_GOARCH` / `*_GOOS_GOARCH`；
+   `xxx_go1.99.go` 在 go1.25.1 上照样编译。`typed_go1.27.go` 里的 `go1.27` 纯属可读性
+   命名，真正的门禁是文件内的 `//go:build` 行。
+3. **`//go:build go1.27` 一举两得**：既是文件选择门禁，又会按 Go 规则把该文件的
+   language version 抬到 `go1.27`（cmd/go 依文件内的 `go1.N` 约束传 `-lang`），这正是
+   `go.mod` 只写 `go 1.25.0` 也能用 `db.Get[T](...)` 的原因；去掉这行就会在 1.27.1 上
+   编译失败（见上表），所以**不要**为了"顺便兼容 1.25"而删掉它。
 
 ## 语义要点
 

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -37,11 +38,13 @@ func Run(t *testing.T, factory func(t *testing.T) core.KvProvider) {
 func VirtualClock(t *testing.T) Options {
 	t.Helper()
 	base := time.Now()
-	offset := time.Duration(0)
+	// offset 用原子存：并发读用例会在 FastForward 推进时钟的同时从多个 goroutine
+	// 经 core.Now 读取它，普通变量会被 -race 判为数据竞争。
+	var offset atomic.Int64 // 纳秒
 	real := core.Now
-	core.Now = func() time.Time { return base.Add(offset) }
+	core.Now = func() time.Time { return base.Add(time.Duration(offset.Load())) }
 	t.Cleanup(func() { core.Now = real })
-	return Options{FastForward: func() { offset += 2 * time.Second }}
+	return Options{FastForward: func() { offset.Add(int64(2 * time.Second)) }}
 }
 
 // RunWithOptions 是 Run 的带选项版本（虚拟时钟等）。

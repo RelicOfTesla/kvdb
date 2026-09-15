@@ -14,7 +14,7 @@ n, err := db.Incr(ctx, "visits", 1)
 
 ## 特性
 
-- **9 个内置基座**，同一套 API：`mem` / `jsonl` / `bolt` / `leveldb` / `sqlite` / `mysql` / `pg` / `redis` / `ssdb`
+- **10 个内置基座**，同一套 API：`mem` / `jsonl` / `bolt` / `leveldb` / `badger` / `sqlite` / `mysql` / `pg` / `redis` / `ssdb`
 - **能力可选、按需探测**：KV 必选；Queue / ZSet / Batch / 生命周期为可选能力，
   未实现时返回 `ErrUnsupported`，可用 `Capabilities()` 探测
 - **注册表默认空**：用哪个基座就 `import _` 哪个包，根包与mod不引入任何驱动依赖
@@ -33,6 +33,7 @@ n, err := db.Incr(ctx, "visits", 1)
 | `kvdb/mem`、`kvdb/jsonl` | 1.18 | 仅标准库 |
 | `kvdb/sqlstore` | 1.18 | 仅标准库（`database/sql` 抽象） |
 | `kvdb/ssdb`、`kvdb/leveldb` | 1.19 | 用到 `atomic.Bool` / `atomic.Pointer[T]` |
+| `kvdb/badger` | 1.24 | Badger v4 自身声明 `go 1.24.0` |
 | `kvdb/bolt`、`kvdb/sqlite`、`kvdb/mysql`、`kvdb/pg`、`kvdb/redis` | 1.25 | 由驱动及其传递依赖决定（如 `golang.org/x/sys` 要求 1.25） |
 | `kvdb/all`、`kvdb/bench`、`kvdb/example` | 1.25 | 聚合了上述模块 |
 
@@ -97,6 +98,7 @@ jsonl://./data.jsonl?sync=1        # sync=1 每次写 fsync
 sqlite://./data.db?table_prefix=app_       # 表名前缀（mysql/pg 同名参数）
 bolt://./data.bolt?nosync=1        # nosync=1 关闭 fsync（更快，崩溃可能丢最近提交）
 leveldb://./data.dir?nosync=1&cache=8&wb=4   # 目录型存储；cache/wb 单位 MiB
+badger://./data.dir?nosync=1&cache=64&memtable=64   # 目录型存储；cache/memtable 单位 MiB
 mysql://user:pass@host:3306/dbname?parseTime=true&table_prefix=app_
 pg://user:pass@host:5432/dbname?sslmode=disable&table_prefix=app_
 redis://:password@host:6379/0?key_prefix=app:   # 键命名空间前缀
@@ -119,6 +121,7 @@ ssdb://:password@host:8888         # 服务端启用 server.auth 时
 | JSONL 日志 | `jsonl` | ✅ | ✅ | ✅ | append-only WAL，打开时回放，支持 `Compact()`；单进程内嵌 |
 | BoltDB | `bolt` | ✅ | ✅ | ✅ | bbolt 单文件 B+tree（纯 Go）；每写一次事务提交，批写整批一次提交 |
 | LevelDB | `leveldb` | ✅ | ✅ | ✅ | syndtr/goleveldb LSM-tree（纯 Go）；批写收进单个 Batch 原子提交 |
+| Badger | `badger` | ✅ | ✅ | ✅ | dgraph-io/badger LSM-tree（纯 Go）；有 MVCC 事务，批写整批一个 `Update` 提交，**批内可见** |
 | SQLite | `sqlite` | ✅ | ✅ | ✅ | 纯 Go 驱动（modernc），无 CGO |
 | MySQL | `mysql` | ✅ | ✅ | ✅ | 共享 `sqlstore` |
 | PostgreSQL | `pg` | ✅ | ✅ | ✅ | 共享 `sqlstore` |
@@ -154,7 +157,7 @@ c.BatchComposed                    // 批内后续操作能否看到本批前序
 
 - **批内可见性是可感知、非强制的能力**：同一批内多条操作涉及同一 key / 队列 /
   zset 成员时，终值取决于基座机制。在同一事务或同一把锁内逐条应用的基座
-  （`mem` / `jsonl` / `bolt` / `sqlite` / `mysql` / `pg`）为 `true`；
+  （`mem` / `jsonl` / `bolt` / `badger` / `sqlite` / `mysql` / `pg`）为 `true`；
   LevelDB 的 Batch、Redis 的 MULTI/EXEC、SSDB 的流水线在提交前读不到未提交内容，
   为 `false`。需要确定性组合时，先探测再决定，或直接把相互依赖的操作拆批。
 - **窄依赖**：业务函数只需声明用到的能力接口，测试里实现对应方法即可，无需实现整个 `DB`：
@@ -278,6 +281,8 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 | BoltDB 并发写 | 单写者、多读者（MVCC）；写操作按 bbolt 事务串行提交 |
 | LevelDB 无 bucket / 无事务 | 单一有序键空间，三类数据用首字节命名空间标签隔离；`Write(batch)` 本身原子，所有多键写（含值+TTL、zset 双侧索引）都收进一个 Batch。**Batch 是写缓冲、读不到未提交内容**，故 `Capabilities().BatchComposed=false`：同批内针对同一队列/zset 成员的多条操作可能互相覆盖，需确定性组合请拆批 |
 | LevelDB 并发 Incr | LevelDB 无 CAS 原语，同 key 的读-改-写由分片锁串行化（不同 key 仍并行） |
+| Badger 有事务 | 多键写用 `db.Update` 事务提交，批内 read-your-writes（`BatchComposed=true`）。同 key 的读-改-写仍先用分片锁串行化：仅靠事务的 SSI 冲突重试也能保证正确，但同键热点会退化成重试风暴 |
+| Badger 的 TTL | 不用原生 `WithTTL`（走真实时间），改为独立 TTL 记录 + 可注入时钟判定，与 leveldb 一致 |
 | SQL 键长 | MySQL 键列上限 255 字节（兼容 5.6 默认索引前缀）；PG / SQLite 用 BYTEA/BLOB 无此限制 |
 | 过期键的写语义 | 所有基座统一"已过期 = 不存在"：`Set` 不继承旧 TTL、`Incr` 从 0 起算、`Expire` 不复活 |
 | 读返回值所有权 | `Get`/`MGet`/`Scan`/`QFront`/`QBack` 返回副本，调用方改写不影响库内状态 |
@@ -332,7 +337,7 @@ SQLite 采用纯 Go 驱动（modernc），吞吐与 CGO 驱动相当，不引入
 口径：**固定时间窗内跑满并发负载、统计实际完成量**（ops/s）。要点：
 
 - **批写收益随介质与持久化等级变化**：ext4(WSL vhdx) 上 sqlite 48.6×、bolt 86.9×、
-  leveldb 73.1×；tmpfs 上多数为 2.5–3×（没有 fsync 可摊薄）。
+  leveldb 73.1×、badger 38.9×；tmpfs 上多数为 2.5–7×（没有 fsync 可摊薄）。
 - **写瓶颈通常是每个事务一次 fsync**，而非语句条数：本环境裸 fsync 为
   tmpfs 2–4 µs、ext4(vhdx) ~2.5 ms、drvfs(9p) 3.8–5.5 ms。
 - **同 key 热点在 SQL 上明显掉档**：mysql 多 key 447 vs 同 key 116 ops/s（3.9×）、
@@ -358,14 +363,17 @@ SQLite 采用纯 Go 驱动（modernc），吞吐与 CGO 驱动相当，不引入
 | jsonl · tmpfs | ~201.8k | ~10.1M | ~221.9k | ~298.2k | ~286.3k | ~13.4M | ~510.5k |
 | bolt · tmpfs | ~22.1k | ~569.8k | ~22.9k | ~26.9k | ~20.9k | ~2.2M | ~479.1k |
 | leveldb · tmpfs | ~137.0k | ~1.0M | ~111.8k | ~122.4k | ~108.5k | ~1.0M | ~381.8k |
+| badger · tmpfs | ~67.0k | ~274.4k | ~63.5k | ~34.0k | ~53.1k | ~638.4k | ~461.5k |
 | sqlite · tmpfs | ~12.0k | ~60.6k | ~5.7k | ~5.8k | ~7.3k | ~447.9k | ~35.6k |
 | jsonl · ext4 | ~177.0k | ~10.0M | ~190.1k | ~242.2k | ~315.3k | ~14.1M | ~548.7k |
 | bolt · ext4 | ~426 | ~591.1k | ~461 | ~481 | ~518 | ~2.6M | ~38.6k |
 | leveldb · ext4 | ~1.3k | ~1.0M | ~1.4k | ~448 | ~1.4k | ~1.0M | ~92.8k |
+| badger · ext4 | ~757 | ~272.0k | ~741 | ~620 | ~724 | ~608.2k | ~29.4k |
 | sqlite · ext4 | ~559 | ~61.3k | ~312 | ~316 | ~358 | ~453.0k | ~30.4k |
 | jsonl · 9p | ~1.4k | ~9.6M | ~1.5k | ~1.5k | ~1.6k | ~13.3M | ~110.3k |
 | bolt · 9p | ~89 | ~589.5k | ~91 | ~88 | ~94 | ~2.6M | ~7.1k |
 | leveldb · 9p | ~1.0k | ~1.1M | ~1.0k | ~288 | ~1.1k | ~1.0M | ~75.2k |
+| badger · 9p | ~321 | ~297.6k | ~312 | ~286 | ~338 | ~622.8k | ~26.8k |
 | sqlite · 9p | ~234 | ~9.6k | ~129 | ~151 | ~105 | ~102.0k | ~16.1k |
 | redis | ~12.7k | ~12.4k | ~14.9k | ~13.4k | ~13.2k | ~256.4k | ~497.2k |
 | ssdb | ~8.0k | ~7.6k | ~7.7k | ~7.9k | ~8.2k | ~137.4k | ~20.6k |
@@ -375,7 +383,7 @@ SQLite 采用纯 Go 驱动（modernc），吞吐与 CGO 驱动相当，不引入
 ① jsonl 默认只 flush 到 OS、不逐条 fsync（`?sync=1` 才是每写一次 fsync）：比较时
 须先对齐持久化等级。
 
-读路径几乎不受介质影响（如 leveldb Get 三档均 ~1.0M），而写路径跨介质差 2–3 个数量级
+读路径几乎不受介质影响（leveldb Get 三档均 ~1.0M、badger ~272–298k），而写路径跨介质差 2–3 个数量级
 （bolt Set：22.1k → 426 → 89）。服务端基座的**读**吞吐低于嵌入式（redis Get ~12.4k vs
 bolt ~590k），瓶颈是网络往返。完整分析见 [PERFORMANCE.md](PERFORMANCE.md)。
 
@@ -394,8 +402,11 @@ bolt ~590k），瓶颈是网络往返。完整分析见 [PERFORMANCE.md](PERFORM
 | bolt · ext4 | ~500k | ~491 | 85% |
 | bolt · 9p | ~319k | ~119 | 54% |
 | leveldb · tmpfs | ~109k | ~58.8k | 11% |
+| badger · tmpfs | ~74.6k | ~40.3k | 27% |
 | leveldb · ext4 | ~736k | ~827 | 74% |
+| badger · ext4 | ~1.0k | ~689 | 0.4% |
 | leveldb · 9p | ~658k | ~658 | 60% |
+| badger · 9p | ~497 | ~314 | 0.2% |
 | sqlite · tmpfs | ~37k | ~6.7k | 61% |
 | sqlite · ext4 | ~74k | ~409 | 121% |
 | sqlite · 9p | ~19k | ~85 | 193% |
@@ -406,6 +417,9 @@ bolt ~590k），瓶颈是网络往返。完整分析见 [PERFORMANCE.md](PERFORM
 
 - **服务端基座读写互不阻塞**（各保留 ~44–63%，只是把并发度对半分）；`mem`/`jsonl`
   因共用全局锁，高写频率下读只剩纯读的 5–9%。
+- **`badger` 的读保留率由"写提交窗口"决定**：默认逐条 fsync 时，一次提交在 9p/ext4
+  上要 1.3–3 ms，读者排在提交锁之后，读保留率只剩 0.2–0.4%；换成 `?nosync=1` 后同一
+  组负载在 9p 上读回到 92.7k ops/s（保留率 ~33%）。这是它与其他嵌入式基座最不一样的地方。
 - **掉幅取决于写者进入共享同步原语的频率，而非介质带宽**：同一基座的写频率越低
   （如 9p 上），读保留率越高——盘慢反而让读者更容易穿插。所以"Get 比 Set 快几十倍"
   只在低写负载下成立。
@@ -474,7 +488,7 @@ bytes.go               B / P / D / DMust 字节编解码
 registry.go            Register / MustRegister / Schemes
 kvdbtest/              跨基座共享合同用例（公开包，供各基座模块测试引用）
 all/                   聚合注册包：import _ 即接入全部内置基座
-mem/ jsonl/ leveldb/ sqlite/ mysql/ pg/ redis/ ssdb/   各基座实现（各自独立模块）
+mem/ jsonl/ bolt/ leveldb/ badger/ sqlite/ mysql/ pg/ redis/ ssdb/   各基座实现（各自独立模块）
 sqlstore/              MySQL / SQLite / PG 共享的 database/sql 实现（方言参数化）
 bench/                 基准测试（独立模块，import .../all）
 example/               可运行演示

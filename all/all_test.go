@@ -13,7 +13,7 @@ import (
 )
 
 func TestAllSchemesRegistered(t *testing.T) {
-	want := []string{"bolt", "jsonl", "leveldb", "mem", "mysql", "pg", "redis", "sqlite", "ssdb"}
+	want := []string{"badger", "bolt", "jsonl", "leveldb", "mem", "mysql", "pg", "redis", "sqlite", "ssdb"}
 	got := kvdb.Schemes()
 	set := make(map[string]bool, len(got))
 	for _, s := range got {
@@ -36,6 +36,7 @@ func TestOpenLocalBackends(t *testing.T) {
 	uris := []string{
 		"mem://",
 		"jsonl://" + filepath.Join(dir, "d.jsonl"),
+		"badger://" + filepath.Join(dir, "d.badger"),
 		"bolt://" + filepath.Join(dir, "d.bolt"),
 		"leveldb://" + filepath.Join(dir, "d.ldb"),
 		"sqlite://" + filepath.Join(dir, "d.db"),

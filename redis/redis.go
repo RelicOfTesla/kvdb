@@ -37,6 +37,7 @@ func OpenURI(ctx context.Context, u *url.URL) (core.KvProvider, error) {
 	if cfg.Password == "" {
 		cfg.Password = u.Query().Get("password")
 	}
+	cfg.KeyPrefix = u.Query().Get("key_prefix")
 	if db := strings.TrimPrefix(u.Path, "/"); db != "" {
 		if n, err := strconv.Atoi(db); err == nil {
 			cfg.DB = n
@@ -52,15 +53,22 @@ var (
 // 三类数据共存于同一个 Redis keyspace，而 core.KvProvider 约定"命名空间彼此独立"，
 // 因此用前缀隔离：同名 KV 键 / 队列 / zset 互不干扰，Scan 也只扫描 KV 前缀
 // （否则会在 List/Sorted Set 键上触发 WRONGTYPE）。
-const (
-	kvPrefix = "kvdb:kv:"
-	qPrefix  = "kvdb:q:"
-	zPrefix  = "kvdb:z:"
-)
+//
+// DefaultKeyPrefix 是 Config.KeyPrefix 为空时采用的前缀。实际生效的三段前缀由
+// 它派生：<prefix>kv: / <prefix>q: / <prefix>z:。
+const DefaultKeyPrefix = "kvdb:"
 
-func kvKey(k string) string { return kvPrefix + k }
-func qKey(k string) string  { return qPrefix + k }
-func zKey(k string) string  { return zPrefix + k }
+// prefixes 是由 Config.KeyPrefix 派生的三段实际前缀。
+type prefixes struct {
+	kv, q, z string
+}
+
+func newPrefixes(base string) prefixes {
+	if base == "" {
+		base = DefaultKeyPrefix
+	}
+	return prefixes{kv: base + "kv:", q: base + "q:", z: base + "z:"}
+}
 
 // Config 是 Redis 连接配置。
 type Config struct {
@@ -69,11 +77,15 @@ type Config struct {
 	Password string
 	DB       int // 库号（0-15）
 	PoolSize int // 0 使用驱动默认值
+	// KeyPrefix 是键命名空间前缀，派生出 <pfx>kv: / <pfx>q: / <pfx>z: 三段；
+	// 空串取 DefaultKeyPrefix。多个应用共用一个 Redis 库时用它互相隔离。
+	KeyPrefix string
 }
 
 // Provider 是 Redis 基座。go-redis 内部自带连接池，并发安全。
 type Provider struct {
 	rd        *goredis.Client
+	pfx       prefixes // 键命名空间前缀（见 Config.KeyPrefix）
 	closed    atomic.Bool
 	closeOnce sync.Once
 }
@@ -94,7 +106,7 @@ func Open(ctx context.Context, cfg Config) (*Provider, error) {
 		rd.Close()
 		return nil, fmt.Errorf("redis: ping %s: %w", cfg.Addr, err)
 	}
-	return &Provider{rd: rd}, nil
+	return &Provider{rd: rd, pfx: newPrefixes(cfg.KeyPrefix)}, nil
 }
 
 // check 判断是否已关闭：closed 为 atomic.Bool，与并发 Close 无数据竞争。
@@ -121,7 +133,7 @@ func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 	if err := p.check(); err != nil {
 		return err
 	}
-	key = kvKey(key)
+	key = p.pfx.kv + key
 	// KEEPTTL 保持既有 TTL（与 SSDB set 不触碰 ttl 表语义对齐），需 Redis >= 6.0。
 	if err := p.rd.SetArgs(ctx, key, string(value), goredis.SetArgs{KeepTTL: true}).Err(); err != nil {
 		return fmt.Errorf("redis: set: %w", err)
@@ -134,7 +146,7 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 	if err := p.check(); err != nil {
 		return err
 	}
-	key = kvKey(key)
+	key = p.pfx.kv + key
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
@@ -148,7 +160,7 @@ func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	if err := p.check(); err != nil {
 		return nil, false, err
 	}
-	key = kvKey(key)
+	key = p.pfx.kv + key
 	v, err := p.rd.Get(ctx, key).Result()
 	if errors.Is(err, goredis.Nil) {
 		return nil, false, nil
@@ -163,7 +175,7 @@ func (p *Provider) Del(ctx context.Context, key string) error {
 	if err := p.check(); err != nil {
 		return err
 	}
-	key = kvKey(key)
+	key = p.pfx.kv + key
 	if err := p.rd.Del(ctx, key).Err(); err != nil {
 		return fmt.Errorf("redis: del: %w", err)
 	}
@@ -174,7 +186,7 @@ func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 	if err := p.check(); err != nil {
 		return false, err
 	}
-	key = kvKey(key)
+	key = p.pfx.kv + key
 	n, err := p.rd.Exists(ctx, key).Result()
 	if err != nil {
 		return false, fmt.Errorf("redis: exists: %w", err)
@@ -186,7 +198,7 @@ func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, er
 	if err := p.check(); err != nil {
 		return 0, err
 	}
-	key = kvKey(key)
+	key = p.pfx.kv + key
 	n, err := p.rd.IncrBy(ctx, key, delta).Result()
 	if err != nil {
 		if notInteger(err) {
@@ -208,7 +220,7 @@ func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte,
 	}
 	rkeys := make([]string, len(keys))
 	for i, k := range keys {
-		rkeys[i] = kvKey(k)
+		rkeys[i] = p.pfx.kv + k
 	}
 	vals, err := p.rd.MGet(ctx, rkeys...).Result()
 	if err != nil {
@@ -239,12 +251,12 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 	var found []string
 	cur := uint64(0)
 	for {
-		keys, next, err := p.rd.Scan(ctx, cur, kvPrefix+"*", 256).Result()
+		keys, next, err := p.rd.Scan(ctx, cur, p.pfx.kv+"*", 256).Result()
 		if err != nil {
 			return nil, fmt.Errorf("redis: scan: %w", err)
 		}
 		for _, rk := range keys {
-			k := strings.TrimPrefix(rk, kvPrefix)
+			k := strings.TrimPrefix(rk, p.pfx.kv)
 			if start != "" && k < start {
 				continue
 			}
@@ -264,7 +276,7 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 	}
 	out := make([]core.KeyValue, 0, len(found))
 	for _, k := range found {
-		v, err := p.rd.Get(ctx, kvKey(k)).Result()
+		v, err := p.rd.Get(ctx, p.pfx.kv+k).Result()
 		if errors.Is(err, goredis.Nil) {
 			continue // 扫描期间被删，跳过
 		}
@@ -280,7 +292,7 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	if err := p.check(); err != nil {
 		return err
 	}
-	key = kvKey(key)
+	key = p.pfx.kv + key
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
@@ -294,7 +306,7 @@ func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
 	if err := p.check(); err != nil {
 		return 0, false, err
 	}
-	key = kvKey(key)
+	key = p.pfx.kv + key
 	d, err := p.rd.TTL(ctx, key).Result()
 	if err != nil {
 		return 0, false, fmt.Errorf("redis: ttl: %w", err)
@@ -312,7 +324,7 @@ func (p *Provider) QPush(ctx context.Context, name string, value []byte) error {
 	if err := p.check(); err != nil {
 		return err
 	}
-	name = qKey(name)
+	name = p.pfx.q + name
 	if err := p.rd.RPush(ctx, name, string(value)).Err(); err != nil {
 		return fmt.Errorf("redis: rpush: %w", err)
 	}
@@ -323,7 +335,7 @@ func (p *Provider) QPushFront(ctx context.Context, name string, value []byte) er
 	if err := p.check(); err != nil {
 		return err
 	}
-	name = qKey(name)
+	name = p.pfx.q + name
 	if err := p.rd.LPush(ctx, name, string(value)).Err(); err != nil {
 		return fmt.Errorf("redis: lpush: %w", err)
 	}
@@ -334,7 +346,7 @@ func (p *Provider) QPop(ctx context.Context, name string) ([]byte, bool, error) 
 	if err := p.check(); err != nil {
 		return nil, false, err
 	}
-	name = qKey(name)
+	name = p.pfx.q + name
 	v, err := p.rd.LPop(ctx, name).Result()
 	if errors.Is(err, goredis.Nil) {
 		return nil, false, nil
@@ -349,7 +361,7 @@ func (p *Provider) QPopBack(ctx context.Context, name string) ([]byte, bool, err
 	if err := p.check(); err != nil {
 		return nil, false, err
 	}
-	name = qKey(name)
+	name = p.pfx.q + name
 	v, err := p.rd.RPop(ctx, name).Result()
 	if errors.Is(err, goredis.Nil) {
 		return nil, false, nil
@@ -364,7 +376,7 @@ func (p *Provider) QSize(ctx context.Context, name string) (int64, error) {
 	if err := p.check(); err != nil {
 		return 0, err
 	}
-	name = qKey(name)
+	name = p.pfx.q + name
 	n, err := p.rd.LLen(ctx, name).Result()
 	if err != nil {
 		return 0, fmt.Errorf("redis: llen: %w", err)
@@ -384,7 +396,7 @@ func (p *Provider) lindex(ctx context.Context, name string, idx int64) ([]byte, 
 	if err := p.check(); err != nil {
 		return nil, false, err
 	}
-	name = qKey(name)
+	name = p.pfx.q + name
 	v, err := p.rd.LIndex(ctx, name, idx).Result()
 	if errors.Is(err, goredis.Nil) {
 		return nil, false, nil
@@ -401,7 +413,7 @@ func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) erro
 	if err := p.check(); err != nil {
 		return err
 	}
-	name = zKey(name)
+	name = p.pfx.z + name
 	if err := p.rd.ZAdd(ctx, name, goredis.Z{Score: f64(score), Member: key}).Err(); err != nil {
 		return fmt.Errorf("redis: zadd: %w", err)
 	}
@@ -412,7 +424,7 @@ func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, err
 	if err := p.check(); err != nil {
 		return 0, false, err
 	}
-	name = zKey(name)
+	name = p.pfx.z + name
 	s, err := p.rd.ZScore(ctx, name, key).Result()
 	if errors.Is(err, goredis.Nil) {
 		return 0, false, nil
@@ -427,7 +439,7 @@ func (p *Provider) ZDel(ctx context.Context, name, key string) error {
 	if err := p.check(); err != nil {
 		return err
 	}
-	name = zKey(name)
+	name = p.pfx.z + name
 	if err := p.rd.ZRem(ctx, name, key).Err(); err != nil {
 		return fmt.Errorf("redis: zrem: %w", err)
 	}
@@ -438,7 +450,7 @@ func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
 	if err := p.check(); err != nil {
 		return 0, err
 	}
-	name = zKey(name)
+	name = p.pfx.z + name
 	n, err := p.rd.ZCard(ctx, name).Result()
 	if err != nil {
 		return 0, fmt.Errorf("redis: zcard: %w", err)
@@ -450,7 +462,7 @@ func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, er
 	if err := p.check(); err != nil {
 		return 0, false, err
 	}
-	name = zKey(name)
+	name = p.pfx.z + name
 	r, err := p.rd.ZRank(ctx, name, key).Result()
 	if errors.Is(err, goredis.Nil) {
 		return 0, false, nil
@@ -465,7 +477,7 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 	if err := p.check(); err != nil {
 		return nil, err
 	}
-	name = zKey(name)
+	name = p.pfx.z + name
 	zs, err := p.rd.ZRangeWithScores(ctx, name, start, stop).Result()
 	if err != nil {
 		return nil, fmt.Errorf("redis: zrange: %w", err)
@@ -485,7 +497,7 @@ func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (in
 	if err := p.check(); err != nil {
 		return 0, err
 	}
-	name = zKey(name)
+	name = p.pfx.z + name
 	s, err := p.rd.ZIncrBy(ctx, name, f64(delta), key).Result()
 	if err != nil {
 		if notInteger(err) {
@@ -555,39 +567,39 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 			case core.BatchSet:
 				// KEEPTTL：与单条 Set 一致，批内 Set 不得清掉既有 TTL
 				//（裸 SET 会清 TTL，违反 batch 契约；需 Redis >= 6.0）。
-				if err := pipe.SetArgs(ctx, kvKey(op.Key), op.Value, goredis.SetArgs{KeepTTL: true}).Err(); err != nil {
+				if err := pipe.SetArgs(ctx, p.pfx.kv+op.Key, op.Value, goredis.SetArgs{KeepTTL: true}).Err(); err != nil {
 					return err
 				}
 			case core.BatchSetEx:
-				if err := pipe.Set(ctx, kvKey(op.Key), op.Value, secondsDuration(op.TTL)).Err(); err != nil {
+				if err := pipe.Set(ctx, p.pfx.kv+op.Key, op.Value, secondsDuration(op.TTL)).Err(); err != nil {
 					return err
 				}
 			case core.BatchDel:
-				if err := pipe.Del(ctx, kvKey(op.Key)).Err(); err != nil {
+				if err := pipe.Del(ctx, p.pfx.kv+op.Key).Err(); err != nil {
 					return err
 				}
 			case core.BatchExpire:
-				if err := pipe.Expire(ctx, kvKey(op.Key), secondsDuration(op.TTL)).Err(); err != nil {
+				if err := pipe.Expire(ctx, p.pfx.kv+op.Key, secondsDuration(op.TTL)).Err(); err != nil {
 					return err
 				}
 			case core.BatchQPush:
-				if err := pipe.RPush(ctx, qKey(op.Key), op.Value).Err(); err != nil {
+				if err := pipe.RPush(ctx, p.pfx.q+op.Key, op.Value).Err(); err != nil {
 					return err
 				}
 			case core.BatchQPushFront:
-				if err := pipe.LPush(ctx, qKey(op.Key), op.Value).Err(); err != nil {
+				if err := pipe.LPush(ctx, p.pfx.q+op.Key, op.Value).Err(); err != nil {
 					return err
 				}
 			case core.BatchZSet:
-				if err := pipe.ZAdd(ctx, zKey(op.Key), goredis.Z{Score: f64(op.Score), Member: op.Member}).Err(); err != nil {
+				if err := pipe.ZAdd(ctx, p.pfx.z+op.Key, goredis.Z{Score: f64(op.Score), Member: op.Member}).Err(); err != nil {
 					return err
 				}
 			case core.BatchZDel:
-				if err := pipe.ZRem(ctx, zKey(op.Key), op.Member).Err(); err != nil {
+				if err := pipe.ZRem(ctx, p.pfx.z+op.Key, op.Member).Err(); err != nil {
 					return err
 				}
 			case core.BatchZIncr:
-				if err := pipe.ZIncrBy(ctx, zKey(op.Key), f64(op.Delta), op.Member).Err(); err != nil {
+				if err := pipe.ZIncrBy(ctx, p.pfx.z+op.Key, f64(op.Delta), op.Member).Err(); err != nil {
 					return err
 				}
 			default:

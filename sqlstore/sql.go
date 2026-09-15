@@ -62,6 +62,9 @@ type Dialect struct {
 	// SQLite 需要：多连接并发写即使有 busy_timeout 也会在持续竞争下报
 	// SQLITE_BUSY；进程级写锁把竞争变成排队，读仍由 WAL 并行。
 	SerializeWrites bool
+	// TablePrefix 加在四张表名之前（如 "kvdb_" -> kvdb_kv_items），用于与其他应用
+	// 共用一个库/schema。空串表示用默认表名。索引名同样带前缀，不会与别的表的索引冲突。
+	TablePrefix string
 	// DDL（占位符无需参数）。
 	KvDDL, QSeqDDL, QItemsDDL, ZDDL, ZIdxDDL string
 }
@@ -281,6 +284,54 @@ func build(d Dialect, tpl string) string {
 		sb.WriteByte(tpl[i])
 		i++
 	}
+	return applyTablePrefix(d, sb.String())
+}
+
+// tableNames 是 sqlstore 使用的四张表；applyTablePrefix 在 SQL 文本里把它们替换成
+// 带前缀的形式。只匹配左右都不是标识符字符的位置，因此 "idx_z_items_s" 这类派生名
+// 不会被误改（它左侧是 "_"，属于标识符字符）。
+var tableNames = []string{"kv_items", "q_seq", "q_items", "z_items"}
+
+func applyTablePrefix(d Dialect, sql string) string {
+	if d.TablePrefix == "" {
+		return sql
+	}
+	// 索引名先单独处理：它含表名子串但不是独立标识符（左邻 "z_"），
+	// 不先替换会被下面的表名替换漏掉，导致同库多前缀互相撞索引名。
+	sql = strings.ReplaceAll(sql, indexName, d.TablePrefix+indexName)
+	for _, t := range tableNames {
+		sql = replaceIdent(sql, t, d.TablePrefix+t)
+	}
+	return sql
+}
+
+// indexName 是 z_items(z,s,k) 的二级索引名（MySQL 内联在 DDL，其余用 CREATE INDEX）。
+const indexName = "idx_z_items_s"
+
+// replaceIdent 把 s 中作为独立标识符出现的 from 换成 to。
+func replaceIdent(s, from, to string) string {
+	isIdent := func(b byte) bool {
+		return b == '_' || b == '$' || (b >= '0' && b <= '9') ||
+			(b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+	}
+	var sb strings.Builder
+	for i := 0; i < len(s); {
+		j := strings.Index(s[i:], from)
+		if j < 0 {
+			sb.WriteString(s[i:])
+			break
+		}
+		start, end := i+j, i+j+len(from)
+		leftOK := start == 0 || !isIdent(s[start-1])
+		rightOK := end == len(s) || !isIdent(s[end])
+		sb.WriteString(s[i:start])
+		if leftOK && rightOK {
+			sb.WriteString(to)
+		} else {
+			sb.WriteString(from)
+		}
+		i = end
+	}
 	return sb.String()
 }
 
@@ -425,12 +476,19 @@ type Provider struct {
 }
 
 // New 在既有 *sql.DB 上构造基座：建表、清理过期行。
+//
+// Dialect.TablePrefix 若非空，必须是合法标识符片段（字母/数字/下划线，且不以数字
+// 开头），因为它会被直接拼进表名而不是作为参数绑定。
 func New(db *sql.DB, d Dialect) (*Provider, error) {
-	// 空 DDL 跳过（如 MySQL 索引已内联建表）。
-	for _, ddl := range []string{d.KvDDL, d.QSeqDDL, d.QItemsDDL, d.ZDDL, d.ZIdxDDL} {
-		if ddl == "" {
+	if err := validTablePrefix(d.TablePrefix); err != nil {
+		return nil, fmt.Errorf("sqlstore: dialect %s: %w", d.Name, err)
+	}
+	// 空 DDL 跳过（如 MySQL 索引已内联建表）。DDL 不经 build()，故在此单独加前缀。
+	for _, raw := range []string{d.KvDDL, d.QSeqDDL, d.QItemsDDL, d.ZDDL, d.ZIdxDDL} {
+		if raw == "" {
 			continue
 		}
+		ddl := applyTablePrefix(d, raw)
 		if _, err := db.Exec(ddl); err != nil {
 			return nil, fmt.Errorf("sqlstore: migrate (%s): %w", d.Name, err)
 		}
@@ -444,6 +502,21 @@ func New(db *sql.DB, d Dialect) (*Provider, error) {
 		return nil, fmt.Errorf("sqlstore: cleanup (%s): %w", d.Name, err)
 	}
 	return p, nil
+}
+
+// validTablePrefix 校验表名前缀只含标识符安全字符，防止把任意内容拼进 SQL。
+func validTablePrefix(p string) error {
+	if p == "" {
+		return nil
+	}
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		ok := c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (i > 0 && c >= '0' && c <= '9')
+		if !ok {
+			return fmt.Errorf("invalid table prefix %q (want identifier-safe: letters, digits, underscore)", p)
+		}
+	}
+	return nil
 }
 
 func (p *Provider) check() error {

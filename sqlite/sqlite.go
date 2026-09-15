@@ -19,13 +19,22 @@ import (
 
 func init() { kvdb.MustRegister("sqlite", OpenURI) }
 
-// OpenURI 解析 sqlite://<path>；Host 为空表示绝对路径 sqlite:///abs/x。
+// Config 控制 SQLite 基座行为。
+type Config struct {
+	// Path 是数据库文件路径；":memory:" 表示进程内临时库。
+	Path string
+	// TablePrefix 加在四张表名前（如 "kvdb_" -> kvdb_kv_items），用于与其他应用
+	// 共用一个库。空串使用默认表名。
+	TablePrefix string
+}
+
+// OpenURI 解析 sqlite://<path>[?table_prefix=pfx_]；Host 为空表示绝对路径 sqlite:///abs/x。
 func OpenURI(ctx context.Context, u *url.URL) (core.KvProvider, error) {
 	p := u.Path
 	if u.Host != "" {
 		p = strings.TrimPrefix(u.Host+u.Path, "/")
 	}
-	return Open(ctx, p)
+	return OpenConfig(ctx, Config{Path: p, TablePrefix: u.Query().Get("table_prefix")})
 }
 
 // Provider 是 SQLite 基座（别名 sqlstore.Provider）。
@@ -34,6 +43,12 @@ type Provider = sqlstore.Provider
 // Open 打开 SQLite 数据库文件；path 为 ":memory:" 时使用进程内临时库。
 // 建表（IF NOT EXISTS）与过期清理在 Open 内完成。
 func Open(ctx context.Context, path string) (*Provider, error) {
+	return OpenConfig(ctx, Config{Path: path})
+}
+
+// OpenConfig 按配置打开（可指定表名前缀）。
+func OpenConfig(ctx context.Context, cfg Config) (*Provider, error) {
+	path := cfg.Path
 	dsn := sqliteDSN(path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -52,7 +67,9 @@ func Open(ctx context.Context, path string) (*Provider, error) {
 		db.Close()
 		return nil, fmt.Errorf("sqlite: ping: %w", err)
 	}
-	p, err := sqlstore.New(db, sqlstore.SQLiteDialect)
+	d := sqlstore.SQLiteDialect
+	d.TablePrefix = cfg.TablePrefix
+	p, err := sqlstore.New(db, d)
 	if err != nil {
 		db.Close()
 		return nil, err

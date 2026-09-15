@@ -52,7 +52,7 @@ type Dialect struct {
 	IncrSQL string
 	// HasNumCol 表示 kv_items 有数值投影列 n（供单语句 Incr 使用）；
 	// 为 true 时 Set/SetEx 必须同步维护 n，否则 Incr 会误判为非整数。
-	// 该列是后加的，旧库由 migrate 补列并回填（见 migrate）。
+	// 该列是后加的；未发 tag 期间不做旧库兼容，旧表请手动删除重建。
 	HasNumCol bool
 	// SerializeWrites 为 true 时基座在进程内串行化全部写操作（单写者模型）。
 	// SQLite 需要：多连接并发写即使有 busy_timeout 也会在持续竞争下报
@@ -419,9 +419,6 @@ func New(db *sql.DB, d Dialect) (*Provider, error) {
 			return nil, fmt.Errorf("sqlstore: migrate (%s): %w", d.Name, err)
 		}
 	}
-	if err := migrate(db, d); err != nil {
-		return nil, fmt.Errorf("sqlstore: migrate (%s): %w", d.Name, err)
-	}
 	p := &Provider{db: db, st: makeStmts(d), dialect: d, hasNumCol: d.HasNumCol}
 	if d.SerializeWrites {
 		p.writeMu = &sync.Mutex{}
@@ -431,84 +428,6 @@ func New(db *sql.DB, d Dialect) (*Provider, error) {
 		return nil, fmt.Errorf("sqlstore: cleanup (%s): %w", d.Name, err)
 	}
 	return p, nil
-}
-
-// migrate 处理 CREATE TABLE IF NOT EXISTS 覆盖不到的旧库 schema 升级。
-//
-// 目前只有 SQLite 的数值投影列 n：该列是后加的（此前 kv_items 只有 k/v/expire_at），
-// 旧库升级后建表语句是 no-op，所有写路径都会报 "table kv_items has no column
-// named n"。这里用 PRAGMA 检测缺列 -> 加列 -> 回填整数投影，全程一个事务，
-// 可重复执行（幂等）。
-func migrate(db *sql.DB, d Dialect) error {
-	if !d.HasNumCol {
-		return nil
-	}
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	rows, err := tx.Query("PRAGMA table_info(kv_items)")
-	if err != nil {
-		return err
-	}
-	hasN := false
-	for rows.Next() {
-		var (
-			cid, notnull, pk int
-			name, ctype      string
-			dflt             any
-		)
-		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			rows.Close()
-			return err
-		}
-		if name == "n" {
-			hasN = true
-		}
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
-	if !hasN {
-		if _, err := tx.Exec("ALTER TABLE kv_items ADD COLUMN n INTEGER NULL"); err != nil {
-			return err
-		}
-	}
-	// 回填：把已有行的 n 按 numProjection 规则补齐（非整数保持 NULL）。
-	// 用 Go 侧解析而不是 SQL CAST，保证与写路径的"十进制 int64"判定完全一致。
-	br, err := tx.Query("SELECT k, v FROM kv_items WHERE n IS NULL")
-	if err != nil {
-		return err
-	}
-	type kvPair struct {
-		k, v []byte
-	}
-	var pairs []kvPair
-	for br.Next() {
-		var k, v []byte
-		if err := br.Scan(&k, &v); err != nil {
-			br.Close()
-			return err
-		}
-		if numProjection(v) != nil {
-			pairs = append(pairs, kvPair{k, v})
-		}
-	}
-	if err := br.Err(); err != nil {
-		br.Close()
-		return err
-	}
-	br.Close()
-	for _, p := range pairs {
-		if _, err := tx.Exec("UPDATE kv_items SET n = ? WHERE k = ?", numProjection(p.v), p.k); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
 }
 
 func (p *Provider) check() error {

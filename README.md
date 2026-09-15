@@ -275,7 +275,7 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 | Redis 的 `Set` | 用 `SET ... KEEPTTL` 保持既有 TTL（需 Redis ≥ 6.0） |
 | Redis 键前缀 | 三类数据共用一个 keyspace，基座自动加 `kvdb:kv:` / `kvdb:q:` / `kvdb:z:` 前缀，保证命名空间独立；**前缀属于数据布局**，旧版本写入的裸 key 数据不再可见（`SCAN kvdb:kv:*` 可导出旧数据） |
 | SQL 键长 | MySQL 键列上限 255 字节（兼容 5.6 默认索引前缀）；PostgreSQL/SQLite 用 BYTEA/BLOB 无此限制 |
-| SQLite 旧库升级 | `kv_items.n` 列由开库迁移自动补列并回填整数投影（幂等），旧库无需手工处理 |
+| SQL schema 变更 | **尚未发 tag，不做旧库兼容**：模块既不迁移也不探测，旧库请手动删除重建（表已存在时建表语句 `IF NOT EXISTS` 不生效，旧结构会在写入时报错） |
 | 过期键的写语义 | 所有基座统一"已过期 = 不存在"：过期后 `Set` 不继承旧 TTL、`Incr` 从 0 起算、`Expire` 不复活 |
 | 读返回值所有权 | `Get`/`MGet`/`Scan`/`QFront`/`QBack` 一律返回副本，调用方改写不影响库内状态（mem/jsonl 曾是内部切片别名） |
 

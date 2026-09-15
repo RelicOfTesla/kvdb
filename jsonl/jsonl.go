@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 
 	"github.com/RelicOfTesla/kvdb/core"
@@ -112,14 +113,20 @@ func (e *parseError) Error() string {
 func (e *parseError) Unwrap() error { return e.err }
 
 // Provider 是 JSONL 基座。并发安全；ctx 仅用于接口一致。
+//
+// 关于 mu 的职责：它保护**日志写入流**（bw/file 的追加与 Compact 时的换名重开），
+// 因此所有写操作必须串行——单条日志的顺序就是这份 WAL 的语义。它不保护读：
+// 读操作只经 mem（其自身有锁）并读原子的 closed，既不碰 file/bw，也不参与换名，
+// 所以读路径不取 mu，读写可以真正并行。若把读也纳入这把锁（哪怕用 RLock），
+// 一个写者就会阻塞全部读者，而读侧本来不需要任何额外一致性保证。
 type Provider struct {
-	mu     sync.RWMutex
+	mu     sync.Mutex
 	mem    *mem.Provider
 	file   *os.File
 	bw     *bufio.Writer
 	path   string
 	sync   bool
-	closed bool
+	closed atomic.Bool
 }
 
 // Open 打开（不存在则创建）日志文件并回放恢复状态。
@@ -388,7 +395,7 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	if p.closed.Load() {
 		return core.ErrClosed
 	}
 	recs := make([]op, 0, len(ops))
@@ -450,7 +457,7 @@ func toRecord(o core.BatchOp, now int64) (op, error) {
 func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	if p.closed.Load() {
 		return core.ErrClosed
 	}
 	// WAL 顺序：先写日志、再改内存。若写日志失败则内存不变，二者始终一致
@@ -466,7 +473,7 @@ func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	if p.closed.Load() {
 		return core.ErrClosed
 	}
 	if ttl <= 0 {
@@ -479,9 +486,7 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 }
 
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.closed {
+	if p.closed.Load() {
 		return nil, false, core.ErrClosed
 	}
 	return p.mem.Get(ctx, key)
@@ -490,7 +495,7 @@ func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 func (p *Provider) Del(ctx context.Context, key string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	if p.closed.Load() {
 		return core.ErrClosed
 	}
 	if err := p.appendOp(encOp(op{Op: opDel}, key, "", nil)); err != nil {
@@ -500,9 +505,7 @@ func (p *Provider) Del(ctx context.Context, key string) error {
 }
 
 func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.closed {
+	if p.closed.Load() {
 		return false, core.ErrClosed
 	}
 	return p.mem.Exists(ctx, key)
@@ -511,7 +514,7 @@ func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	if p.closed.Load() {
 		return 0, core.ErrClosed
 	}
 	// 先校验既有值可解析为整数：若直接写日志再应用，日志里会留下一条
@@ -530,18 +533,14 @@ func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, er
 }
 
 func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.closed {
+	if p.closed.Load() {
 		return nil, core.ErrClosed
 	}
 	return p.mem.MGet(ctx, keys...)
 }
 
 func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]core.KeyValue, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.closed {
+	if p.closed.Load() {
 		return nil, core.ErrClosed
 	}
 	return p.mem.Scan(ctx, start, end, limit)
@@ -550,7 +549,7 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	if p.closed.Load() {
 		return core.ErrClosed
 	}
 	if ttl <= 0 {
@@ -563,9 +562,7 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 }
 
 func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.closed {
+	if p.closed.Load() {
 		return 0, false, core.ErrClosed
 	}
 	return p.mem.TTL(ctx, key)
@@ -584,7 +581,7 @@ func (p *Provider) QPushFront(ctx context.Context, name string, value []byte) er
 func (p *Provider) qpush(ctx context.Context, name string, value []byte, front bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	if p.closed.Load() {
 		return core.ErrClosed
 	}
 	if err := p.appendOp(encOp(op{Op: opQPush, F: front}, name, "", value)); err != nil {
@@ -607,7 +604,7 @@ func (p *Provider) QPopBack(ctx context.Context, name string) ([]byte, bool, err
 func (p *Provider) qpop(ctx context.Context, name string, back bool) ([]byte, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	if p.closed.Load() {
 		return nil, false, core.ErrClosed
 	}
 	// 空队列不写日志（否则回放时多出一条无对应元素的 qpop）。
@@ -631,27 +628,21 @@ func (p *Provider) qpop(ctx context.Context, name string, back bool) ([]byte, bo
 }
 
 func (p *Provider) QSize(ctx context.Context, name string) (int64, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.closed {
+	if p.closed.Load() {
 		return 0, core.ErrClosed
 	}
 	return p.mem.QSize(ctx, name)
 }
 
 func (p *Provider) QFront(ctx context.Context, name string) ([]byte, bool, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.closed {
+	if p.closed.Load() {
 		return nil, false, core.ErrClosed
 	}
 	return p.mem.QFront(ctx, name)
 }
 
 func (p *Provider) QBack(ctx context.Context, name string) ([]byte, bool, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.closed {
+	if p.closed.Load() {
 		return nil, false, core.ErrClosed
 	}
 	return p.mem.QBack(ctx, name)
@@ -662,7 +653,7 @@ func (p *Provider) QBack(ctx context.Context, name string) ([]byte, bool, error)
 func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	if p.closed.Load() {
 		return core.ErrClosed
 	}
 	if err := p.appendOp(encOp(op{Op: opZSet, S: score}, name, key, nil)); err != nil {
@@ -672,9 +663,7 @@ func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) erro
 }
 
 func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.closed {
+	if p.closed.Load() {
 		return 0, false, core.ErrClosed
 	}
 	return p.mem.ZGet(ctx, name, key)
@@ -683,7 +672,7 @@ func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, err
 func (p *Provider) ZDel(ctx context.Context, name, key string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	if p.closed.Load() {
 		return core.ErrClosed
 	}
 	if err := p.appendOp(encOp(op{Op: opZDel}, name, key, nil)); err != nil {
@@ -693,27 +682,21 @@ func (p *Provider) ZDel(ctx context.Context, name, key string) error {
 }
 
 func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.closed {
+	if p.closed.Load() {
 		return 0, core.ErrClosed
 	}
 	return p.mem.ZSize(ctx, name)
 }
 
 func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.closed {
+	if p.closed.Load() {
 		return 0, false, core.ErrClosed
 	}
 	return p.mem.ZRank(ctx, name, key)
 }
 
 func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) ([]core.ZItem, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.closed {
+	if p.closed.Load() {
 		return nil, core.ErrClosed
 	}
 	return p.mem.ZRange(ctx, name, start, stop)
@@ -722,7 +705,7 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (int64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	if p.closed.Load() {
 		return 0, core.ErrClosed
 	}
 	if err := p.appendOp(encOp(op{Op: opZIncr, D: delta}, name, key, nil)); err != nil {
@@ -736,7 +719,7 @@ func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (in
 func (p *Provider) Compact(ctx context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	if p.closed.Load() {
 		return core.ErrClosed
 	}
 	_ = ctx
@@ -815,7 +798,7 @@ func (p *Provider) Compact(ctx context.Context) error {
 	if err != nil {
 		// 换名已成功而旧句柄指向的是被 unlink 的孤儿 inode：若继续服务，
 		// 后续写会"返回成功却全部丢失"。这里置为已关闭，宁可拒绝服务。
-		p.closed = true
+		p.closed.Store(true)
 		return fmt.Errorf("jsonl: compact reopen: %w", err)
 	}
 	p.file.Close() // 旧句柄关闭失败不影响新句柄可用性，忽略
@@ -838,10 +821,10 @@ func syncDirBestEffort(path string) {
 func (p *Provider) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	if p.closed.Load() {
 		return nil
 	}
-	p.closed = true
+	p.closed.Store(true)
 	err1 := p.bw.Flush()
 	err2 := p.file.Sync()
 	err3 := p.file.Close()

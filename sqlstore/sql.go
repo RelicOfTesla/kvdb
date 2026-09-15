@@ -472,7 +472,6 @@ func makeStmts(d Dialect) stmts {
 
 // Provider 是 SQL 基座。并发安全由 database/sql 连接池与事务保障。
 type Provider struct {
-	mu        sync.Mutex
 	writeMu   *sync.Mutex // 方言要求写串行化时非 nil（SQLite 单写者）
 	db        *sql.DB
 	st        stmts
@@ -533,9 +532,8 @@ func (p *Provider) check() error {
 	return nil
 }
 
+// Close 幂等：closed 为原子标志，Swap 保证只有一个调用者真正关闭底层连接池。
 func (p *Provider) Close() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.closed.Swap(true) {
 		return nil
 	}

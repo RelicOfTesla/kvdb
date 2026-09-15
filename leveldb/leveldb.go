@@ -181,6 +181,21 @@ func (p *Provider) Close() error {
 
 // keyMu 把同一 key 的"读-改-写"串行化（LevelDB 没有 CAS/事务原语），
 // 不同 key 之间仍可并行。分片锁避免为每个 key 常驻一个 mutex。
+//
+// 为什么是 Mutex 而不是 RWMutex——由操作所需的一致性语义决定，与"当前有几个
+// 调用点"无关：
+//
+//   - 需要互斥的是"读当前状态 → 计算 → 写回"这类**复合序列**（Incr、队列
+//     push/pop、zset 增删改）：它们跨多次 LevelDB 调用，并发执行会各自基于同一个
+//     旧值计算而互相覆盖（丢更），因此临界区必须是**排他**的。
+//   - 只读操作不需要 SDK 这一层的锁。LevelDB 自身已给出：Get 取快照序号
+//     （acquireSnapshot），单次读原子；NewIterator 持有 version 快照，整次扫描
+//     一致；而本基座的多键更新一律收进一次 Write(batch) 原子生效（是**原子提交**，
+//     不是"一条指令"）。因此读者只会看到提交前或提交后的完整状态。
+//
+// 即：这把锁是**写侧串行化原语**，RLock 不是"暂时没人用"，而是按设计不该有——
+// 读侧若真需要跨多次读的一致视图，正确做法是用 LevelDB 快照，而不是给这把按 key
+// 分片的锁加 RLock：分片粒度本就给不出跨分片一致性，反而让读多付一层锁开销。
 const keyShards = 64
 
 func (p *Provider) keyMutex(key string) *sync.Mutex {

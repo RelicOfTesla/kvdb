@@ -21,9 +21,14 @@ type conn struct {
 	bw *bufio.Writer
 }
 
+// maxRecordBytes 是单条记录（长度前缀声明的 body）的防御性字节上限，
+// 防止服务端异常/恶意应答超大长度导致按声明值一次性分配内存。
+const maxRecordBytes = 1 << 26 // 64 MiB
+
 // dial 建立到 addr（host:port）的连接；ctx 控制拨号与后续每操作超时。
+// 无 ctx deadline 时拨号默认 10s 超时，避免对黑洞地址阻塞到内核 SYN 超时。
 func dial(ctx context.Context, addr string) (*conn, error) {
-	var d net.Dialer
+	d := net.Dialer{Timeout: 10 * time.Second}
 	nc, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("ssdb: dial %s: %w", addr, err)
@@ -135,6 +140,9 @@ func (c *conn) readRecs() ([][]byte, error) {
 		n, err := strconv.Atoi(line)
 		if err != nil || n < 0 {
 			return nil, fmt.Errorf("ssdb: bad size line %q", line)
+		}
+		if n > maxRecordBytes {
+			return nil, fmt.Errorf("ssdb: record too large: %d bytes (limit %d)", n, maxRecordBytes)
 		}
 		body := make([]byte, n)
 		if _, err := io.ReadFull(c.br, body); err != nil {

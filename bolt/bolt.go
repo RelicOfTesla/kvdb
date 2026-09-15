@@ -46,9 +46,10 @@ var (
 
 // Provider 是 bbolt 基座。
 type Provider struct {
-	db     *bolt.DB
-	path   string
-	closed atomic.Bool
+	db        *bolt.DB
+	path      string
+	closed    atomic.Bool
+	lastSweep atomic.Int64 // 上次过期回收时刻（unix 秒），节流写事务内的清理
 }
 
 // Open 打开（不存在则创建）数据库文件。
@@ -63,6 +64,8 @@ func Open(ctx context.Context, path string, cfg Config) (*Provider, error) {
 		db.Close()
 		return nil, err
 	}
+	// init 已做过一次全量清理，节流起点从现在起算。
+	p.lastSweep.Store(time.Now().Unix())
 	return p, nil
 }
 
@@ -73,13 +76,17 @@ func OpenURI(ctx context.Context, u *url.URL) (core.KvProvider, error) {
 		p = strings.TrimPrefix(u.Host+u.Path, "/")
 	}
 	var cfg Config
-	if u.Query().Get("nosync") == "1" {
+	if v := u.Query().Get("nosync"); v == "1" || v == "true" {
 		cfg.NoSync = true
 	}
 	if t := u.Query().Get("timeout"); t != "" {
-		if d, err := time.ParseDuration(t); err == nil {
-			cfg.Timeout = d
+		// 必须报错而不是静默忽略：Timeout 留 0 意味着 bbolt 获取文件锁
+		// 无限等待（"timeout=5" 这类无单位写法会被 ParseDuration 拒绝）。
+		d, err := time.ParseDuration(t)
+		if err != nil {
+			return nil, fmt.Errorf("bolt: bad timeout %q: %w", t, err)
 		}
+		cfg.Timeout = d
 	}
 	return Open(ctx, p, cfg)
 }
@@ -128,7 +135,19 @@ func (p *Provider) update(fn func(*bolt.Tx) error) error {
 	if err := p.check(); err != nil {
 		return err
 	}
-	return p.db.Update(fn)
+	return p.db.Update(func(tx *bolt.Tx) error {
+		// 写事务开头按节流回收过期条目：TTL 磨损负载下过期键可能不再被
+		// 任何写触碰，挂在写事务上保证长期运行进程的磁盘占用有界
+		//（Open 时另有一次全量清理）。清理失败回滚整个事务，可重试。
+		now := time.Now().Unix()
+		if now-p.lastSweep.Load() >= sweepInterval {
+			p.lastSweep.Store(now)
+			if err := cleanupExpired(tx, now); err != nil {
+				return err
+			}
+		}
+		return fn(tx)
+	})
 }
 
 // ---- 键编码 ----
@@ -178,17 +197,24 @@ func prefixEnd(prefix []byte) []byte {
 
 func ttlExpired(tx *bolt.Tx, key []byte, now int64) bool {
 	v := tx.Bucket(bTTL).Get(key)
-	if v == nil {
+	if len(v) != 8 {
+		// 无 TTL（nil）或记录长度异常：按未过期处理（fail-open，保持可读）。
 		return false
 	}
 	return int64(binary.BigEndian.Uint64(v)) <= now
 }
+
+// sweepInterval 是写事务内过期回收的最小间隔（秒）。
+const sweepInterval = 60
 
 func cleanupExpired(tx *bolt.Tx, now int64) error {
 	kvt, kk := tx.Bucket(bTTL), tx.Bucket(bKV)
 	var expired [][]byte
 	c := kvt.Cursor()
 	for k, v := c.First(); k != nil; k, v = c.Next() {
+		if len(v) != 8 {
+			continue // 记录异常的 TTL 不参与清理
+		}
 		if int64(binary.BigEndian.Uint64(v)) <= now {
 			expired = append(expired, append([]byte(nil), k...))
 		}
@@ -226,7 +252,8 @@ func kvSetExTx(tx *bolt.Tx, key string, value []byte, ttl int64) error {
 	if err := tx.Bucket(bKV).Put([]byte(key), value); err != nil {
 		return err
 	}
-	return tx.Bucket(bTTL).Put([]byte(key), be64(uint64(time.Now().Unix()+ttl)))
+	// AddTTL 饱和：now+ttl 溢出为负再经 uint64 编码会被所有读者判"已过期"。
+	return tx.Bucket(bTTL).Put([]byte(key), be64(uint64(core.AddTTL(time.Now().Unix(), ttl))))
 }
 
 func kvDelTx(tx *bolt.Tx, key string) error {
@@ -245,7 +272,7 @@ func kvExpireTx(tx *bolt.Tx, key string, ttl int64, now int64) error {
 	if tx.Bucket(bKV).Get(k) == nil || ttlExpired(tx, k, now) {
 		return nil
 	}
-	return tx.Bucket(bTTL).Put(k, be64(uint64(now+ttl)))
+	return tx.Bucket(bTTL).Put(k, be64(uint64(core.AddTTL(now, ttl))))
 }
 
 // kvIncrTx 原子累加：已过期的键按不存在处理（从 0 起算并清除旧 TTL），
@@ -370,6 +397,15 @@ func qPopTx(tx *bolt.Tx, name string, back bool) ([]byte, bool, error) {
 	if cs.count > 0 {
 		cs.count--
 	}
+	if cs.count == 0 {
+		// 队列排空：删除计数记录，防止队列命名 churn 永久泄漏
+		//（与 zset 的 zc 记录在清空时删除保持一致；计数从 0 重启无碰撞，
+		// 因为旧元素已全部删除）。
+		if err := tx.Bucket(bQS).Delete(lp(name)); err != nil {
+			return nil, false, err
+		}
+		return out, true, nil
+	}
 	if err := qCountersPut(tx, name, cs); err != nil {
 		return nil, false, err
 	}
@@ -397,8 +433,8 @@ func zScoreGet(tx *bolt.Tx, name, member string) (int64, bool) {
 
 func zCountGet(tx *bolt.Tx, name string) int64 {
 	v := tx.Bucket(bZC).Get(lp(name))
-	if v == nil {
-		return 0
+	if len(v) != 8 {
+		return 0 // 缺失或记录异常按 0 处理
 	}
 	return int64(binary.BigEndian.Uint64(v))
 }
@@ -533,8 +569,11 @@ func zRankTx(tx *bolt.Tx, name, member string) (int64, bool) {
 
 func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 	_ = ctx
-	now := time.Now().Unix()
-	return p.update(func(tx *bolt.Tx) error { return kvSetTx(tx, key, value, now) })
+	// now 在事务内采样：等待 bbolt 单写者锁期间若跨过键的过期点，
+	// 事务外的陈旧 now 会让 kvSetTx 保留已失效的 TTL（写成功却不可见）。
+	return p.update(func(tx *bolt.Tx) error {
+		return kvSetTx(tx, key, value, time.Now().Unix())
+	})
 }
 
 func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int64) error {
@@ -544,10 +583,10 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	_ = ctx
-	now := time.Now().Unix()
 	var out []byte
 	var ok bool
 	err := p.view(func(tx *bolt.Tx) error {
+		now := time.Now().Unix()
 		k := []byte(key)
 		v := tx.Bucket(bKV).Get(k)
 		if v == nil || ttlExpired(tx, k, now) {
@@ -566,9 +605,9 @@ func (p *Provider) Del(ctx context.Context, key string) error {
 
 func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 	_ = ctx
-	now := time.Now().Unix()
 	var ok bool
 	err := p.view(func(tx *bolt.Tx) error {
+		now := time.Now().Unix()
 		k := []byte(key)
 		v := tx.Bucket(bKV).Get(k)
 		ok = v != nil && !ttlExpired(tx, k, now)
@@ -579,10 +618,9 @@ func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 
 func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, error) {
 	_ = ctx
-	now := time.Now().Unix()
 	var out int64
 	err := p.update(func(tx *bolt.Tx) error {
-		n, err := kvIncrTx(tx, key, delta, now)
+		n, err := kvIncrTx(tx, key, delta, time.Now().Unix())
 		if err != nil {
 			return err
 		}
@@ -594,9 +632,9 @@ func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, er
 
 func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte, error) {
 	_ = ctx
-	now := time.Now().Unix()
 	out := make(map[string][]byte, len(keys))
 	err := p.view(func(tx *bolt.Tx) error {
+		now := time.Now().Unix()
 		b := tx.Bucket(bKV)
 		for _, key := range keys {
 			k := []byte(key)
@@ -614,9 +652,9 @@ func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte,
 func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]core.KeyValue, error) {
 	_ = ctx
 	limit = normalizeLimit(limit)
-	now := time.Now().Unix()
 	var out []core.KeyValue
 	err := p.view(func(tx *bolt.Tx) error {
+		now := time.Now().Unix()
 		c := tx.Bucket(bKV).Cursor()
 		var k, v []byte
 		if start != "" {
@@ -643,18 +681,17 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 
 func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	_ = ctx
-	now := time.Now().Unix()
-	return p.update(func(tx *bolt.Tx) error { return kvExpireTx(tx, key, ttl, now) })
+	return p.update(func(tx *bolt.Tx) error { return kvExpireTx(tx, key, ttl, time.Now().Unix()) })
 }
 
 func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
 	_ = ctx
-	now := time.Now().Unix()
 	var secs int64
 	var ok bool
 	err := p.view(func(tx *bolt.Tx) error {
+		now := time.Now().Unix()
 		v := tx.Bucket(bTTL).Get([]byte(key))
-		if v == nil {
+		if v == nil || len(v) != 8 {
 			return nil
 		}
 		exp := int64(binary.BigEndian.Uint64(v))

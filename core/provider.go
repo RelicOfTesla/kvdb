@@ -7,10 +7,20 @@ package core
 import (
 	"context"
 	"errors"
+	"math"
 )
 
 // DefaultScanLimit 是 Scan 在 limit<=0 时采用的页大小，避免无上限全表扫描。
 const DefaultScanLimit = 100
+
+// AddTTL 返回 now+ttl 的饱和和：ttl 大到溢出 int64 时钳制到 MaxInt64，
+// 避免各基座把 expire_at 包绕成负数（键立即过期或永不过期的分歧）。
+func AddTTL(now, ttl int64) int64 {
+	if ttl > 0 && now > math.MaxInt64-ttl {
+		return math.MaxInt64
+	}
+	return now + ttl
+}
 
 // 哨兵错误：仅用于 errors.Is 判等，不携带额外状态。
 var (
@@ -52,7 +62,9 @@ type KvProvider interface {
 	// Exists 判断 key 是否存在（已过期视为不存在）。
 	Exists(ctx context.Context, key string) (bool, error)
 	// Incr 原子地对 key 存储的十进制整数加 delta（key 不存在按 0 起算）；
-	// 已有值非整数返回 ErrNotInteger。
+	// 已有值非整数返回 ErrNotInteger。溢出行为按基座分歧：SQL/Redis/SSDB
+	// 返回错误（SSDB/PG 统一映射为 ErrNotInteger），内存型基座（mem/bolt/jsonl）
+	// 按 int64 回绕——契约不对溢出语义做统一承诺。
 	Incr(ctx context.Context, key string, delta int64) (int64, error)
 	// MGet 批量读取；结果只含存在的 key，不保证顺序。
 	MGet(ctx context.Context, keys ...string) (map[string][]byte, error)
@@ -108,8 +120,10 @@ type BatchOp struct {
 //
 // 提交语义：
 //   - 整批按 ops 顺序生效；空批为空操作；
-//   - 提交失败时：具备事务能力的基座（mysql/sqlite/pg/redis/jsonl/mem）保证整批
-//     不生效；SSDB 无事务，采用流水线，失败时可能部分生效（其价值在于减少往返）；
+//   - 提交失败时：具备事务能力的基座（mysql/sqlite/pg/jsonl/mem）保证整批
+//     不生效；Redis 走 MULTI/EXEC，网络/协议错误整批不生效，但命令级错误
+//     （如 WRONGTYPE/OOM）时 EXEC 不回滚，之前的命令可能已生效；SSDB 无事务，
+//     采用流水线，失败时可能部分生效（其价值在于减少往返）；
 //   - 批内不含 Incr/QPop 这类依赖当前状态的操作（需先校验再写），如需请单独调用。
 type BatchProvider interface {
 	ApplyBatch(ctx context.Context, ops []BatchOp) error

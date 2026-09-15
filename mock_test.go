@@ -3,10 +3,12 @@ package kvdb_test
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/RelicOfTesla/kvdb"
+	"github.com/RelicOfTesla/kvdb/core"
 )
 
 // fakeKV 是只实现 KV 能力的最小 mock：证明业务函数可以只依赖窄接口
@@ -39,7 +41,12 @@ func (f *fakeKV) MGet(_ context.Context, keys ...string) (map[string][]byte, err
 	return out, nil
 }
 
-func (f *fakeKV) Scan(_ context.Context, start, end string, _ int) ([]kvdb.KeyValue, error) {
+func (f *fakeKV) Scan(_ context.Context, start, end string, limit int) ([]kvdb.KeyValue, error) {
+	// 与真实基座契约一致：字节序升序 + limit 截断（limit<=0 按 DefaultScanLimit），
+	// 避免把"map 随机序/忽略 limit"的偏差当作 mock 的合法行为。
+	if limit <= 0 {
+		limit = kvdb.DefaultScanLimit
+	}
 	var out []kvdb.KeyValue
 	for k, v := range f.data {
 		if start != "" && k < start {
@@ -49,6 +56,10 @@ func (f *fakeKV) Scan(_ context.Context, start, end string, _ int) ([]kvdb.KeyVa
 			continue
 		}
 		out = append(out, kvdb.KeyValue{Key: k, Value: v})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	if len(out) > limit {
+		out = out[:limit]
 	}
 	return out, nil
 }
@@ -80,7 +91,9 @@ func (f *fakeKV) Incr(ctx context.Context, key string, delta int64) (int64, erro
 	var n int64
 	if ok {
 		if n, err = kvdb.P[int64](cur); err != nil {
-			return 0, err
+			// 与真实基座对齐：非整数值返回 core.ErrNotInteger（errors.Is 可判），
+			// 而不是把解码错误原样透出。
+			return 0, core.ErrNotInteger
 		}
 	}
 	n += delta

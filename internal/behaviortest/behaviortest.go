@@ -369,8 +369,8 @@ func TestKV(t *testing.T, db kvdb.DB) {
 	if err := db.Del(ctx, "a"); err != nil {
 		t.Fatal(err)
 	}
-	if ok, _ := db.Exists(ctx, "a"); ok {
-		t.Fatal("Del 后仍存在")
+	if ok, err := db.Exists(ctx, "a"); err != nil || ok {
+		t.Fatalf("Del 后仍存在 (err=%v)", err)
 	}
 
 	// Incr：缺失按 0 起算；非整数报错；并发原子性
@@ -402,8 +402,8 @@ func TestKV(t *testing.T, db kvdb.DB) {
 		}()
 	}
 	wg.Wait()
-	if n, _ := db.Incr(ctx, "race", 0); n != goroutines*per {
-		t.Fatalf("并发 Incr 结果 = %d, want %d", n, goroutines*per)
+	if n, err := db.Incr(ctx, "race", 0); err != nil || n != goroutines*per {
+		t.Fatalf("并发 Incr 结果 = %d (err=%v), want %d", n, err, goroutines*per)
 	}
 
 	// 多 key 并发：每个 goroutine 只写自己的 key（互不重叠），
@@ -425,8 +425,9 @@ func TestKV(t *testing.T, db kvdb.DB) {
 	}
 	mkWg.Wait()
 	for g := 0; g < mkG; g++ {
-		if n, _ := db.Incr(ctx, fmt.Sprintf("mk%d", g), 0); n != mkPer {
-			t.Fatalf("多key 并发后 mk%d = %d, want %d", g, n, mkPer)
+		n, err := db.Incr(ctx, fmt.Sprintf("mk%d", g), 0)
+		if err != nil || n != mkPer {
+			t.Fatalf("多key 并发后 mk%d = %d (err=%v), want %d", g, n, err, mkPer)
 		}
 	}
 
@@ -487,6 +488,32 @@ func TestKV(t *testing.T, db kvdb.DB) {
 	if err != nil || len(open) != 2 || open[0].Key != "k4" || open[1].Key != "k5" {
 		t.Fatalf("Scan open-end = %v, %v", open, err)
 	}
+
+	// Scan × limit：start 键存在且区间内键数 > limit 时，必须返回闭区间的
+	// **前 limit 个**（含 start 键本身）——回归 ssdb 基座此前"满页丢 start"的分歧。
+	for _, k := range []string{"sl2", "sl3", "sl4", "sl5", "sl6"} {
+		if err := db.Set(ctx, k, []byte(k)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gotLimit, err := db.Scan(ctx, "sl2", "slz", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantLimit := []string{"sl2", "sl3", "sl4"}
+	if len(gotLimit) != len(wantLimit) {
+		t.Fatalf("Scan limit len = %d, want %d: %v", len(gotLimit), len(wantLimit), gotLimit)
+	}
+	for i, kv := range gotLimit {
+		if kv.Key != wantLimit[i] {
+			t.Fatalf("Scan limit[%d] = %s, want %s", i, kv.Key, wantLimit[i])
+		}
+	}
+	for _, k := range []string{"sl2", "sl3", "sl4", "sl5", "sl6"} {
+		if err := db.Del(ctx, k); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func TestQueue(t *testing.T, db kvdb.DB) {
@@ -516,8 +543,8 @@ func TestQueue(t *testing.T, db kvdb.DB) {
 			t.Fatalf("QPop = %q,%v,%v; want %q", v, ok, err, want)
 		}
 	}
-	if _, ok, _ := db.QPop(ctx, "q1"); ok {
-		t.Fatal("空队列 QPop 应 ok=false")
+	if _, ok, err := db.QPop(ctx, "q1"); err != nil || ok {
+		t.Fatalf("空队列 QPop 应 ok=false (err=%v)", err)
 	}
 
 	// 队头插入 / 队尾弹出
@@ -661,6 +688,27 @@ func TestBatch(t *testing.T, db kvdb.DB) {
 	}
 	if secs, has, _ := db.TTL(ctx, "bk1"); !has || secs <= 0 || secs > 50 {
 		t.Fatalf("bk1 批内 Expire = %d,%v", secs, has)
+	}
+
+	// 批内 Set 不得清掉既有 TTL（契约：Set 不改变已存在键的 TTL）。
+	// 回归 redis 基座此前批内用裸 SET 清 TTL 的分歧。
+	if err := db.SetEx(ctx, "bkttl", []byte("v"), 30); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Batch(ctx, func(b *kvdb.Batch) error {
+		b.Set("bkttl", []byte("v2"))
+		return nil
+	}); err != nil {
+		t.Fatalf("Batch bkttl: %v", err)
+	}
+	if v, ok, _ := db.Get(ctx, "bkttl"); !ok || string(v) != "v2" {
+		t.Fatalf("bkttl = %q,%v", v, ok)
+	}
+	if secs, has, _ := db.TTL(ctx, "bkttl"); !has || secs <= 0 || secs > 30 {
+		t.Fatalf("批内 Set 后 TTL = %d,%v, want 0<secs<=30", secs, has)
+	}
+	if err := db.Del(ctx, "bkttl"); err != nil {
+		t.Fatal(err)
 	}
 	if ok, _ := db.Exists(ctx, "bk4"); ok {
 		t.Fatal("批内 Del 应生效")

@@ -1,10 +1,11 @@
 // Command example 演示 kvdb 适配器：同一段业务代码（KV + Queue + ZSet +
-// TTL + Scan + Incr）在 7 个基座间原样切换，仅改 kvdb.Open 的 URI。
+// TTL + Scan + Incr）在 8 个基座间原样切换，仅改 kvdb.Open 的 URI。
 //
 // 用法：
 //
 //	go run ./example -backend mem
 //	go run ./example -backend jsonl://./tmp/data.jsonl
+//	go run ./example -backend bolt://./tmp/data.bolt
 //	go run ./example -backend sqlite://./tmp/data.db
 //	go run ./example -backend mysql://root:kvdbroot@127.0.0.1:43306/kvdb_test
 //	go run ./example -backend pg://postgres:kvdbpass@127.0.0.1:45432/kvdb_test?sslmode=disable
@@ -90,7 +91,10 @@ func main() {
 		db.QPush(ctx, "jobs", []byte("job-2"))
 		db.QPushFront(ctx, "jobs", []byte("job-0"))
 		for n := must(db.QSize(ctx, "jobs")); n > 0; n = must(db.QSize(ctx, "jobs")) {
-			v, _, _ := db.QPop(ctx, "jobs")
+			v, ok, _ := db.QPop(ctx, "jobs")
+			if !ok {
+				break // QSize>0 但 QPop 为空（并发消费等）：避免死循环
+			}
 			fmt.Printf("QPop jobs = %s\n", v)
 		}
 	} else {

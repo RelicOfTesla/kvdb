@@ -30,11 +30,14 @@ type fullStub struct {
 
 var _ core.FullProvider = fullStub{}
 
-// 反向校验：仅 KV 的基座不满足 FullProvider。
+// 反向校验：仅 KV 的基座不满足 FullProvider（运行期断言，失败即 panic）。
 var _ = func() bool {
 	var p any = kvOnly{}
 	_, isFull := p.(core.FullProvider)
-	return !isFull
+	if isFull {
+		panic("kvOnly 不应满足 core.FullProvider")
+	}
+	return true
 }()
 
 // TestSchemeNotRegistered 验证未 import 的基座 scheme 不可用，

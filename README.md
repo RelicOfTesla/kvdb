@@ -211,13 +211,7 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
   与可替换的 `Marshal`/`Unmarshal`；
 - 其余方法经内嵌 `DB` 透传；泛型方法会遮蔽同名方法，**`TypedDB` 不满足 `DB`
   接口**，需要 DB 语义时用 `tdb.DB` 或保留原始 `db`；
-- 版本与门禁：方法级类型参数自 Go 1.27 起支持，但 1.27.0 存在泛型方法相关的
-  编译器缺陷（[golang/go#81195](https://github.com/golang/go/issues/81195)），
-  建议 **1.27.1+**。实现在带 `//go:build go1.27` 的文件中，该行既是文件门禁
-  （低版本工具链不编译它，`TypedDB` / `Typed` 不存在，其余功能不受影响），又把
-  该文件的 language version 抬到 `go1.27`，因此**本模块与消费方的 `go` 指令都
-  无需抬高**。构建标签只有系列级（没有补丁级标签），无法表达"1.27.1+"；
-  文件名后缀没有约束语义，`typed_go1.27.go` 中的 `go1.27` 仅为命名。
+- 版本与门禁：方法级类型参数自 Go 1.27 起支持，实现在带 `//go:build go1.27` 的文件中
 
 ## 语义要点
 
@@ -303,15 +297,16 @@ SQLite 采用纯 Go 驱动（modernc），吞吐与 CGO 驱动相当，不引入
 ## 测试
 
 ```bash
-go test ./...        # 本地基座（mem / jsonl / sqlite）+ 进程内替身（miniredis、假 SSDB）
+go test ./...        # 本地基座（mem / jsonl / sqlite / bolt）+ 进程内替身（miniredis、假 SSDB）
 ```
 
 真实基座用例默认跳过，设置对应环境变量后启用（端口按需调整，避免与本地服务冲突）：
 
 ```bash
-docker run -d --name kvdb-mysql -p 3306:3306 -e MYSQL_ROOT_PASSWORD=pw -e MYSQL_DATABASE=kvdb_test mysql:8.0
-docker run -d --name kvdb-pg    -p 5432:5432 -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=kvdb_test postgres:16-alpine
-docker run -d --name kvdb-redis -p 6379:6379 redis:7-alpine
+# 测试容器只绑回环地址，避免弱口令测试服务暴露到局域网。
+docker run -d --name kvdb-mysql -p 127.0.0.1:3306:3306 -e MYSQL_ROOT_PASSWORD=pw -e MYSQL_DATABASE=kvdb_test mysql:8.0
+docker run -d --name kvdb-pg    -p 127.0.0.1:5432:5432 -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=kvdb_test postgres:16-alpine
+docker run -d --name kvdb-redis -p 127.0.0.1:6379:6379 redis:7-alpine
 
 KVDB_TEST_MYSQL_DSN='root:pw@tcp(127.0.0.1:3306)/kvdb_test' \
 KVDB_TEST_PG_DSN='postgres://postgres:pw@127.0.0.1:5432/kvdb_test?sslmode=disable' \

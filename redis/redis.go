@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"sort"
 	"strconv"
@@ -137,7 +138,7 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
-	if err := p.rd.Set(ctx, key, string(value), time.Duration(ttl)*time.Second).Err(); err != nil {
+	if err := p.rd.Set(ctx, key, string(value), secondsDuration(ttl)).Err(); err != nil {
 		return fmt.Errorf("redis: setex: %w", err)
 	}
 	return nil
@@ -199,6 +200,11 @@ func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, er
 func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte, error) {
 	if err := p.check(); err != nil {
 		return nil, err
+	}
+	if len(keys) == 0 {
+		// 与 mem/SQL 基座对齐：空 key 列表返回空 map（裸 MGET 会被服务端
+		// 以 wrong number of arguments 拒绝）。
+		return map[string][]byte{}, nil
 	}
 	rkeys := make([]string, len(keys))
 	for i, k := range keys {
@@ -278,7 +284,7 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
-	if err := p.rd.Expire(ctx, key, time.Duration(ttl)*time.Second).Err(); err != nil {
+	if err := p.rd.Expire(ctx, key, secondsDuration(ttl)).Err(); err != nil {
 		return fmt.Errorf("redis: expire: %w", err)
 	}
 	return nil
@@ -496,6 +502,18 @@ func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (in
 func f64(v int64) float64 { return float64(v) }
 func i64(f float64) int64 { return int64(f) }
 
+// secondsDuration 把秒数换算为 time.Duration。time.Duration 是 int64 纳秒，
+// ttl > MaxInt64/1e9（约 292 年）时直接换算会回绕成负数：EXPIRE 收到负值会
+// **立即删除键**，SET 收到负值会静默跳过 EX——这里钳制到上限，语义是
+// "足够长"，而非毁数据。
+func secondsDuration(ttl int64) time.Duration {
+	const maxSeconds = math.MaxInt64 / int64(time.Second)
+	if ttl > maxSeconds {
+		ttl = maxSeconds
+	}
+	return time.Duration(ttl) * time.Second
+}
+
 // notInteger 识别 Redis "value is not an integer or out of range" 类错误。
 func notInteger(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "not an integer")
@@ -535,11 +553,13 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 		for _, op := range ops {
 			switch op.Kind {
 			case core.BatchSet:
-				if err := pipe.Set(ctx, kvKey(op.Key), op.Value, 0).Err(); err != nil {
+				// KEEPTTL：与单条 Set 一致，批内 Set 不得清掉既有 TTL
+				//（裸 SET 会清 TTL，违反 batch 契约；需 Redis >= 6.0）。
+				if err := pipe.SetArgs(ctx, kvKey(op.Key), op.Value, goredis.SetArgs{KeepTTL: true}).Err(); err != nil {
 					return err
 				}
 			case core.BatchSetEx:
-				if err := pipe.Set(ctx, kvKey(op.Key), op.Value, time.Duration(op.TTL)*time.Second).Err(); err != nil {
+				if err := pipe.Set(ctx, kvKey(op.Key), op.Value, secondsDuration(op.TTL)).Err(); err != nil {
 					return err
 				}
 			case core.BatchDel:
@@ -547,7 +567,7 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 					return err
 				}
 			case core.BatchExpire:
-				if err := pipe.Expire(ctx, kvKey(op.Key), time.Duration(op.TTL)*time.Second).Err(); err != nil {
+				if err := pipe.Expire(ctx, kvKey(op.Key), secondsDuration(op.TTL)).Err(); err != nil {
 					return err
 				}
 			case core.BatchQPush:

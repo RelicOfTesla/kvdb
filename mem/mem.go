@@ -39,6 +39,9 @@ type Provider struct {
 	queue  map[string]*list.List
 	zset   map[string]map[string]int64
 	closed bool
+	// lastSweep 是上次过期回收的时刻（unix 秒）。仅写路径在写锁内读写，
+	// 用于节流 sweepLocked（无需后台 goroutine）。
+	lastSweep int64
 }
 
 // New 创建一个空的内存基座。
@@ -113,7 +116,36 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 
 // setExLocked 写入值并覆盖 TTL，调用方需持有 p.mu。
 func (p *Provider) setExLocked(key string, value []byte, ttl int64, now int64) {
-	p.kv[key] = &entry{val: append([]byte(nil), value...), exp: now + ttl}
+	p.sweepLocked(now) // TTL 条目只会经此路径与 expireLocked 产生，回收在此节流触发
+	p.kv[key] = &entry{val: append([]byte(nil), value...), exp: core.AddTTL(now, ttl)}
+}
+
+// sweepInterval 是过期条目回收的最小间隔（秒）。
+const sweepInterval = 60
+
+// sweepLocked 物理删除已过期的 kv 条目并清理空容器，调用方需持有 p.mu。
+// 读路径在 RLock 下不得改写 map（见 lookup 注释），因此回收挂在产生 TTL
+// 的写路径上按间隔节流执行；纯读负载不产生新的过期条目，无需回收。
+func (p *Provider) sweepLocked(now int64) {
+	if now-p.lastSweep < sweepInterval {
+		return
+	}
+	p.lastSweep = now
+	for k, e := range p.kv {
+		if e.exp > 0 && e.exp <= now {
+			delete(p.kv, k)
+		}
+	}
+	for name, l := range p.queue {
+		if l.Len() == 0 {
+			delete(p.queue, name)
+		}
+	}
+	for name, m := range p.zset {
+		if len(m) == 0 {
+			delete(p.zset, name)
+		}
+	}
 }
 
 // ---- 读路径 ----
@@ -260,8 +292,9 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 // expireLocked 设置 TTL：已过期/不存在的 key 按不存在处理，不做"复活"。
 // 调用方需持有 p.mu。
 func (p *Provider) expireLocked(key string, ttl int64, now int64) {
+	p.sweepLocked(now)
 	if e, ok := p.lookup(key, now, true); ok {
-		e.exp = now + ttl
+		e.exp = core.AddTTL(now, ttl)
 	}
 }
 
@@ -272,11 +305,17 @@ func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
 	if err := p.checkOpen(); err != nil {
 		return 0, false, err
 	}
-	e, ok := p.lookup(key, time.Now().Unix(), false)
+	now := time.Now().Unix()
+	e, ok := p.lookup(key, now, false)
 	if !ok || e.exp == 0 {
 		return -1, false, nil
 	}
-	return e.exp - time.Now().Unix(), true, nil
+	rem := e.exp - now
+	if rem <= 0 {
+		// 秒级边界上恰好到期：与 Get/Exists 的"已过期即不存在"保持一致。
+		return -1, false, nil
+	}
+	return rem, true, nil
 }
 
 func (p *Provider) Close() error {
@@ -394,6 +433,10 @@ func (p *Provider) qpop(_ context.Context, name string, back bool) ([]byte, bool
 		el = l.Front()
 	}
 	l.Remove(el)
+	if l.Len() == 0 {
+		// 弹空后删除外层条目，防止队列命名 churn 的外层 map 泄漏。
+		delete(p.queue, name)
+	}
 	return el.Value.([]byte), true, nil
 }
 
@@ -479,6 +522,10 @@ func (p *Provider) ZDel(_ context.Context, name, key string) error {
 func (p *Provider) zdelLocked(name, key string) {
 	if m := p.zset[name]; m != nil {
 		delete(m, key)
+		if len(m) == 0 {
+			// 清空后删除内层 map 与外层条目，防止成员命名 churn 泄漏。
+			delete(p.zset, name)
+		}
 	}
 }
 
@@ -605,13 +652,18 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 	if err := p.checkOpen(); err != nil {
 		return err
 	}
-	// 先校验整批（TTL 合法性），避免"应用一半才发现参数非法"。
+	// 先校验整批（Kind 与 TTL 合法性），避免"应用一半才发现参数非法"。
 	for _, op := range ops {
 		switch op.Kind {
+		case core.BatchSet, core.BatchDel, core.BatchQPush, core.BatchQPushFront,
+			core.BatchZSet, core.BatchZDel, core.BatchZIncr:
+			// 无条件写，无参数校验需求
 		case core.BatchSetEx, core.BatchExpire:
 			if op.TTL <= 0 {
 				return core.ErrInvalidTTL
 			}
+		default:
+			return fmt.Errorf("mem: unknown batch op %d", op.Kind)
 		}
 	}
 	now := time.Now().Unix() // 整批共享同一"当前时刻"，避免批内语义漂移

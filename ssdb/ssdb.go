@@ -313,6 +313,13 @@ func (p *Provider) do(ctx context.Context, args ...string) (string, [][]byte, er
 		p.total.Add(-1)
 		return "", nil, err
 	}
+	if st == "noauth" {
+		// 未认证：集中映射 ErrAuth，调用方 errors.Is 即可触发重新认证，
+		// 无需每个命令各自判断（服务端对未认证命令一律回复 noauth）。
+		err := fmt.Errorf("%w: %s", ErrAuth, firstOr(recs, st))
+		p.put(c)
+		return "", nil, err
+	}
 	p.put(c)
 	return st, recs, nil
 }
@@ -354,6 +361,11 @@ func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 	if err := p.check(); err != nil {
 		return err
 	}
+	if key == "" {
+		// SSDB 对空 key 返回 ok 却不写数据（SSDBImpl::set 直接返回 0），
+		// 写入侧拒绝，避免"报成功但丢数据"。
+		return fmt.Errorf("ssdb: set: key must not be empty")
+	}
 	st, _, err := p.do(ctx, "set", key, string(value))
 	if err != nil {
 		return err
@@ -371,6 +383,9 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 	}
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
+	}
+	if key == "" {
+		return fmt.Errorf("ssdb: setx: key must not be empty")
 	}
 	st, _, err := p.do(ctx, "setx", key, string(value), strconv.FormatInt(ttl, 10))
 	if err != nil {
@@ -397,11 +412,11 @@ func (p *Provider) getLocked(ctx context.Context, key string) ([]byte, bool, err
 	}
 	switch st {
 	case "ok":
-		return recs[0], true, nil
+		return firstPayload(recs), true, nil
 	case "not_found":
 		return nil, false, nil
 	default:
-		return nil, false, errFrom(recs[0])
+		return nil, false, errFrom([]byte(firstOr(recs, st)))
 	}
 }
 
@@ -430,26 +445,34 @@ func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 	if st != "ok" {
 		return false, fmt.Errorf("ssdb: exists: status %q", st)
 	}
-	return recs[0][0] == '1', nil
+	return string(firstPayload(recs)) == "1", nil
 }
 
 func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, error) {
 	if err := p.check(); err != nil {
 		return 0, err
 	}
+	if key == "" {
+		return 0, fmt.Errorf("ssdb: incr: key must not be empty")
+	}
 	st, recs, err := p.do(ctx, "incr", key, strconv.FormatInt(delta, 10))
 	if err != nil {
 		return 0, err
 	}
 	if st != "ok" {
-		return 0, errFrom(recs[0])
+		return 0, errFrom([]byte(firstOr(recs, st)))
 	}
-	return strconv.ParseInt(string(recs[0]), 10, 64)
+	return strconv.ParseInt(string(firstPayload(recs)), 10, 64)
 }
 
 func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte, error) {
 	if err := p.check(); err != nil {
 		return nil, err
+	}
+	if len(keys) == 0 {
+		// 与 mem/SQL 基座对齐：空 key 列表返回空 map（SSDB multi_get 要求
+		// 至少 1 个 key，会回 client_error）。
+		return map[string][]byte{}, nil
 	}
 	args := append([]string{"multi_get"}, keys...)
 	st, recs, err := p.do(ctx, args...)
@@ -471,8 +494,13 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 		return nil, err
 	}
 	limit = normalizeLimit(limit)
+	// 闭区间为空（start>end）直接返回，避免补偿逻辑把 start 键塞进空区间。
+	if start != "" && end != "" && start > end {
+		return []core.KeyValue{}, nil
+	}
 	// 真实 SSDB 的 scan 语义为 start 开区间、end 闭区间（分页便利），
-	// SDK 契约统一为闭区间，此处对存在的 start 键做一次 get 补偿。
+	// SDK 契约统一为闭区间：对存在的 start 键做一次 get 补偿；补偿导致
+	// 超页时截掉扫出的最后一个键，保证返回"闭区间的前 limit 个"。
 	st, recs, err := p.do(ctx, "scan", start, end, strconv.Itoa(limit))
 	if err != nil {
 		return nil, err
@@ -484,12 +512,15 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 	for i := 0; i+1 < len(recs); i += 2 {
 		out = append(out, core.KeyValue{Key: string(recs[i]), Value: recs[i+1]})
 	}
-	if start == "" || len(out) >= limit {
+	if start == "" {
 		return out, nil
 	}
 	if v, ok, err := p.getLocked(ctx, start); err != nil {
 		return nil, err
 	} else if ok {
+		if len(out) >= limit {
+			out = out[:limit-1]
+		}
 		out = append([]core.KeyValue{{Key: start, Value: v}}, out...)
 	}
 	return out, nil
@@ -523,7 +554,7 @@ func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
 	if st != "ok" {
 		return 0, false, fmt.Errorf("ssdb: ttl: status %q", st)
 	}
-	n, err := strconv.ParseInt(string(recs[0]), 10, 64)
+	n, err := strconv.ParseInt(string(firstPayload(recs)), 10, 64)
 	if err != nil {
 		return 0, false, err
 	}
@@ -547,6 +578,9 @@ func (p *Provider) QPushFront(ctx context.Context, name string, value []byte) er
 func (p *Provider) qpush(ctx context.Context, name string, value []byte, cmd string) error {
 	if err := p.check(); err != nil {
 		return err
+	}
+	if name == "" {
+		return fmt.Errorf("ssdb: %s: queue name must not be empty", cmd)
 	}
 	st, _, err := p.do(ctx, cmd, name, string(value))
 	if err != nil {
@@ -576,11 +610,11 @@ func (p *Provider) qpop(ctx context.Context, name, cmd string) ([]byte, bool, er
 	}
 	switch st {
 	case "ok":
-		return recs[0], true, nil
+		return firstPayload(recs), true, nil
 	case "not_found":
 		return nil, false, nil
 	default:
-		return nil, false, errFrom(recs[0])
+		return nil, false, errFrom([]byte(firstOr(recs, st)))
 	}
 }
 
@@ -595,7 +629,7 @@ func (p *Provider) QSize(ctx context.Context, name string) (int64, error) {
 	if st != "ok" {
 		return 0, fmt.Errorf("ssdb: qsize: status %q", st)
 	}
-	return strconv.ParseInt(string(recs[0]), 10, 64)
+	return strconv.ParseInt(string(firstPayload(recs)), 10, 64)
 }
 
 func (p *Provider) QFront(ctx context.Context, name string) ([]byte, bool, error) {
@@ -616,11 +650,11 @@ func (p *Provider) qpeek(ctx context.Context, name, cmd string) ([]byte, bool, e
 	}
 	switch st {
 	case "ok":
-		return recs[0], true, nil
+		return firstPayload(recs), true, nil
 	case "not_found":
 		return nil, false, nil
 	default:
-		return nil, false, errFrom(recs[0])
+		return nil, false, errFrom([]byte(firstOr(recs, st)))
 	}
 }
 
@@ -629,6 +663,9 @@ func (p *Provider) qpeek(ctx context.Context, name, cmd string) ([]byte, bool, e
 func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) error {
 	if err := p.check(); err != nil {
 		return err
+	}
+	if name == "" || key == "" {
+		return fmt.Errorf("ssdb: zset: zset name and member must not be empty")
 	}
 	st, _, err := p.do(ctx, "zset", name, key, strconv.FormatInt(score, 10))
 	if err != nil {
@@ -650,12 +687,12 @@ func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, err
 	}
 	switch st {
 	case "ok":
-		s, err := strconv.ParseInt(string(recs[0]), 10, 64)
+		s, err := strconv.ParseInt(string(firstPayload(recs)), 10, 64)
 		return s, err == nil, err
 	case "not_found":
 		return 0, false, nil
 	default:
-		return 0, false, errFrom(recs[0])
+		return 0, false, errFrom([]byte(firstOr(recs, st)))
 	}
 }
 
@@ -684,7 +721,7 @@ func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
 	if st != "ok" {
 		return 0, fmt.Errorf("ssdb: zsize: status %q", st)
 	}
-	return strconv.ParseInt(string(recs[0]), 10, 64)
+	return strconv.ParseInt(string(firstPayload(recs)), 10, 64)
 }
 
 func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, error) {
@@ -697,12 +734,12 @@ func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, er
 	}
 	switch st {
 	case "ok":
-		r, err := strconv.ParseInt(string(recs[0]), 10, 64)
+		r, err := strconv.ParseInt(string(firstPayload(recs)), 10, 64)
 		return r, err == nil, err
 	case "not_found":
 		return 0, false, nil
 	default:
-		return 0, false, errFrom(recs[0])
+		return 0, false, errFrom([]byte(firstOr(recs, st)))
 	}
 }
 
@@ -750,7 +787,7 @@ func (p *Provider) zrangeArgs(ctx context.Context, name string, start, stop int6
 	if st != "ok" {
 		return 0, 0, fmt.Errorf("ssdb: zsize: status %q", st)
 	}
-	size, err := strconv.ParseInt(string(recs[0]), 10, 64)
+	size, err := strconv.ParseInt(string(firstPayload(recs)), 10, 64)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -773,17 +810,20 @@ func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (in
 	if err := p.check(); err != nil {
 		return 0, err
 	}
+	if name == "" || key == "" {
+		return 0, fmt.Errorf("ssdb: zincr: zset name and member must not be empty")
+	}
 	st, recs, err := p.do(ctx, "zincr", name, key, strconv.FormatInt(delta, 10))
 	if err != nil {
 		return 0, err
 	}
 	if st != "ok" {
-		if errors.Is(errFrom(recs[0]), core.ErrNotInteger) {
+		if errors.Is(errFrom([]byte(firstOr(recs, st))), core.ErrNotInteger) {
 			return 0, core.ErrNotInteger
 		}
 		return 0, fmt.Errorf("ssdb: zincr: status %q", st)
 	}
-	return strconv.ParseInt(string(recs[0]), 10, 64)
+	return strconv.ParseInt(string(firstPayload(recs)), 10, 64)
 }
 
 // normalizeLimit 保证 limit<=0 时使用 core.DefaultScanLimit（统一常量）。
@@ -843,6 +883,18 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 
 // batchArgs 把契约批操作翻译为 SSDB 命令参数。
 func batchArgs(op core.BatchOp) ([][]byte, error) {
+	// SSDB 对空 key/成员静默不写（set 对空 key 返回 ok 却不落数据），拒绝之。
+	switch op.Kind {
+	case core.BatchSet, core.BatchSetEx, core.BatchDel, core.BatchExpire,
+		core.BatchQPush, core.BatchQPushFront:
+		if op.Key == "" {
+			return nil, fmt.Errorf("ssdb: batch op %d: key must not be empty", op.Kind)
+		}
+	case core.BatchZSet, core.BatchZDel, core.BatchZIncr:
+		if op.Key == "" || op.Member == "" {
+			return nil, fmt.Errorf("ssdb: batch op %d: zset name and member must not be empty", op.Kind)
+		}
+	}
 	b := func(parts ...string) [][]byte {
 		out := make([][]byte, len(parts))
 		for i, s := range parts {

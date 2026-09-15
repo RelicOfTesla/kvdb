@@ -11,9 +11,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/RelicOfTesla/kvdb/core"
@@ -53,6 +55,10 @@ type Dialect struct {
 	// HasNumCol 表示 kv_items 有数值投影列 n（供单语句 Incr 使用）；
 	// 为 true 时 Set/SetEx 必须同步维护 n，否则 Incr 会误判为非整数。
 	HasNumCol bool
+	// MaxKeyLen 是方言对 key/队列名/zset 名/成员的字节长度上限（0 = 不限）。
+	// MySQL 的 VARBINARY(255)：strict 模式超限报 1406，非 strict 模式静默截断
+	// 会导致键碰撞——由写入侧显式校验并报错。
+	MaxKeyLen int
 	// SerializeWrites 为 true 时基座在进程内串行化全部写操作（单写者模型）。
 	// SQLite 需要：多连接并发写即使有 busy_timeout 也会在持续竞争下报
 	// SQLITE_BUSY；进程级写锁把竞争变成排队，读仍由 WAL 并行。
@@ -76,6 +82,7 @@ var (
 		QSeqIgnoreTail:  "ON DUPLICATE KEY UPDATE next = next",
 		ForUpdate:       " FOR UPDATE",
 		Returning:       false, // MySQL 无 UPDATE ... RETURNING（走 qSeq/事务路径）
+		MaxKeyLen:       255,   // VARBINARY(255)
 		KvDDL:           "CREATE TABLE IF NOT EXISTS kv_items (k VARBINARY(255) NOT NULL, v LONGBLOB NOT NULL, expire_at BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (k))",
 		QSeqDDL:         "CREATE TABLE IF NOT EXISTS q_seq (q VARBINARY(255) NOT NULL, next BIGINT NOT NULL, prev BIGINT NOT NULL, PRIMARY KEY (q))",
 		QItemsDDL:       "CREATE TABLE IF NOT EXISTS q_items (q VARBINARY(255) NOT NULL, seq BIGINT NOT NULL, v LONGBLOB NOT NULL, PRIMARY KEY (q, seq))",
@@ -103,8 +110,9 @@ var (
 		HasNumCol: true,
 		// 单语句 upsert：n 列缓存数值投影，v 列同步物化为十进制文本。
 		// expired 分支（expire_at 非 0 且 <= {3}）把键按"不存在"处理：以增量本身为
-		// 基数并把 expire_at 归零；非 expired 分支要求 n NOT NULL，否则无匹配行 ->
-		// RETURNING 无结果 -> 映射 ErrNotInteger。
+		// 基数并把 expire_at 归零；非 expired 分支要求 n NOT NULL 且 n+增量不溢出
+		// int64——SQLite 整数加法溢出会静默转 REAL 并永久腐蚀该键，这里在 WHERE
+		// 中拒绝（无匹配行 -> RETURNING 无结果 -> 映射 ErrNotInteger，行保持原值）。
 		// {1}=key、{2}=增量、{3}=当前 unix 秒。
 		IncrSQL: "INSERT INTO kv_items (k, v, n, expire_at) VALUES ({1}, CAST({2} AS TEXT), {2}, 0) " +
 			"ON CONFLICT(k) DO UPDATE SET " +
@@ -114,7 +122,8 @@ var (
 			"THEN excluded.n ELSE kv_items.n + excluded.n END, " +
 			"expire_at = CASE WHEN kv_items.expire_at > 0 AND kv_items.expire_at <= {3} " +
 			"THEN 0 ELSE kv_items.expire_at END " +
-			"WHERE (kv_items.expire_at > 0 AND kv_items.expire_at <= {3}) OR kv_items.n IS NOT NULL " +
+			"WHERE (kv_items.expire_at > 0 AND kv_items.expire_at <= {3}) " +
+			"OR (kv_items.n IS NOT NULL AND kv_items.n + excluded.n BETWEEN -9223372036854775807 - 1 AND 9223372036854775807) " +
 			"RETURNING kv_items.n",
 		KvDDL: "CREATE TABLE IF NOT EXISTS kv_items (k BLOB NOT NULL, v BLOB NOT NULL, n INTEGER NULL, " +
 			"expire_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (k))",
@@ -199,6 +208,9 @@ type stmts struct {
 	zRankCount  string
 	zRange      string
 	zIncrSelect string
+	// zIncrOne 是单语句原子自增 + RETURNING 新分数（方言支持 Returning 时），
+	// 消除"upsert 后另起语句回读"在并发下返回值不对应该次调用的竞态。
+	zIncrOne string
 }
 
 // kvSetTemplate 生成 Set/SetEx 的 upsert 语句。当方言使用数值投影列（HasNumCol）时
@@ -393,18 +405,24 @@ func makeStmts(d Dialect) stmts {
 		zRange:      build(d, "SELECT k, s FROM z_items WHERE z = {1} ORDER BY s ASC, k ASC LIMIT {2} OFFSET {3}"),
 		zIncrSelect: build(d, "SELECT s FROM z_items WHERE z = {1} AND k = {2}"),
 	}
+	if d.Returning {
+		// 与 zUpsert(true) 共用冲突子句，RETURNING 取更新后的分数：
+		// 自增与读取在一条语句内完成（见 Provider.ZIncr）。
+		s.zIncrOne = build(d, "INSERT INTO z_items (z, k, s) VALUES ({1}, {2}, {3}) "+d.ZIncrUpsertTail+" RETURNING s")
+	}
 	return s
 }
 
 // Provider 是 SQL 基座。并发安全由 database/sql 连接池与事务保障。
 type Provider struct {
 	mu        sync.Mutex
-	writeMu   *sync.Mutex // 方言要求写串行化时非 nil（SQLite 单写者）
+	writeMu   *sync.Mutex  // 方言要求写串行化时非 nil（SQLite 单写者）
 	db        *sql.DB
 	st        stmts
-	dialect   Dialect // 保留方言：IncrSQL 的参数装配需按占位符风格判定
-	hasNumCol bool    // 方言是否使用数值投影列 n
-	closed    bool
+	dialect   Dialect      // 保留方言：IncrSQL 的参数装配需按占位符风格判定
+	hasNumCol bool         // 方言是否使用数值投影列 n
+	maxKeyLen int          // 方言键长上限（0 = 不限），写入侧校验
+	closed    atomic.Bool
 }
 
 // New 在既有 *sql.DB 上构造基座：建表、清理过期行。
@@ -418,7 +436,7 @@ func New(db *sql.DB, d Dialect) (*Provider, error) {
 			return nil, fmt.Errorf("sqlstore: migrate (%s): %w", d.Name, err)
 		}
 	}
-	p := &Provider{db: db, st: makeStmts(d), dialect: d, hasNumCol: d.HasNumCol}
+	p := &Provider{db: db, st: makeStmts(d), dialect: d, hasNumCol: d.HasNumCol, maxKeyLen: d.MaxKeyLen}
 	if d.SerializeWrites {
 		p.writeMu = &sync.Mutex{}
 	}
@@ -430,7 +448,7 @@ func New(db *sql.DB, d Dialect) (*Provider, error) {
 }
 
 func (p *Provider) check() error {
-	if p.closed {
+	if p.closed.Load() {
 		return core.ErrClosed
 	}
 	return nil
@@ -439,11 +457,24 @@ func (p *Provider) check() error {
 func (p *Provider) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	if p.closed.Swap(true) {
 		return nil
 	}
-	p.closed = true
 	return p.db.Close()
+}
+
+// checkLen 校验方言的键长上限（仅 MySQL VARBINARY(255) 非零）：超长 key 在
+// strict 模式下报 1406、非 strict 模式静默截断导致键碰撞，统一显式报错。
+func (p *Provider) checkLen(what string, parts ...string) error {
+	if p.maxKeyLen <= 0 {
+		return nil
+	}
+	for _, s := range parts {
+		if len(s) > p.maxKeyLen {
+			return fmt.Errorf("sqlstore: %s: argument length %d exceeds dialect limit %d", what, len(s), p.maxKeyLen)
+		}
+	}
+	return nil
 }
 
 // bs 把字符串键转 []byte，保证二进制安全的参数绑定。
@@ -464,6 +495,9 @@ func (p *Provider) writeLock() func() {
 func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 	defer p.writeLock()()
 	if err := p.check(); err != nil {
+		return err
+	}
+	if err := p.checkLen("set", key); err != nil {
 		return err
 	}
 	// 参数顺序须与 kvSetTemplate 一致：k, v[, n], now（now 供冲突子句清过期）。
@@ -497,7 +531,10 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
-	args := []any{bs(key), value, time.Now().Unix() + ttl}
+	if err := p.checkLen("setex", key); err != nil {
+		return err
+	}
+	args := []any{bs(key), value, core.AddTTL(time.Now().Unix(), ttl)}
 	if p.hasNumCol {
 		args = append(args, numProjection(value))
 	}
@@ -553,6 +590,9 @@ func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, er
 	if err := p.check(); err != nil {
 		return 0, err
 	}
+	if err := p.checkLen("incr", key); err != nil {
+		return 0, err
+	}
 	// 快路径：PostgreSQL/SQLite 用单语句 upsert + RETURNING 完成
 	// 「缺失按 0 起算 + 原子累加 + 校验非整数 + 已过期按不存在 + 取回新值」，
 	// 一条语句一次 fsync，实测约为事务多语句路径的 2 倍吞吐（见 README 性能一节）。
@@ -586,6 +626,10 @@ func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, er
 			return 0, core.ErrNotInteger
 		}
 		cur = v
+	}
+	// 溢出检查：与 Redis/SSDB 对齐返回错误，而不是 Go 侧静默回绕。
+	if (delta > 0 && cur > math.MaxInt64-delta) || (delta < 0 && cur < math.MinInt64-delta) {
+		return 0, core.ErrNotInteger
 	}
 	newVal := cur + delta
 	newExpire := expireAt
@@ -638,6 +682,10 @@ func isNotIntegerErr(err error) bool {
 // mgetChunk 分批上限：IN 子句占位符控制在 SQLite/MySQL 变量上限内。
 const mgetChunk = 100
 
+// maxZRangeLimit 是 ZRange 在不查集合大小时接受的最大请求行数：
+// 超过则先取 zCount 收敛 stop（防溢出/巨型预分配，见 ZRange）。
+const maxZRangeLimit = 1 << 32
+
 func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte, error) {
 	if err := p.check(); err != nil {
 		return nil, err
@@ -662,6 +710,12 @@ func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte,
 				return nil, fmt.Errorf("sqlstore: mget scan: %w", err)
 			}
 			out[string(k)] = v
+		}
+		// rows.Close 只返回释放连接的错误，迭代期错误（ctx 取消、驱动错误）
+		// 必须用 rows.Err() 捕获，否则会把部分结果当完整结果返回。
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("sqlstore: mget: %w", err)
 		}
 		if err := rows.Close(); err != nil {
 			return nil, err
@@ -690,7 +744,9 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 		return nil, fmt.Errorf("sqlstore: scan: %w", err)
 	}
 	defer rows.Close()
-	out := make([]core.KeyValue, 0, limit)
+	// 预分配按 1024 封顶：limit 是调用方入参，直接按 limit 分配会被
+	// "合法但巨大"的 limit 打爆内存（OOM），行数由 SQL LIMIT 保证。
+	out := make([]core.KeyValue, 0, min(limit, 1024))
 	for rows.Next() {
 		var k, v []byte
 		if err := rows.Scan(&k, &v); err != nil {
@@ -709,9 +765,12 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
+	if err := p.checkLen("expire", key); err != nil {
+		return err
+	}
 	now := time.Now().Unix()
 	// 参数：新过期时间、key、当前秒（用于把"已过期 = 不存在"写进 WHERE，不复活过期键）。
-	if _, err := p.db.ExecContext(ctx, p.st.kvExpire, now+ttl, bs(key), now); err != nil {
+	if _, err := p.db.ExecContext(ctx, p.st.kvExpire, core.AddTTL(now, ttl), bs(key), now); err != nil {
 		return fmt.Errorf("sqlstore: expire: %w", err)
 	}
 	return nil
@@ -729,10 +788,17 @@ func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
 	if err != nil {
 		return 0, false, fmt.Errorf("sqlstore: ttl: %w", err)
 	}
-	if exp == 0 || exp <= time.Now().Unix() {
+	now := time.Now().Unix()
+	if exp == 0 || exp <= now {
 		return -1, false, nil
 	}
-	return exp - time.Now().Unix(), true, nil
+	rem := exp - now
+	if rem <= 0 {
+		// 单次采样的 now 保证"ok=true ⇒ 剩余秒数为正"，避免两次取时
+		// 在秒边界上返回 (0, true) 与 Get 的"仍然存在"自相矛盾。
+		return -1, false, nil
+	}
+	return rem, true, nil
 }
 
 // ---- Queue ----
@@ -774,6 +840,9 @@ func (p *Provider) qpush(ctx context.Context, name string, value []byte, front b
 // 其他方言（MySQL）走"确保行存在 + 行锁读 + 更新 + 插入"的多语句路径。
 // 供单条 QPush 与批量 ApplyBatch 共用（批量时整批共享一个事务与一次提交）。
 func (p *Provider) qpushTx(ctx context.Context, tx *sql.Tx, name string, value []byte, front bool) error {
+	if err := p.checkLen("qpush", name); err != nil {
+		return err
+	}
 	if p.st.qSeqBumpBack != "" {
 		if _, err := tx.ExecContext(ctx, p.st.qSeqEnsure, bs(name)); err != nil {
 			return fmt.Errorf("sqlstore: qpush ensure: %w", err)
@@ -895,6 +964,9 @@ func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) erro
 	if err := p.check(); err != nil {
 		return err
 	}
+	if err := p.checkLen("zset", name, key); err != nil {
+		return err
+	}
 	if _, err := p.db.ExecContext(ctx, p.st.zUpsert(false), bs(name), bs(key), score); err != nil {
 		return fmt.Errorf("sqlstore: zset: %w", err)
 	}
@@ -919,6 +991,9 @@ func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, err
 func (p *Provider) ZDel(ctx context.Context, name, key string) error {
 	defer p.writeLock()()
 	if err := p.check(); err != nil {
+		return err
+	}
+	if err := p.checkLen("zdel", name, key); err != nil {
 		return err
 	}
 	if _, err := p.db.ExecContext(ctx, p.st.zDel, bs(name), bs(key)); err != nil {
@@ -978,17 +1053,39 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 			stop = n + stop
 		}
 	}
+	limit := stop - start + 1
+	if limit <= 0 || limit > maxZRangeLimit {
+		// limit 溢出为负（如 stop=MaxInt64）或大到不可信：按集合大小收敛
+		// stop——与 Redis ZRANGE 对越界正索引的 clamp 语义一致。否则轻则
+		// 负 cap 的 make 直接 panic，重则按 cap 预清零巨型切片 OOM。
+		var n int64
+		if err := p.db.QueryRowContext(ctx, p.st.zCount, bs(name)).Scan(&n); err != nil {
+			return nil, fmt.Errorf("sqlstore: zrange size: %w", err)
+		}
+		if stop >= n {
+			stop = n - 1
+		}
+		if stop < start || start < 0 {
+			return []core.ZItem{}, nil
+		}
+		limit = stop - start + 1
+	}
 	if stop < start || start < 0 {
 		return []core.ZItem{}, nil
 	}
 	offset := start
-	limit := stop - start + 1
 	rows, err := p.db.QueryContext(ctx, p.st.zRange, bs(name), limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("sqlstore: zrange: %w", err)
 	}
 	defer rows.Close()
-	out := make([]core.ZItem, 0, limit)
+	// 预分配按 1024 封顶：limit 是调用方入参，直接按 limit 分配会被
+	// "合法但巨大"的 limit 打爆内存（OOM），行数由 SQL LIMIT 保证。
+	prealloc := limit
+	if prealloc > 1024 {
+		prealloc = 1024
+	}
+	out := make([]core.ZItem, 0, prealloc)
 	for rows.Next() {
 		var k []byte
 		var s int64
@@ -1005,6 +1102,20 @@ func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (in
 	if err := p.check(); err != nil {
 		return 0, err
 	}
+	if err := p.checkLen("zincr", name, key); err != nil {
+		return 0, err
+	}
+	// 快路径：单语句原子自增 + RETURNING 新分数（PostgreSQL/SQLite），
+	// 避免两条语句间并发写入导致返回值不是本次调用的结果。
+	if p.st.zIncrOne != "" {
+		var s int64
+		if err := p.db.QueryRowContext(ctx, p.st.zIncrOne, bs(name), bs(key), delta).Scan(&s); err != nil {
+			return 0, fmt.Errorf("sqlstore: zincr: %w", err)
+		}
+		return s, nil
+	}
+	// MySQL 无 RETURNING：upsert 本身原子，但并发下回读值可能包含其他
+	// 调用的增量（契约只承诺分数正确落库，不承诺返回值线性对应本次调用）。
 	if _, err := p.db.ExecContext(ctx, p.st.zUpsert(true), bs(name), bs(key), delta); err != nil {
 		return 0, fmt.Errorf("sqlstore: zincr: %w", err)
 	}
@@ -1076,6 +1187,9 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 func (p *Provider) batchOp(ctx context.Context, tx *sql.Tx, op core.BatchOp, now int64) error {
 	switch op.Kind {
 	case core.BatchSet:
+		if err := p.checkLen("batch set", op.Key); err != nil {
+			return err
+		}
 		args := []any{bs(op.Key), op.Value}
 		if p.hasNumCol {
 			args = append(args, numProjection(op.Value))
@@ -1084,7 +1198,10 @@ func (p *Provider) batchOp(ctx context.Context, tx *sql.Tx, op core.BatchOp, now
 		_, err := tx.ExecContext(ctx, p.st.kvUpsert, args...)
 		return err
 	case core.BatchSetEx:
-		args := []any{bs(op.Key), op.Value, now + op.TTL}
+		if err := p.checkLen("batch setex", op.Key); err != nil {
+			return err
+		}
+		args := []any{bs(op.Key), op.Value, core.AddTTL(now, op.TTL)}
 		if p.hasNumCol {
 			args = append(args, numProjection(op.Value))
 		}
@@ -1094,19 +1211,28 @@ func (p *Provider) batchOp(ctx context.Context, tx *sql.Tx, op core.BatchOp, now
 		_, err := tx.ExecContext(ctx, p.st.kvDel, bs(op.Key))
 		return err
 	case core.BatchExpire:
-		_, err := tx.ExecContext(ctx, p.st.kvExpire, now+op.TTL, bs(op.Key), now)
+		_, err := tx.ExecContext(ctx, p.st.kvExpire, core.AddTTL(now, op.TTL), bs(op.Key), now)
 		return err
 	case core.BatchQPush:
 		return p.qpushTx(ctx, tx, op.Key, op.Value, false)
 	case core.BatchQPushFront:
 		return p.qpushTx(ctx, tx, op.Key, op.Value, true)
 	case core.BatchZSet:
+		if err := p.checkLen("batch zset", op.Key, op.Member); err != nil {
+			return err
+		}
 		_, err := tx.ExecContext(ctx, p.st.zUpsert(false), bs(op.Key), bs(op.Member), op.Score)
 		return err
 	case core.BatchZDel:
+		if err := p.checkLen("batch zdel", op.Key, op.Member); err != nil {
+			return err
+		}
 		_, err := tx.ExecContext(ctx, p.st.zDel, bs(op.Key), bs(op.Member))
 		return err
 	case core.BatchZIncr:
+		if err := p.checkLen("batch zincr", op.Key, op.Member); err != nil {
+			return err
+		}
 		_, err := tx.ExecContext(ctx, p.st.zUpsert(true), bs(op.Key), bs(op.Member), op.Delta)
 		return err
 	default:

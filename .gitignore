@@ -6,6 +6,7 @@
 /.docker
 .gomodcache-w/
 
-# 本地测试 fixture：带 server.auth 的 SSDB 配置文件与密码，
-# 只存在于本机，绝不进入版本库（见 .test-ssdb-auth/start.sh）
-.test-ssdb-auth/
+# 本地测试 fixture：带 server.auth 的 SSDB 配置文件与密码，只存在于本机，
+# 绝不进入版本库（见 .test-ssdb-auth/start.sh）；脚本本身入库便于共享评审。
+.test-ssdb-auth
+/.test-ssdb-auth

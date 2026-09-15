@@ -15,8 +15,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -67,6 +69,8 @@ type op struct {
 	M   string `json:"m,omitempty"`   // zset 成员
 	V   string `json:"v,omitempty"`   // set / qpush 的值（文本或 base64）
 	B64 bool   `json:"b64,omitempty"` // V 为 base64 编码
+	KB  bool   `json:"kb,omitempty"`  // K 为 base64 编码（非 UTF-8 key，见 encStr）
+	MB  bool   `json:"mb,omitempty"`  // M 为 base64 编码（非 UTF-8 成员）
 	D   int64  `json:"d,omitempty"`   // incr / zincr 增量
 	S   int64  `json:"s,omitempty"`   // zset 分数
 	At  int64  `json:"at,omitempty"`  // expire 绝对过期时间（unix 秒，必然 >0）
@@ -121,25 +125,54 @@ func Open(ctx context.Context, path string, cfg Config) (*Provider, error) {
 }
 
 // replay 打开时流式回放日志（内存峰值限单行，不缓存全文件）。
-// 容错规则：最后一行无法解析视为崩溃残留的半行直接忽略；
-// 若坏行之后还有完整行，则说明日志损坏，返回错误；最后一行"解析成功但无法
-// 应用"（如未知 op）属于日志损坏，必须上报而不是静默忽略。
+// 容错规则：最后一行无法解析视为崩溃残留的半行——**截断到最后有效行末**
+// 再返回（否则 O_APPEND 追加的下一条记录会与残片合并成一行，下次打开
+// 轻则日志变砖、重则静默吞掉已确认的写入）；若坏行之后还有完整行，
+// 则说明日志损坏，返回错误；最后一行"解析成功但无法应用"（如未知 op、
+// base64 损坏）属于日志损坏，必须上报而不是静默忽略。
 // 实现采用"延迟一行"策略：读入新行时先应用上一行——上一行若坏且仍读到
-// 后续行即为中间损坏；EOF 时上行的解析结果决定是否容忍。
+// 后续行即为中间损坏；EOF 时上行的解析结果决定是否截断容忍。
 func (p *Provider) replay() error {
 	if _, err := p.file.Seek(0, 0); err != nil {
 		return fmt.Errorf("jsonl: seek: %w", err)
 	}
-	sc := bufio.NewScanner(p.file)
-	// 回放上限与写入侧校验一致：多留 1 字节，保证恰好等于 MaxRecordBytes
-	// 的合法记录不会因令牌上限被误判。
-	sc.Buffer(make([]byte, 0, 64*1024), MaxRecordBytes+1)
-
+	rd := bufio.NewReaderSize(p.file, 64*1024)
 	now := time.Now().Unix()
-	// deferred 是暂缓的一行及其序号：读入下一行前应用它，
-	// 以便区分"坏行是最后一行（容忍）"与"坏行在中间（报错）"。
+
+	// readLine 以 '\n' 分隔读一行（含行尾换行符）；与 Scanner 的
+	// ErrTooLong 语义等价，但能同时给出字节偏移供截断使用。
+	readLine := func() ([]byte, error) {
+		var acc []byte
+		for {
+			frag, ferr := rd.ReadSlice('\n')
+			if ferr == bufio.ErrBufferFull {
+				acc = append(acc, frag...)
+				if len(acc) > MaxRecordBytes+1 {
+					return nil, fmt.Errorf("jsonl: line exceeds %d bytes", MaxRecordBytes+1)
+				}
+				continue
+			}
+			if ferr != nil && ferr != io.EOF {
+				return nil, ferr
+			}
+			if len(acc) == 0 {
+				return frag, ferr // 常规路径；ferr==io.EOF 时 frag 为 EOF 前残段
+			}
+			acc = append(acc, frag...)
+			if len(acc) > MaxRecordBytes+1 {
+				return nil, fmt.Errorf("jsonl: line exceeds %d bytes", MaxRecordBytes+1)
+			}
+			return acc, ferr
+		}
+	}
+
+	// deferred 是暂缓的一行及其起始偏移：读入下一行前应用它，
+	// 以便区分"坏行是最后一行（截断容忍）"与"坏行在中间（报错）"。
 	var deferred *string
+	var deferredStart int64
 	lineNo := 0
+	pos := int64(0)
+	terminated := true // 最后一行是否以换行符结束
 	flush := func() error {
 		if deferred == nil {
 			return nil
@@ -155,73 +188,114 @@ func (p *Provider) replay() error {
 		}
 		return p.apply(rec, now)
 	}
-	for sc.Scan() {
-		lineNo++
+	for {
+		lineStart := pos
+		line, rerr := readLine()
+		if len(line) == 0 && rerr == io.EOF {
+			break // 干净 EOF：无更多内容
+		}
+		if rerr != nil && rerr != io.EOF {
+			return fmt.Errorf("jsonl: read: %w", rerr)
+		}
+		pos += int64(len(line))
+		terminated = len(line) > 0 && line[len(line)-1] == '\n'
 		// 先应用上一行；坏行若在此报错说明它后面还有行（中间损坏）。
 		if err := flush(); err != nil {
 			return err
 		}
-		line := sc.Text()
-		deferred = &line
-	}
-	if err := sc.Err(); err != nil {
-		return fmt.Errorf("jsonl: read: %w", err)
+		s := strings.TrimSuffix(strings.TrimSuffix(string(line), "\n"), "\r")
+		deferred, deferredStart = &s, lineStart
+		lineNo++
+		if rerr == io.EOF {
+			break // 无换行符的最后残段：交给 EOF 分支判定
+		}
 	}
 	// EOF：deferred 为最后一行。仅"JSON 解析失败"按崩溃残留容忍；
-	// 应用失败（未知 op、参数非法等）说明日志本身损坏，必须上报。
+	// 应用失败（未知 op、base64 损坏等）说明日志本身损坏，必须上报。
 	if err := flush(); err != nil {
 		var pe *parseError
-		if errors.As(err, &pe) {
-			return nil
+		if !errors.As(err, &pe) {
+			return err
 		}
-		return err
+		// 崩溃残留半行：截断到最后有效行末并落盘，修复文件帧结构。
+		if err := p.file.Truncate(deferredStart); err != nil {
+			return fmt.Errorf("jsonl: truncate torn tail: %w", err)
+		}
+		if err := p.file.Sync(); err != nil {
+			return fmt.Errorf("jsonl: sync after truncate: %w", err)
+		}
+		return nil
+	}
+	// 最后一行解析成功但缺换行符（上次进程在完整记录写入中途断电）：
+	// 记录已应用，补一个换行符修复帧结构，防止下次追加与之合并。
+	if !terminated && deferred != nil && *deferred != "" {
+		if _, err := p.file.Write([]byte{'\n'}); err != nil { // O_APPEND 追加到末尾
+			return fmt.Errorf("jsonl: repair missing newline: %w", err)
+		}
+		if err := p.file.Sync(); err != nil {
+			return fmt.Errorf("jsonl: sync after newline repair: %w", err)
+		}
 	}
 	return nil
 }
 
 // apply 将一条记录作用到内存状态（与写路径顺序一致即可确定性还原）。
+// K/M/V 一律先解码：base64 损坏按"解析成功但无法应用"上报（中断打开），
+// 不静默替换成空值。
 func (p *Provider) apply(rec op, now int64) error {
+	key, err := dec(rec.K, rec.KB)
+	if err != nil {
+		return err
+	}
+	member, err := dec(rec.M, rec.MB)
+	if err != nil {
+		return err
+	}
+	value, err := dec(rec.V, rec.B64)
+	if err != nil {
+		return err
+	}
 	switch rec.Op {
 	case "set":
-		return p.mem.Set(context.Background(), rec.K, dec(rec.V, rec.B64))
+		return p.mem.Set(context.Background(), string(key), value)
 	case "setx":
-		if err := p.mem.Set(context.Background(), rec.K, dec(rec.V, rec.B64)); err != nil {
+		if err := p.mem.Set(context.Background(), string(key), value); err != nil {
 			return err
 		}
 		remain := rec.At - now
 		if remain <= 0 {
-			return p.mem.Del(context.Background(), rec.K)
+			return p.mem.Del(context.Background(), string(key))
 		}
-		return p.mem.Expire(context.Background(), rec.K, remain)
+		return p.mem.Expire(context.Background(), string(key), remain)
 	case "del":
-		return p.mem.Del(context.Background(), rec.K)
+		return p.mem.Del(context.Background(), string(key))
 	case "incr":
-		_, err := p.mem.Incr(context.Background(), rec.K, rec.D)
+		_, err := p.mem.Incr(context.Background(), string(key), rec.D)
 		return err
 	case "expire":
 		remain := rec.At - now
 		if remain <= 0 {
-			return p.mem.Del(context.Background(), rec.K)
+			return p.mem.Del(context.Background(), string(key))
 		}
-		return p.mem.Expire(context.Background(), rec.K, remain)
+		return p.mem.Expire(context.Background(), string(key), remain)
 	case "qpush":
 		if rec.F {
-			return p.mem.QPushFront(context.Background(), rec.K, dec(rec.V, rec.B64))
+			return p.mem.QPushFront(context.Background(), string(key), value)
 		}
-		return p.mem.QPush(context.Background(), rec.K, dec(rec.V, rec.B64))
+		return p.mem.QPush(context.Background(), string(key), value)
 	case "qpop":
 		if rec.F {
-			_, _, err := p.mem.QPopBack(context.Background(), rec.K)
+			_, _, err := p.mem.QPopBack(context.Background(), string(key))
 			return err
 		}
-		_, _, err := p.mem.QPop(context.Background(), rec.K)
+		_, _, err := p.mem.QPop(context.Background(), string(key))
 		return err
 	case "zset":
-		return p.mem.ZSet(context.Background(), rec.K, rec.M, rec.S)
+		return p.mem.ZSet(context.Background(), string(key), string(member), rec.S)
 	case "zdel":
-		return p.mem.ZDel(context.Background(), rec.K, rec.M)
+		return p.mem.ZDel(context.Background(), string(key), string(member))
 	case "zincr":
-		_, err := p.mem.ZIncr(context.Background(), rec.K, rec.M, rec.D)
+		_, err := p.mem.ZIncr(context.Background(), string(key), string(member), rec.D)
 		return err
 	case "batch":
 		// 整批记录：逐条应用。写入侧已保证同一事务式地落在一行里，
@@ -318,33 +392,29 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 func toRecord(o core.BatchOp, now int64) (op, error) {
 	switch o.Kind {
 	case core.BatchSet:
-		v, b64 := enc(o.Value)
-		return op{Op: "set", K: o.Key, V: v, B64: b64}, nil
+		return encOp(op{Op: "set"}, o.Key, "", o.Value), nil
 	case core.BatchSetEx:
 		if o.TTL <= 0 {
 			return op{}, core.ErrInvalidTTL
 		}
-		v, b64 := enc(o.Value)
-		return op{Op: "setx", K: o.Key, V: v, B64: b64, At: now + o.TTL}, nil
+		return encOp(op{Op: "setx", At: core.AddTTL(now, o.TTL)}, o.Key, "", o.Value), nil
 	case core.BatchDel:
-		return op{Op: "del", K: o.Key}, nil
+		return encOp(op{Op: "del"}, o.Key, "", nil), nil
 	case core.BatchExpire:
 		if o.TTL <= 0 {
 			return op{}, core.ErrInvalidTTL
 		}
-		return op{Op: "expire", K: o.Key, At: now + o.TTL}, nil
+		return encOp(op{Op: "expire", At: core.AddTTL(now, o.TTL)}, o.Key, "", nil), nil
 	case core.BatchQPush:
-		v, b64 := enc(o.Value)
-		return op{Op: "qpush", K: o.Key, V: v, B64: b64}, nil
+		return encOp(op{Op: "qpush"}, o.Key, "", o.Value), nil
 	case core.BatchQPushFront:
-		v, b64 := enc(o.Value)
-		return op{Op: "qpush", K: o.Key, V: v, B64: b64, F: true}, nil
+		return encOp(op{Op: "qpush", F: true}, o.Key, "", o.Value), nil
 	case core.BatchZSet:
-		return op{Op: "zset", K: o.Key, M: o.Member, S: o.Score}, nil
+		return encOp(op{Op: "zset", S: o.Score}, o.Key, o.Member, nil), nil
 	case core.BatchZDel:
-		return op{Op: "zdel", K: o.Key, M: o.Member}, nil
+		return encOp(op{Op: "zdel"}, o.Key, o.Member, nil), nil
 	case core.BatchZIncr:
-		return op{Op: "zincr", K: o.Key, M: o.Member, D: o.Delta}, nil
+		return encOp(op{Op: "zincr", D: o.Delta}, o.Key, o.Member, nil), nil
 	default:
 		return op{}, fmt.Errorf("jsonl: unknown batch op %d", o.Kind)
 	}
@@ -360,8 +430,7 @@ func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 	}
 	// WAL 顺序：先写日志、再改内存。若写日志失败则内存不变，二者始终一致
 	//（反序会出现"内存已改、日志缺失"，重启回放后状态回退）。
-	s, b64 := enc(value)
-	if err := p.appendOp(op{Op: "set", K: key, V: s, B64: b64}); err != nil {
+	if err := p.appendOp(encOp(op{Op: "set"}, key, "", value)); err != nil {
 		return err
 	}
 	return p.mem.Set(ctx, key, value)
@@ -378,8 +447,7 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
-	s, b64 := enc(value)
-	if err := p.appendOp(op{Op: "setx", K: key, V: s, B64: b64, At: time.Now().Unix() + ttl}); err != nil {
+	if err := p.appendOp(encOp(op{Op: "setx", At: core.AddTTL(time.Now().Unix(), ttl)}, key, "", value)); err != nil {
 		return err
 	}
 	return p.mem.SetEx(ctx, key, value, ttl)
@@ -400,7 +468,7 @@ func (p *Provider) Del(ctx context.Context, key string) error {
 	if p.closed {
 		return core.ErrClosed
 	}
-	if err := p.appendOp(op{Op: "del", K: key}); err != nil {
+	if err := p.appendOp(encOp(op{Op: "del"}, key, "", nil)); err != nil {
 		return err
 	}
 	return p.mem.Del(ctx, key)
@@ -430,7 +498,7 @@ func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, er
 			return 0, core.ErrNotInteger
 		}
 	}
-	if err := p.appendOp(op{Op: "incr", K: key, D: delta}); err != nil {
+	if err := p.appendOp(encOp(op{Op: "incr", D: delta}, key, "", nil)); err != nil {
 		return 0, err
 	}
 	return p.mem.Incr(ctx, key, delta)
@@ -463,7 +531,7 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
-	if err := p.appendOp(op{Op: "expire", K: key, At: time.Now().Unix() + ttl}); err != nil {
+	if err := p.appendOp(encOp(op{Op: "expire", At: core.AddTTL(time.Now().Unix(), ttl)}, key, "", nil)); err != nil {
 		return err
 	}
 	return p.mem.Expire(ctx, key, ttl)
@@ -494,8 +562,7 @@ func (p *Provider) qpush(ctx context.Context, name string, value []byte, front b
 	if p.closed {
 		return core.ErrClosed
 	}
-	s, b64 := enc(value)
-	if err := p.appendOp(op{Op: "qpush", K: name, V: s, B64: b64, F: front}); err != nil {
+	if err := p.appendOp(encOp(op{Op: "qpush", F: front}, name, "", value)); err != nil {
 		return err
 	}
 	if front {
@@ -573,7 +640,7 @@ func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) erro
 	if p.closed {
 		return core.ErrClosed
 	}
-	if err := p.appendOp(op{Op: "zset", K: name, M: key, S: score}); err != nil {
+	if err := p.appendOp(encOp(op{Op: "zset", S: score}, name, key, nil)); err != nil {
 		return err
 	}
 	return p.mem.ZSet(ctx, name, key, score)
@@ -594,7 +661,7 @@ func (p *Provider) ZDel(ctx context.Context, name, key string) error {
 	if p.closed {
 		return core.ErrClosed
 	}
-	if err := p.appendOp(op{Op: "zdel", K: name, M: key}); err != nil {
+	if err := p.appendOp(encOp(op{Op: "zdel"}, name, key, nil)); err != nil {
 		return err
 	}
 	return p.mem.ZDel(ctx, name, key)
@@ -633,7 +700,7 @@ func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (in
 	if p.closed {
 		return 0, core.ErrClosed
 	}
-	if err := p.appendOp(op{Op: "zincr", K: name, M: key, D: delta}); err != nil {
+	if err := p.appendOp(encOp(op{Op: "zincr", D: delta}, name, key, nil)); err != nil {
 		return 0, err
 	}
 	return p.mem.ZIncr(ctx, name, key, delta)
@@ -667,8 +734,7 @@ func (p *Provider) Compact(ctx context.Context) error {
 		return err
 	}
 	for k, v := range s.KV {
-		vs, b64 := enc(v)
-		if err := write(op{Op: "set", K: k, V: vs, B64: b64}); err != nil {
+		if err := write(encOp(op{Op: "set"}, k, "", v)); err != nil {
 			f.Close()
 			os.Remove(tmp)
 			return err
@@ -676,7 +742,7 @@ func (p *Provider) Compact(ctx context.Context) error {
 	}
 	// 过期时间保留绝对戳（确定性回放）；已过期的 key 已在快照中剔除。
 	for k, at := range s.Exp {
-		if err := write(op{Op: "expire", K: k, At: at}); err != nil {
+		if err := write(encOp(op{Op: "expire", At: at}, k, "", nil)); err != nil {
 			f.Close()
 			os.Remove(tmp)
 			return err
@@ -684,8 +750,7 @@ func (p *Provider) Compact(ctx context.Context) error {
 	}
 	for name, vals := range s.Queue {
 		for _, v := range vals {
-			vs, b64 := enc(v)
-			if err := write(op{Op: "qpush", K: name, V: vs, B64: b64}); err != nil {
+			if err := write(encOp(op{Op: "qpush"}, name, "", v)); err != nil {
 				f.Close()
 				os.Remove(tmp)
 				return err
@@ -694,7 +759,7 @@ func (p *Provider) Compact(ctx context.Context) error {
 	}
 	for name, m := range s.ZSet {
 		for k, score := range m {
-			if err := write(op{Op: "zset", K: name, M: k, S: score}); err != nil {
+			if err := write(encOp(op{Op: "zset", S: score}, name, k, nil)); err != nil {
 				f.Close()
 				os.Remove(tmp)
 				return err
@@ -719,15 +784,30 @@ func (p *Provider) Compact(ctx context.Context) error {
 		os.Remove(tmp)
 		return fmt.Errorf("jsonl: compact rename: %w", err)
 	}
+	syncDirBestEffort(p.path) // 让 rename 的目录项变更尽量持久（sync 模式）
 	// 原子换名后重新打开追加句柄，保持与后续写路径一致。
 	nf, err := os.OpenFile(p.path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o644)
 	if err != nil {
+		// 换名已成功而旧句柄指向的是被 unlink 的孤儿 inode：若继续服务，
+		// 后续写会"返回成功却全部丢失"。这里置为已关闭，宁可拒绝服务。
+		p.closed = true
 		return fmt.Errorf("jsonl: compact reopen: %w", err)
 	}
-	p.file.Close()
+	p.file.Close() // 旧句柄关闭失败不影响新句柄可用性，忽略
 	p.file = nf
 	p.bw = bufio.NewWriterSize(nf, 32*1024)
 	return nil
+}
+
+// syncDirBestEffort 尽力 fsync 父目录，使 create/rename 的目录项变更在掉电后
+// 也持久（POSIX 语义；不支持目录 fsync 的平台如部分 Windows 场景静默忽略）。
+func syncDirBestEffort(path string) {
+	d, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	_ = d.Close()
 }
 
 func (p *Provider) Close() error {
@@ -758,13 +838,32 @@ func enc(v []byte) (string, bool) {
 	return base64.StdEncoding.EncodeToString(v), true
 }
 
-func dec(s string, b64 bool) []byte {
+// encStr 是 enc 的字符串版：用于 key / 队列名 / zset 成员。json.Marshal 会把
+// 非法 UTF-8 字符串静默替换成 U+FFFD，导致回放重建出另一个 key（原数据
+// 不可达），因此非 UTF-8 的 key/成员同样必须 base64 落盘。
+func encStr(s string) (string, bool) {
+	if utf8.ValidString(s) {
+		return s, false
+	}
+	return base64.StdEncoding.EncodeToString([]byte(s)), true
+}
+
+// encOp 填充一条记录的 K/M/V 三个编码字段（写路径统一入口，回放侧 apply
+// 按各字段的 b64 标志对称解码）。
+func encOp(rec op, key, member string, value []byte) op {
+	rec.K, rec.KB = encStr(key)
+	rec.M, rec.MB = encStr(member)
+	rec.V, rec.B64 = enc(value)
+	return rec
+}
+
+func dec(s string, b64 bool) ([]byte, error) {
 	if b64 {
 		b, err := base64.StdEncoding.DecodeString(s)
 		if err != nil {
-			return nil // 记录损坏时按空值回放（容错），不阻断启动
+			return nil, fmt.Errorf("jsonl: corrupt base64 record: %w", err)
 		}
-		return b
+		return b, nil
 	}
-	return []byte(s)
+	return []byte(s), nil
 }

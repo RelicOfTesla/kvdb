@@ -11,11 +11,8 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/RelicOfTesla/kvdb"
 	"github.com/RelicOfTesla/kvdb/core"
 )
-
-func init() { kvdb.MustRegister("mem", OpenURI) }
 
 // OpenURI 按 mem://（忽略路径与参数）创建内存基座，供 kvdb.Open 使用。
 func OpenURI(_ context.Context, _ *url.URL) (core.KvProvider, error) {

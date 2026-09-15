@@ -20,11 +20,8 @@ import (
 
 	goredis "github.com/redis/go-redis/v9"
 
-	"github.com/RelicOfTesla/kvdb"
 	"github.com/RelicOfTesla/kvdb/core"
 )
-
-func init() { kvdb.MustRegister("redis", OpenURI) }
 
 // OpenURI 解析 redis://[:pass]@host:port[/db]，亦支持 ?password= 传参。
 func OpenURI(ctx context.Context, u *url.URL) (core.KvProvider, error) {

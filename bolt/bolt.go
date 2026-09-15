@@ -16,13 +16,10 @@ import (
 
 	bolt "go.etcd.io/bbolt"
 
-	"github.com/RelicOfTesla/kvdb"
 	"github.com/RelicOfTesla/kvdb/core"
 )
 
 var _ core.FullProvider = (*Provider)(nil)
-
-func init() { kvdb.MustRegister("bolt", OpenURI) }
 
 // Config 控制打开行为。
 type Config struct {

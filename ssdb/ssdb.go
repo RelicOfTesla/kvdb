@@ -20,11 +20,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/RelicOfTesla/kvdb"
 	"github.com/RelicOfTesla/kvdb/core"
 )
-
-func init() { kvdb.MustRegister("ssdb", OpenURI) }
 
 // OpenURI 解析 ssdb://[user:pass@]host:port（缺省端口 8888）；
 // URI 中的密码部分作为 auth 凭据，亦支持 ?password= 传参。

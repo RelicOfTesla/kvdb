@@ -24,12 +24,9 @@ import (
 	"sync"
 	"unicode/utf8"
 
-	"github.com/RelicOfTesla/kvdb"
 	"github.com/RelicOfTesla/kvdb/core"
 	"github.com/RelicOfTesla/kvdb/mem"
 )
-
-func init() { kvdb.MustRegister("jsonl", OpenURI) }
 
 // OpenURI 解析 jsonl://<path>?sync=1；路径支持 jsonl://./x、jsonl:///abs/x。
 func OpenURI(ctx context.Context, u *url.URL) (core.KvProvider, error) {

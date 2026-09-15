@@ -41,7 +41,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/RelicOfTesla/kvdb"
 	"github.com/RelicOfTesla/kvdb/core"
 
 	gldb "github.com/syndtr/goleveldb/leveldb"
@@ -49,8 +48,6 @@ import (
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	"github.com/syndtr/goleveldb/leveldb/util"
 )
-
-func init() { kvdb.MustRegister("leveldb", OpenURI) }
 
 var _ core.FullProvider = (*Provider)(nil)
 

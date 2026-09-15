@@ -12,12 +12,9 @@ import (
 
 	_ "modernc.org/sqlite" // 注册 "sqlite" 驱动
 
-	"github.com/RelicOfTesla/kvdb"
 	"github.com/RelicOfTesla/kvdb/core"
 	"github.com/RelicOfTesla/kvdb/sqlstore"
 )
-
-func init() { kvdb.MustRegister("sqlite", OpenURI) }
 
 // Config 控制 SQLite 基座行为。
 type Config struct {

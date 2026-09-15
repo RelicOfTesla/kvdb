@@ -10,12 +10,9 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib" // 注册 "pgx" 驱动
 
-	"github.com/RelicOfTesla/kvdb"
 	"github.com/RelicOfTesla/kvdb/core"
 	"github.com/RelicOfTesla/kvdb/sqlstore"
 )
-
-func init() { kvdb.MustRegister("pg", OpenURI) }
 
 // Config 控制 PostgreSQL 基座行为。
 type Config struct {

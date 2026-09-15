@@ -53,8 +53,10 @@ var _ core.FullProvider = (*Provider)(nil)
 
 // Config 控制 LevelDB 基座行为。
 type Config struct {
-	// NoSync 关闭每次提交的 fsync（吞吐更高；崩溃可能丢最近已确认的写入）。
-	NoSync bool
+	// Sync 为 true 时每次提交都 fsync：进程/机器崩溃不丢已确认写入，吞吐显著下降。
+	// 默认 false（不 fsync）：高速模式，进程崩溃或断电可能丢最近的已确认写入
+	// —— 与 jsonl 基座的 Sync 选项同极性。
+	Sync bool
 	// BlockCacheSize 是块缓存大小（MiB）；<=0 使用 goleveldb 默认值。
 	BlockCacheSize int
 	// WriteBuffer 是 memtable 大小（MiB）；<=0 使用 goleveldb 默认值。
@@ -92,7 +94,7 @@ const signBit uint64 = 1 << 63
 type Provider struct {
 	db        *gldb.DB
 	path      string
-	wo        *opt.WriteOptions // 预置 NoSync 等写选项，避免每次构造
+	wo        *opt.WriteOptions // 预置 Sync 写选项，避免每次构造
 	closeOnce sync.Once
 	closed    atomic.Bool
 	keyMu     [keyShards]sync.Mutex // 见 keyMutex
@@ -116,18 +118,26 @@ func Open(ctx context.Context, path string, cfg Config) (*Provider, error) {
 		return nil, fmt.Errorf("leveldb: open %s: %w", path, err)
 	}
 	p := &Provider{db: db, path: path}
-	// 注意极性：goleveldb 的 WriteOptions 只有 Sync（默认 false＝不 fsync）。
-	// Config.NoSync=true 时这里保持 Sync=false；默认（NoSync=false）才要求 Sync。
-	p.wo = &opt.WriteOptions{Sync: !cfg.NoSync}
+	// goleveldb 的 WriteOptions.Sync 默认 false＝不 fsync，正是本基座的默认模式。
+	p.wo = &opt.WriteOptions{Sync: cfg.Sync}
 	return p, nil
 }
 
-// OpenURI 解析 leveldb://<path>?nosync=1&cache=8&wb=4。
+// OpenURI 解析 leveldb://<path>?sync=1&cache=8&wb=4。
 // 路径支持 leveldb://./data、leveldb:///abs/data（Host 为空表示绝对路径）。
+// 默认不 fsync（高速，崩溃可能丢最近的已确认写入）；sync=1 打开逐提交 fsync。
 func OpenURI(ctx context.Context, u *url.URL) (core.KvProvider, error) {
 	path := pathFromURL(u)
 	q := u.Query()
-	cfg := Config{NoSync: q.Get("nosync") == "1"}
+	var cfg Config
+	if v := q.Get("sync"); v == "1" || v == "true" {
+		cfg.Sync = true
+	}
+	if v, ok := q["nosync"]; ok {
+		// 旧参数已废弃：本基座默认即不 fsync，nosync=1 已无意义；而它的字面含义
+		// 会让使用者误以为"只有写了 nosync 才高速"，这里直接报错点明。
+		return nil, fmt.Errorf("leveldb: nosync 参数已废弃（默认即不 fsync，去掉了 %q）；如需逐提交 fsync 请用 sync=1", v)
+	}
 	if v := q.Get("cache"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {

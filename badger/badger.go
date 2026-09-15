@@ -61,8 +61,10 @@ var _ core.FullProvider = (*Provider)(nil)
 
 // Config 控制 Badger 基座行为。
 type Config struct {
-	// NoSync 关闭每次提交的 fsync（吞吐更高；崩溃可能丢最近已确认的写入）。
-	NoSync bool
+	// Sync 为 true 时每次提交都 fsync（Badger SyncWrites）：进程/机器崩溃不丢已
+	// 确认写入，吞吐显著下降。默认 false（不 fsync）：高速模式，进程崩溃或断电
+	// 可能丢最近的已确认写入 —— 与 jsonl 基座的 Sync 选项同极性。
+	Sync bool
 	// BlockCacheSize 是块缓存大小（MiB）；<=0 使用 Badger 默认值。
 	BlockCacheSize int
 	// MemTableSize 是 memtable 大小（MiB）；<=0 使用 Badger 默认值。
@@ -115,7 +117,7 @@ func Open(ctx context.Context, path string, cfg Config) (*Provider, error) {
 		return nil, errors.New("badger: path must not be empty")
 	}
 	opts := badgerdb.DefaultOptions(path).
-		WithSyncWrites(!cfg.NoSync).
+		WithSyncWrites(cfg.Sync).
 		WithLogger(nil) // 默认 logger 会往 stderr 打 INFO 级日志
 	if cfg.BlockCacheSize > 0 {
 		opts = opts.WithBlockCacheSize(int64(cfg.BlockCacheSize) << 20)
@@ -136,11 +138,20 @@ func Open(ctx context.Context, path string, cfg Config) (*Provider, error) {
 	return &Provider{db: db, path: path}, nil
 }
 
-// OpenURI 解析 badger://<path>?nosync=1&cache=64&memtable=64。
+// OpenURI 解析 badger://<path>?sync=1&cache=64&memtable=64。
 // 路径支持 badger://./data、badger:///abs/data（Host 为空表示绝对路径）。
+// 默认不 fsync（高速，崩溃可能丢最近的已确认写入）；sync=1 打开逐提交 fsync。
 func OpenURI(ctx context.Context, u *url.URL) (core.KvProvider, error) {
 	q := u.Query()
-	cfg := Config{NoSync: q.Get("nosync") == "1"}
+	var cfg Config
+	if v := q.Get("sync"); v == "1" || v == "true" {
+		cfg.Sync = true
+	}
+	if v, ok := q["nosync"]; ok {
+		// 旧参数已废弃：本基座默认即不 fsync，nosync=1 已无意义；而它的字面含义
+		// 会让使用者误以为"只有写了 nosync 才高速"，这里直接报错点明。
+		return nil, fmt.Errorf("badger: nosync 参数已废弃（默认即不 fsync，去掉了 %q）；如需逐提交 fsync 请用 sync=1", v)
+	}
 	if v := q.Get("cache"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {

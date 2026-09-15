@@ -73,7 +73,7 @@ func TestOpenURI(t *testing.T) {
 	dir := t.TempDir()
 	for _, tc := range []struct{ uri string }{
 		{"badger://" + filepath.Join(dir, "a")},
-		{"badger://" + filepath.Join(dir, "b") + "?nosync=1"},
+		{"badger://" + filepath.Join(dir, "b") + "?sync=1"}, // 逐提交 fsync（显式要耐久）
 		{"badger://" + filepath.Join(dir, "c") + "?cache=4&memtable=2"},
 	} {
 		db, err := kvdb.Open(ctx, tc.uri)
@@ -91,6 +91,10 @@ func TestOpenURI(t *testing.T) {
 	// 非法参数必须报错，而不是静默忽略
 	if _, err := kvdb.Open(ctx, "badger://"+filepath.Join(dir, "d")+"?cache=abc"); err == nil {
 		t.Fatal("非法 cache 应报错")
+	}
+	// 已废弃的 nosync 必须报错：默认即不 fsync，静默接受会让人误以为"写了才高速"
+	if _, err := kvdb.Open(ctx, "badger://"+filepath.Join(dir, "e")+"?nosync=1"); err == nil {
+		t.Fatal("nosync 参数已废弃，应报错")
 	}
 }
 

@@ -23,15 +23,45 @@ type Config struct {
 	// TablePrefix 加在四张表名前（如 "kvdb_" -> kvdb_kv_items），用于与其他应用
 	// 共用一个库。空串使用默认表名。
 	TablePrefix string
+	// Sync 控制提交时的落盘强度（映射 PRAGMA synchronous）：
+	//
+	//	SyncFull（缺省）FULL：每个提交都 fsync WAL，断电不丢已确认写入（最慢）。
+	//	SyncNormal      NORMAL：只在 checkpoint 时 fsync；WAL 模式下崩溃可能丢
+	//	                 最近的若干已提交事务，但库文件不会被写坏（更快）。
+	//
+	// 这里刻意不提供 synchronous=OFF：OFF 在崩溃时可能损坏数据库文件，
+	// 而本选项的契约是"最多丢尾部已确认写入"，不是"可能丢整个库"。
+	Sync SyncMode
 }
 
-// OpenURI 解析 sqlite://<path>[?table_prefix=pfx_]；Host 为空表示绝对路径 sqlite:///abs/x。
+// SyncMode 是 sqlite 的落盘强度档位。
+type SyncMode int
+
+const (
+	// SyncFull 是缺省档：PRAGMA synchronous=FULL，逐提交 fsync。
+	SyncFull SyncMode = iota
+	// SyncNormal 是高速档：PRAGMA synchronous=NORMAL，崩溃可能丢最近提交但不损坏库。
+	SyncNormal
+)
+
+// OpenURI 解析 sqlite://<path>[?table_prefix=pfx_][&sync=0|1]；
+// Host 为空表示绝对路径 sqlite:///abs/x。sync 缺省＝FULL（与 SQLite 自身默认
+// 一致），sync=1 显式 FULL，sync=0 用 NORMAL（更快）。
 func OpenURI(ctx context.Context, u *url.URL) (core.KvProvider, error) {
 	p := u.Path
 	if u.Host != "" {
 		p = strings.TrimPrefix(u.Host+u.Path, "/")
 	}
-	return OpenConfig(ctx, Config{Path: p, TablePrefix: u.Query().Get("table_prefix")})
+	cfg := Config{Path: p, TablePrefix: u.Query().Get("table_prefix")}
+	switch v := u.Query().Get("sync"); v {
+	case "", "1":
+		cfg.Sync = SyncFull
+	case "0":
+		cfg.Sync = SyncNormal
+	default:
+		return nil, fmt.Errorf("sqlite: invalid sync %q (want 0 or 1)", v)
+	}
+	return OpenConfig(ctx, cfg)
 }
 
 // Provider 是 SQLite 基座（别名 sqlstore.Provider）。
@@ -46,7 +76,7 @@ func Open(ctx context.Context, path string) (*Provider, error) {
 // OpenConfig 按配置打开（可指定表名前缀）。
 func OpenConfig(ctx context.Context, cfg Config) (*Provider, error) {
 	path := cfg.Path
-	dsn := sqliteDSN(path)
+	dsn := sqliteDSN(path, cfg.Sync)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: open: %w", err)
@@ -79,7 +109,7 @@ func isMemory(path string) bool {
 	return path == ":memory:" || strings.Contains(path, "mode=memory")
 }
 
-func sqliteDSN(path string) string {
+func sqliteDSN(path string, sync SyncMode) string {
 	if path == ":memory:" {
 		return ":memory:?_pragma=busy_timeout(5000)"
 	}
@@ -94,7 +124,13 @@ func sqliteDSN(path string) string {
 	// _pragma 参数由 modernc 驱动在**每条新连接**建立时执行，因此多连接下
 	// busy_timeout 依然生效；_txlock=immediate 让写事务一开始就取写锁，
 	// 避免"读事务升级写锁"在并发下直接返回 SQLITE_BUSY（不等待 busy_timeout）。
-	return path + sep + "_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_txlock=immediate"
+	// 用驱动的 _synchronous 简写而非 _pragma：它会校验取值，写错直接报错，
+	// 不会静默降级耐久性；且每条连接都生效（synchronous 是连接级 pragma）。
+	syncName := "FULL"
+	if sync == SyncNormal {
+		syncName = "NORMAL"
+	}
+	return path + sep + "_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_txlock=immediate&_synchronous=" + syncName
 }
 
 var _ core.KvProvider = (*Provider)(nil)

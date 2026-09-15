@@ -19,8 +19,8 @@ import (
 // 语义可用；读侧则完全不参与这把锁（见 Provider.keyMutex 注释）。
 func TestShardLockCorrectness(t *testing.T) {
 	ctx := context.Background()
-	// NoSync：本用例只验证锁语义（撕裂/丢更），不需要每次提交都 fsync。
-	p, err := leveldb.Open(ctx, t.TempDir()+"/db", leveldb.Config{NoSync: true})
+	// 默认即不 fsync：本用例只验证锁语义（撕裂/丢更），不需要逐提交 fsync。
+	p, err := leveldb.Open(ctx, t.TempDir()+"/db", leveldb.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}

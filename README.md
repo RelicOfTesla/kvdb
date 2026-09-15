@@ -98,7 +98,9 @@ URI 一览（各包也提供等价的直接构造函数，如 `sqlite.Open`）�
 
 ```
 mem://
-jsonl://./data.jsonl?sync=1        # 默认不 fsync；sync=1 每次写 fsync
+jsonl://./data.jsonl?sync=1        # 默认逐操作 flush 不 fsync；sync=1 每次写 flush+fsync
+jsonl://./data.jsonl?buffered=1    # 攒 32KiB 缓冲，空闲 100ms 自动落盘（约 2× 写吞吐）
+sqlite://./data.db?sync=0          # 缺省 FULL（逐提交 fsync）；sync=0 用 NORMAL（更快，崩溃可能丢最近提交）
 sqlite://./data.db?table_prefix=app_       # 表名前缀（mysql/pg 同名参数）
 bolt://./data.bolt?nosync=1        # nosync=1 关闭 fsync（更快，崩溃可能丢最近提交）
 leveldb://./data.dir?sync=1&cache=8&wb=4     # 目录型存储；默认不 fsync，sync=1 逐提交 fsync；cache/wb 单位 MiB

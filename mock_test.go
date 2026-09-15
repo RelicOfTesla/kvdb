@@ -134,8 +134,8 @@ func TestMockKV(t *testing.T) {
 		t.Fatal("mock 注入的错误应向上传播")
 	}
 
-	// 同一业务函数用真实基座（mem://）验证接口一致性
-	db, err := kvdb.Open(ctx, "mem://")
+	// 同一业务函数用注册后的测试桩基座（stub://）验证接口一致性
+	db, err := kvdb.Open(ctx, "stub://")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +229,7 @@ type otherDB struct{ kvdb.DB }
 // TestUnwrap 验证 Unwrap 可取回底层基座（非适配器实现返回 nil）。
 func TestUnwrap(t *testing.T) {
 	ctx := context.Background()
-	db, err := kvdb.Open(ctx, "mem://")
+	db, err := kvdb.Open(ctx, "stub://")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -185,21 +185,24 @@ CGO 只在 I/O 免费时快 1.6–1.8×；真实存储上两者基本一致（�
 
 ## 10. 复现
 
-基准位于 `./bench/`，通过 `KVDB_BENCH_URI` 指定基座；未设置时自动跳过（不影响 `go test ./...`）：
+基准位于 `bench/`，是一个独立模块（`import .../all`）；通过 `KVDB_BENCH_URI` 指定基座，
+未设置时自动跳过。**在 `bench/` 目录内执行**：
 
 ```bash
+cd bench
+
 # 本地基座
-KVDB_BENCH_URI=mem://                  go test -bench . -benchtime 2000x ./bench/
-KVDB_BENCH_URI=jsonl://./bench.jsonl   go test -bench . -benchtime 2000x ./bench/
-KVDB_BENCH_URI=sqlite://./bench.db     go test -bench . -benchtime 2000x ./bench/
-KVDB_BENCH_URI=bolt://./bench.bolt     go test -bench . -benchtime 2000x ./bench/
-KVDB_BENCH_URI='bolt://./bench.bolt?nosync=1' go test -bench . -benchtime 2000x ./bench/
+KVDB_BENCH_URI=mem://                  go test -bench . -benchtime 2000x
+KVDB_BENCH_URI=jsonl://./bench.jsonl   go test -bench . -benchtime 2000x
+KVDB_BENCH_URI=sqlite://./bench.db     go test -bench . -benchtime 2000x
+KVDB_BENCH_URI=bolt://./bench.bolt     go test -bench . -benchtime 2000x
+KVDB_BENCH_URI='bolt://./bench.bolt?nosync=1' go test -bench . -benchtime 2000x
 
 # 服务型基座（先起容器，见 README「测试」）
-KVDB_BENCH_URI=redis://127.0.0.1:6379/0            go test -bench . -benchtime 2000x ./bench/
-KVDB_BENCH_URI=ssdb://127.0.0.1:8888               go test -bench . -benchtime 2000x ./bench/
-KVDB_BENCH_URI='mysql://root:pw@127.0.0.1:3306/db' go test -bench . -benchtime 2000x ./bench/
-KVDB_BENCH_URI='pg://postgres:pw@127.0.0.1:5432/db?sslmode=disable' go test -bench . -benchtime 2000x ./bench/
+KVDB_BENCH_URI=redis://127.0.0.1:6379/0            go test -bench . -benchtime 2000x
+KVDB_BENCH_URI=ssdb://127.0.0.1:8888               go test -bench . -benchtime 2000x
+KVDB_BENCH_URI='mysql://root:pw@127.0.0.1:3306/db' go test -bench . -benchtime 2000x
+KVDB_BENCH_URI='pg://postgres:pw@127.0.0.1:5432/db?sslmode=disable' go test -bench . -benchtime 2000x
 ```
 
 包含的基准：`BenchmarkSet`、`BenchmarkGet`、`BenchmarkIncrSequential`、

@@ -107,7 +107,7 @@ func TestBytesBadParse(t *testing.T) {
 //  3. must：n := DMust[T](db.Get(ctx, k))
 func TestDShape(t *testing.T) {
 	ctx := context.Background()
-	db, err := kvdb.Open(ctx, "mem://")
+	db, err := kvdb.Open(ctx, "stub://")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +243,7 @@ func TestBytesStructRoundtrip(t *testing.T) {
 // TestBytesStructWithDB 验证结构体在真实读写链路（Set + Get + D）中可用。
 func TestBytesStructWithDB(t *testing.T) {
 	ctx := context.Background()
-	db, err := kvdb.Open(ctx, "mem://")
+	db, err := kvdb.Open(ctx, "stub://")
 	if err != nil {
 		t.Fatal(err)
 	}

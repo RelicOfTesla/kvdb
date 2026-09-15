@@ -24,14 +24,29 @@ n, err := db.Incr(ctx, "visits", 1)
 - **Go 1.27.1+ 可选薄壳**：`kvdb.Typed(db)` 提供 `db.Get[T](...)` 泛型方法（构建约束隔离）
 - 纯 Go 依赖，无 CGO
 
-需要 Go 1.25+。依赖按基座引入：`sqlite`（modernc.org/sqlite）、`mysql`
-（go-sql-driver/mysql）、`pg`（jackc/pgx）、`redis`（redis/go-redis）；
-`bolt`（go.etcd.io/bbolt）、`mem` / `jsonl` / `ssdb` 仅用标准库或纯 Go 库。
+**每个基座是独立模块**，各自声明所需的最低 Go 版本——只用 `mem` / `jsonl` / `ssdb`
+的项目不会被 SQL / Redis 驱动的版本要求抬高：
+
+| 模块 | 最低 Go | 说明 |
+|---|---|---|
+| `kvdb`（根，含 `core` / `kvdbtest`） | 1.18 | 零第三方依赖 |
+| `kvdb/mem`、`kvdb/jsonl` | 1.18 | 仅标准库 |
+| `kvdb/sqlstore` | 1.18 | 仅标准库（`database/sql` 抽象） |
+| `kvdb/ssdb` | 1.19 | 用到 `atomic.Pointer[T]` |
+| `kvdb/bolt`、`kvdb/sqlite`、`kvdb/mysql`、`kvdb/pg`、`kvdb/redis` | 1.25 | 由驱动及其传递依赖决定（如 `golang.org/x/sys` 要求 1.25） |
+| `kvdb/all`、`kvdb/bench`、`kvdb/example` | 1.25 | 聚合了上述模块 |
+
+版本按各模块**依赖图里最大的 `go` 指令**取（`go list -m -f '{{.GoVersion}}' all`），
+不是照抄直接依赖的声明值。
+
+实测：Go 1.20 的消费方只 import `kvdb/mem` 可正常构建运行，依赖闭包为空（不产生
+go.sum）。
 
 ## 引入方式
 
 ```bash
-go get github.com/RelicOfTesla/kvdb
+go get github.com/RelicOfTesla/kvdb        # 根包
+go get github.com/RelicOfTesla/kvdb/mem    # 按需引入各基座模块
 ```
 
 ```go
@@ -307,12 +322,24 @@ SQLite 采用纯 Go 驱动（modernc），吞吐与 CGO 驱动相当，不引入
   适合低频到中等写入的进程内持久化。
 - 部署侧可调（会缩短崩溃恢复窗口，需自行确认持久性等级）：
   MySQL `innodb_flush_log_at_trx_commit=2`、PostgreSQL `synchronous_commit=off`。
-- 基准可自行复测：`KVDB_BENCH_URI=<uri> go test -bench . -benchtime 2000x ./bench/`
+- 基准可自行复测：`cd bench && KVDB_BENCH_URI=<uri> go test -bench . -benchtime 2000x`
 
 ## 测试
 
+**每个模块独立**，`go test ./...` 只覆盖当前模块；跑全部模块用：
+
 ```bash
-go test ./...        # 本地基座（mem / jsonl / sqlite / bolt）+ 进程内替身（miniredis、假 SSDB）
+# 跑全部模块（. 开头的目录都是本地脚手架，不属于仓库）
+for m in $(find . -name go.mod -not -path './.*'); do
+    (cd "$(dirname "$m")" && go test ./...) || exit 1
+done
+```
+
+单模块跑法（跨模块依赖由各 go.mod 的 replace 解析，无需工作区文件）：
+
+```bash
+cd mem    && go test ./...     # 本地基座 + 进程内替身（miniredis、假 SSDB）
+cd sqlite && go test ./...
 ```
 
 真实基座用例默认跳过，设置对应环境变量后启用（端口按需调整，避免与本地服务冲突）：
@@ -326,7 +353,7 @@ docker run -d --name kvdb-redis -p 127.0.0.1:6379:6379 redis:7-alpine
 KVDB_TEST_MYSQL_DSN='root:pw@tcp(127.0.0.1:3306)/kvdb_test' \
 KVDB_TEST_PG_DSN='postgres://postgres:pw@127.0.0.1:5432/kvdb_test?sslmode=disable' \
 KVDB_TEST_REDIS_ADDR=127.0.0.1:6379 \
-  go test ./...
+  go test ./...          # 在对应基座模块目录内执行
 ```
 
 | 环境变量 | 用途 |
@@ -337,13 +364,18 @@ KVDB_TEST_REDIS_ADDR=127.0.0.1:6379 \
 | `KVDB_TEST_SSDB_ADDR` | SSDB 地址（用例前 flushdb） |
 | `KVDB_TEST_SSDB_AUTH_ADDR` / `KVDB_TEST_SSDB_AUTH_PASS` | 启用 `server.auth` 的 SSDB 实例 |
 
-所有基座共用 `internal/behaviortest` 的合同用例（KV / Queue / ZSet / Batch /
+所有基座共用根模块内 `kvdbtest` 的合同用例（KV / Queue / ZSet / Batch /
 过期写语义 / 返回值所有权 / 命名空间，含并发原子性）；SSDB 另用进程内假服务器
 交叉验证线协议编码。
 
+根模块的注册表/编解码用例用一个**测试桩**（`stub_test.go` 注册的 `stub://`）验证
+"注册表默认空 + 显式接入"语义，因此根模块自身零第三方依赖；真实基座的"import 即
+自注册"由各基座模块自己的用例覆盖（如 `mem/registry_test.go`）。
+
 ## 目录结构
 
-模块根 `github.com/RelicOfTesla/kvdb`：
+**每个子目录是一个独立 Go 模块**（各有 go.mod；跨模块依赖用 require + replace
+指向同级目录，保证每个模块单独可 build / test / tidy）：
 
 ```
 core/                  契约：KvProvider / Queue- / ZSet- / BatchProvider / Closer / FullProvider
@@ -352,10 +384,11 @@ db.go                  DB 接口与默认适配器（adapter）
 batch.go               Batch 收集器与 DB.Batch 分发
 bytes.go               B / P / D / DMust 字节编解码
 registry.go            Register / MustRegister / Schemes
+kvdbtest/              跨基座共享合同用例（公开包，供各基座模块测试引用）
 all/                   聚合注册包：import _ 即接入全部内置基座
-mem/ jsonl/ sqlite/ mysql/ pg/ redis/ ssdb/   各基座实现
+mem/ jsonl/ sqlite/ mysql/ pg/ redis/ ssdb/   各基座实现（各自独立模块）
 sqlstore/              MySQL / SQLite / PG 共享的 database/sql 实现（方言参数化）
-internal/behaviortest/ 跨基座合同用例
+bench/                 基准测试（独立模块，import .../all）
 example/               可运行演示
 ```
 

@@ -12,7 +12,6 @@ import (
 
 	"github.com/RelicOfTesla/kvdb"
 	"github.com/RelicOfTesla/kvdb/core"
-	"github.com/RelicOfTesla/kvdb/mem" // 只接入 mem：验证按需注册
 )
 
 // kvOnly 是仅实现 KV 能力的自定义基座，用于验证可选能力降级路径
@@ -56,28 +55,26 @@ func TestSchemeNotRegistered(t *testing.T) {
 	}
 }
 
+// 根模块不 import 任何真实基座，因此这里断言：只有测试桩（stub_test.go 注册）
+// 在册，而 jsonl/sqlite/mem 等真实基座都必须是"未注册"——一旦根模块被误引入
+// 后端依赖，本用例会立刻失败。
 func TestRegisteredSchemes(t *testing.T) {
 	got := kvdb.Schemes()
-	found := false
-	for _, s := range got {
-		if s == "mem" {
-			found = true
-		}
-		if s == "jsonl" && !importedJSONL {
-			t.Fatalf("未 import jsonl 却已注册: %v", got)
-		}
+	if len(got) != 1 || got[0] != stubScheme {
+		t.Fatalf("根模块只应注册测试桩 %q, got %v", stubScheme, got)
 	}
-	if !found {
-		t.Fatalf("mem 应已注册, got %v", got)
+	for _, unwanted := range []string{"mem", "jsonl", "sqlite", "bolt", "mysql", "pg", "redis", "ssdb"} {
+		for _, s := range got {
+			if s == unwanted {
+				t.Fatalf("根模块不应注册真实基座 %q（说明引入了后端依赖）: %v", unwanted, got)
+			}
+		}
 	}
 }
 
-// importedJSONL 记录本测试包是否 import 了 jsonl 基座（当前为否）。
-const importedJSONL = false
-
 func TestOpenRegisteredScheme(t *testing.T) {
 	ctx := context.Background()
-	db, err := kvdb.Open(ctx, "mem://")
+	db, err := kvdb.Open(ctx, "stub://")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +92,7 @@ func TestUnknownAndDuplicateScheme(t *testing.T) {
 	if _, err := kvdb.Open(ctx, "nosuch://x"); err == nil {
 		t.Fatal("未知 scheme 应报错")
 	}
-	if err := kvdb.Register("mem", func(context.Context, *url.URL) (core.KvProvider, error) { return nil, nil }); err == nil {
+	if err := kvdb.Register(stubScheme, func(context.Context, *url.URL) (core.KvProvider, error) { return nil, nil }); err == nil {
 		t.Fatal("重复注册应报错")
 	}
 	if err := kvdb.Register("", nil); err == nil {
@@ -109,7 +106,7 @@ func TestUnknownAndDuplicateScheme(t *testing.T) {
 func TestCustomScheme(t *testing.T) {
 	ctx := context.Background()
 	if err := kvdb.Register("custom-kv", func(_ context.Context, _ *url.URL) (core.KvProvider, error) {
-		return &kvOnly{KvProvider: mem.New()}, nil
+		return &kvOnly{KvProvider: newFakeKV()}, nil
 	}); err != nil {
 		t.Fatal(err)
 	}

@@ -20,7 +20,7 @@ type tUser struct {
 // TestTypedGet 验证薄壳的核心形态：db.Get[T](...)（Go 1.27 泛型方法）。
 func TestTypedGet(t *testing.T) {
 	ctx := context.Background()
-	db, err := kvdb.Open(ctx, "mem://")
+	db, err := kvdb.Open(ctx, "stub://")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestTypedGet(t *testing.T) {
 // TestTypedQueue 验证队列读取的泛型形态。
 func TestTypedQueue(t *testing.T) {
 	ctx := context.Background()
-	db, err := kvdb.Open(ctx, "mem://")
+	db, err := kvdb.Open(ctx, "stub://")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +113,7 @@ func TestTypedQueue(t *testing.T) {
 // TestTypedPassthrough 验证薄壳未遮蔽的方法仍透传（Set/QPush/Batch/Close）。
 func TestTypedPassthrough(t *testing.T) {
 	ctx := context.Background()
-	db, err := kvdb.Open(ctx, "mem://")
+	db, err := kvdb.Open(ctx, "stub://")
 	if err != nil {
 		t.Fatal(err)
 	}

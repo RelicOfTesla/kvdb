@@ -10,3 +10,13 @@
 # 绝不进入版本库（见 .test-ssdb-auth/start.sh）；脚本本身入库便于共享评审。
 .test-ssdb-auth
 /.test-ssdb-auth
+
+# 本仓库是多模块（每个实现目录一个 go.mod），跨模块解析由各 go.mod 里的
+# require+replace 保证——每个模块单独可 build/test/tidy，不依赖工作区。
+# go.work 只是本地便利文件：不入库，以免掩盖 replace 失效、并避免新增模块
+# 忘记 go work use 时全仓命令报错。需要时自行 `go work init && go work use ./...`。
+go.work
+go.work.sum
+
+# `go build ./...` 在 example/ 下会产出同名可执行文件
+example/example

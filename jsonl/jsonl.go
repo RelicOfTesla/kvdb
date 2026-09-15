@@ -56,6 +56,29 @@ type Config struct {
 	Sync bool
 }
 
+// 日志记录的操作名。它们是**持久化格式的一部分**：写入侧与回放侧必须逐字一致，
+// 用常量而非字面量，避免某一侧写错时不被编译器发现（表现为静默回放失败）。
+const (
+	opSet    = "set"
+	opSetEx  = "setx"
+	opDel    = "del"
+	opIncr   = "incr"
+	opExpire = "expire"
+	opQPush  = "qpush"
+	opQPop   = "qpop"
+	opZSet   = "zset"
+	opZDel   = "zdel"
+	opZIncr  = "zincr"
+	opBatch  = "batch"
+)
+
+// 缓冲大小：写缓冲统一走 writeBufSize（Open / Compact 临时文件 / Compact 重开
+// 三处必须一致，否则同一日志的刷写粒度会随路径变化）；读缓冲用于回放。
+const (
+	writeBufSize = 32 * 1024
+	readBufSize  = 64 * 1024
+)
+
 // MaxRecordBytes 是单条日志记录（含批量记录）的字节上限。写入侧会在此处拒绝
 // 超限值（而不是"写成功、重启时打不开"），回放侧使用同一上限。
 // 非 UTF-8 值走 base64，膨胀约 4/3，因此二进制值的可用上限约为该值的 3/4。
@@ -112,7 +135,7 @@ func Open(ctx context.Context, path string, cfg Config) (*Provider, error) {
 	p := &Provider{
 		mem:  mem.New(),
 		file: f,
-		bw:   bufio.NewWriterSize(f, 32*1024),
+		bw:   bufio.NewWriterSize(f, writeBufSize),
 		path: path,
 		sync: cfg.Sync,
 	}
@@ -135,7 +158,7 @@ func (p *Provider) replay() error {
 	if _, err := p.file.Seek(0, 0); err != nil {
 		return fmt.Errorf("jsonl: seek: %w", err)
 	}
-	rd := bufio.NewReaderSize(p.file, 64*1024)
+	rd := bufio.NewReaderSize(p.file, readBufSize)
 	now := core.NowUnix()
 
 	// readLine 以 '\n' 分隔读一行（含行尾换行符）；与 Scanner 的
@@ -255,9 +278,9 @@ func (p *Provider) apply(rec op, now int64) error {
 		return err
 	}
 	switch rec.Op {
-	case "set":
+	case opSet:
 		return p.mem.Set(context.Background(), string(key), value)
-	case "setx":
+	case opSetEx:
 		if err := p.mem.Set(context.Background(), string(key), value); err != nil {
 			return err
 		}
@@ -266,37 +289,37 @@ func (p *Provider) apply(rec op, now int64) error {
 			return p.mem.Del(context.Background(), string(key))
 		}
 		return p.mem.Expire(context.Background(), string(key), remain)
-	case "del":
+	case opDel:
 		return p.mem.Del(context.Background(), string(key))
-	case "incr":
+	case opIncr:
 		_, err := p.mem.Incr(context.Background(), string(key), rec.D)
 		return err
-	case "expire":
+	case opExpire:
 		remain := rec.At - now
 		if remain <= 0 {
 			return p.mem.Del(context.Background(), string(key))
 		}
 		return p.mem.Expire(context.Background(), string(key), remain)
-	case "qpush":
+	case opQPush:
 		if rec.F {
 			return p.mem.QPushFront(context.Background(), string(key), value)
 		}
 		return p.mem.QPush(context.Background(), string(key), value)
-	case "qpop":
+	case opQPop:
 		if rec.F {
 			_, _, err := p.mem.QPopBack(context.Background(), string(key))
 			return err
 		}
 		_, _, err := p.mem.QPop(context.Background(), string(key))
 		return err
-	case "zset":
+	case opZSet:
 		return p.mem.ZSet(context.Background(), string(key), string(member), rec.S)
-	case "zdel":
+	case opZDel:
 		return p.mem.ZDel(context.Background(), string(key), string(member))
-	case "zincr":
+	case opZIncr:
 		_, err := p.mem.ZIncr(context.Background(), string(key), string(member), rec.D)
 		return err
-	case "batch":
+	case opBatch:
 		// 整批记录：逐条应用。写入侧已保证同一事务式地落在一行里，
 		// 回放时不会出现"半个批"。
 		for _, sub := range rec.B {
@@ -375,7 +398,7 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 		recs = append(recs, rec)
 	}
 	// 日志先行：失败则内存不变。整批序列化为一条记录（原子性所在）。
-	if err := p.appendOps([]op{{Op: "batch", B: recs}}); err != nil {
+	if err := p.appendOps([]op{{Op: opBatch, B: recs}}); err != nil {
 		return err
 	}
 	for _, rec := range recs {
@@ -391,29 +414,29 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 func toRecord(o core.BatchOp, now int64) (op, error) {
 	switch o.Kind {
 	case core.BatchSet:
-		return encOp(op{Op: "set"}, o.Key, "", o.Value), nil
+		return encOp(op{Op: opSet}, o.Key, "", o.Value), nil
 	case core.BatchSetEx:
 		if o.TTL <= 0 {
 			return op{}, core.ErrInvalidTTL
 		}
-		return encOp(op{Op: "setx", At: core.AddTTL(now, o.TTL)}, o.Key, "", o.Value), nil
+		return encOp(op{Op: opSetEx, At: core.AddTTL(now, o.TTL)}, o.Key, "", o.Value), nil
 	case core.BatchDel:
-		return encOp(op{Op: "del"}, o.Key, "", nil), nil
+		return encOp(op{Op: opDel}, o.Key, "", nil), nil
 	case core.BatchExpire:
 		if o.TTL <= 0 {
 			return op{}, core.ErrInvalidTTL
 		}
-		return encOp(op{Op: "expire", At: core.AddTTL(now, o.TTL)}, o.Key, "", nil), nil
+		return encOp(op{Op: opExpire, At: core.AddTTL(now, o.TTL)}, o.Key, "", nil), nil
 	case core.BatchQPush:
-		return encOp(op{Op: "qpush"}, o.Key, "", o.Value), nil
+		return encOp(op{Op: opQPush}, o.Key, "", o.Value), nil
 	case core.BatchQPushFront:
-		return encOp(op{Op: "qpush", F: true}, o.Key, "", o.Value), nil
+		return encOp(op{Op: opQPush, F: true}, o.Key, "", o.Value), nil
 	case core.BatchZSet:
-		return encOp(op{Op: "zset", S: o.Score}, o.Key, o.Member, nil), nil
+		return encOp(op{Op: opZSet, S: o.Score}, o.Key, o.Member, nil), nil
 	case core.BatchZDel:
-		return encOp(op{Op: "zdel"}, o.Key, o.Member, nil), nil
+		return encOp(op{Op: opZDel}, o.Key, o.Member, nil), nil
 	case core.BatchZIncr:
-		return encOp(op{Op: "zincr", D: o.Delta}, o.Key, o.Member, nil), nil
+		return encOp(op{Op: opZIncr, D: o.Delta}, o.Key, o.Member, nil), nil
 	default:
 		return op{}, fmt.Errorf("jsonl: unknown batch op %d", o.Kind)
 	}
@@ -429,7 +452,7 @@ func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 	}
 	// WAL 顺序：先写日志、再改内存。若写日志失败则内存不变，二者始终一致
 	//（反序会出现"内存已改、日志缺失"，重启回放后状态回退）。
-	if err := p.appendOp(encOp(op{Op: "set"}, key, "", value)); err != nil {
+	if err := p.appendOp(encOp(op{Op: opSet}, key, "", value)); err != nil {
 		return err
 	}
 	return p.mem.Set(ctx, key, value)
@@ -446,7 +469,7 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
-	if err := p.appendOp(encOp(op{Op: "setx", At: core.AddTTL(core.NowUnix(), ttl)}, key, "", value)); err != nil {
+	if err := p.appendOp(encOp(op{Op: opSetEx, At: core.AddTTL(core.NowUnix(), ttl)}, key, "", value)); err != nil {
 		return err
 	}
 	return p.mem.SetEx(ctx, key, value, ttl)
@@ -467,7 +490,7 @@ func (p *Provider) Del(ctx context.Context, key string) error {
 	if p.closed {
 		return core.ErrClosed
 	}
-	if err := p.appendOp(encOp(op{Op: "del"}, key, "", nil)); err != nil {
+	if err := p.appendOp(encOp(op{Op: opDel}, key, "", nil)); err != nil {
 		return err
 	}
 	return p.mem.Del(ctx, key)
@@ -497,7 +520,7 @@ func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, er
 			return 0, core.ErrNotInteger
 		}
 	}
-	if err := p.appendOp(encOp(op{Op: "incr", D: delta}, key, "", nil)); err != nil {
+	if err := p.appendOp(encOp(op{Op: opIncr, D: delta}, key, "", nil)); err != nil {
 		return 0, err
 	}
 	return p.mem.Incr(ctx, key, delta)
@@ -530,7 +553,7 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
-	if err := p.appendOp(encOp(op{Op: "expire", At: core.AddTTL(core.NowUnix(), ttl)}, key, "", nil)); err != nil {
+	if err := p.appendOp(encOp(op{Op: opExpire, At: core.AddTTL(core.NowUnix(), ttl)}, key, "", nil)); err != nil {
 		return err
 	}
 	return p.mem.Expire(ctx, key, ttl)
@@ -561,7 +584,7 @@ func (p *Provider) qpush(ctx context.Context, name string, value []byte, front b
 	if p.closed {
 		return core.ErrClosed
 	}
-	if err := p.appendOp(encOp(op{Op: "qpush", F: front}, name, "", value)); err != nil {
+	if err := p.appendOp(encOp(op{Op: opQPush, F: front}, name, "", value)); err != nil {
 		return err
 	}
 	if front {
@@ -595,7 +618,7 @@ func (p *Provider) qpop(ctx context.Context, name string, back bool) ([]byte, bo
 	if _, ok, err := peek(ctx, name); err != nil || !ok {
 		return nil, false, err
 	}
-	if err := p.appendOp(op{Op: "qpop", K: name, F: back}); err != nil {
+	if err := p.appendOp(op{Op: opQPop, K: name, F: back}); err != nil {
 		return nil, false, err
 	}
 	if back {
@@ -639,7 +662,7 @@ func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) erro
 	if p.closed {
 		return core.ErrClosed
 	}
-	if err := p.appendOp(encOp(op{Op: "zset", S: score}, name, key, nil)); err != nil {
+	if err := p.appendOp(encOp(op{Op: opZSet, S: score}, name, key, nil)); err != nil {
 		return err
 	}
 	return p.mem.ZSet(ctx, name, key, score)
@@ -660,7 +683,7 @@ func (p *Provider) ZDel(ctx context.Context, name, key string) error {
 	if p.closed {
 		return core.ErrClosed
 	}
-	if err := p.appendOp(encOp(op{Op: "zdel"}, name, key, nil)); err != nil {
+	if err := p.appendOp(encOp(op{Op: opZDel}, name, key, nil)); err != nil {
 		return err
 	}
 	return p.mem.ZDel(ctx, name, key)
@@ -699,7 +722,7 @@ func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (in
 	if p.closed {
 		return 0, core.ErrClosed
 	}
-	if err := p.appendOp(encOp(op{Op: "zincr", D: delta}, name, key, nil)); err != nil {
+	if err := p.appendOp(encOp(op{Op: opZIncr, D: delta}, name, key, nil)); err != nil {
 		return 0, err
 	}
 	return p.mem.ZIncr(ctx, name, key, delta)
@@ -720,7 +743,7 @@ func (p *Provider) Compact(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("jsonl: compact create: %w", err)
 	}
-	bw := bufio.NewWriterSize(f, 32*1024)
+	bw := bufio.NewWriterSize(f, writeBufSize)
 	write := func(rec op) error {
 		b, err := json.Marshal(rec)
 		if err != nil {
@@ -733,7 +756,7 @@ func (p *Provider) Compact(ctx context.Context) error {
 		return err
 	}
 	for k, v := range s.KV {
-		if err := write(encOp(op{Op: "set"}, k, "", v)); err != nil {
+		if err := write(encOp(op{Op: opSet}, k, "", v)); err != nil {
 			f.Close()
 			os.Remove(tmp)
 			return err
@@ -741,7 +764,7 @@ func (p *Provider) Compact(ctx context.Context) error {
 	}
 	// 过期时间保留绝对戳（确定性回放）；已过期的 key 已在快照中剔除。
 	for k, at := range s.Exp {
-		if err := write(encOp(op{Op: "expire", At: at}, k, "", nil)); err != nil {
+		if err := write(encOp(op{Op: opExpire, At: at}, k, "", nil)); err != nil {
 			f.Close()
 			os.Remove(tmp)
 			return err
@@ -749,7 +772,7 @@ func (p *Provider) Compact(ctx context.Context) error {
 	}
 	for name, vals := range s.Queue {
 		for _, v := range vals {
-			if err := write(encOp(op{Op: "qpush"}, name, "", v)); err != nil {
+			if err := write(encOp(op{Op: opQPush}, name, "", v)); err != nil {
 				f.Close()
 				os.Remove(tmp)
 				return err
@@ -758,7 +781,7 @@ func (p *Provider) Compact(ctx context.Context) error {
 	}
 	for name, m := range s.ZSet {
 		for k, score := range m {
-			if err := write(encOp(op{Op: "zset", S: score}, name, k, nil)); err != nil {
+			if err := write(encOp(op{Op: opZSet, S: score}, name, k, nil)); err != nil {
 				f.Close()
 				os.Remove(tmp)
 				return err
@@ -794,7 +817,7 @@ func (p *Provider) Compact(ctx context.Context) error {
 	}
 	p.file.Close() // 旧句柄关闭失败不影响新句柄可用性，忽略
 	p.file = nf
-	p.bw = bufio.NewWriterSize(nf, 32*1024)
+	p.bw = bufio.NewWriterSize(nf, writeBufSize)
 	return nil
 }
 

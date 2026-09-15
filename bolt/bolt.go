@@ -152,6 +152,19 @@ func (p *Provider) update(fn func(*bolt.Tx) error) error {
 
 // ---- 键编码 ----
 
+// 二进制布局常量。复合键/记录里所有整数一律 8 字节大端（见 be64/ordered），
+// 队列计数器是三个连续的 be64。解析处一律引用这些名字而不是字面量：
+// 改布局时只需改这里，避免"某一处漏改"导致静默错读。
+const (
+	be64Len = 8 // 大端 int64/uint64 的字节数
+
+	// qCounters 记录布局：next | front | count，各占一个 be64。
+	qCountersLen = 3 * be64Len
+	qNextOff     = 0
+	qFrontOff    = be64Len
+	qCountOff    = 2 * be64Len
+)
+
 // lp 为变长名加 uvarint 长度前缀，使复合键可按名字做前缀扫描。
 func lp(name string) []byte {
 	out := make([]byte, binary.MaxVarintLen64+len(name))
@@ -160,13 +173,17 @@ func lp(name string) []byte {
 	return out[:n+len(name)]
 }
 
-// ordered 把 int64 映射为可按字节序比较的 uint64（翻转符号位）。
-func ordered(v int64) uint64 { return uint64(v) ^ (1 << 63) }
+// signBit 是 int64 的符号位：ordered/unorder 通过翻转它把有符号整数映射为
+// 可按字节序比较的无符号整数（两个方向都必须翻转同一位，故提取为常量）。
+const signBit uint64 = 1 << 63
 
-func unorder(u uint64) int64 { return int64(u ^ (1 << 63)) }
+// ordered 把 int64 映射为可按字节序比较的 uint64（翻转符号位）。
+func ordered(v int64) uint64 { return uint64(v) ^ signBit }
+
+func unorder(u uint64) int64 { return int64(u ^ signBit) }
 
 func be64(u uint64) []byte {
-	var b [8]byte
+	var b [be64Len]byte
 	binary.BigEndian.PutUint64(b[:], u)
 	return b[:]
 }
@@ -197,7 +214,7 @@ func prefixEnd(prefix []byte) []byte {
 
 func ttlExpired(tx *bolt.Tx, key []byte, now int64) bool {
 	v := tx.Bucket(bTTL).Get(key)
-	if len(v) != 8 {
+	if len(v) != be64Len {
 		// 无 TTL（nil）或记录长度异常：按未过期处理（fail-open，保持可读）。
 		return false
 	}
@@ -209,7 +226,7 @@ func cleanupExpired(tx *bolt.Tx, now int64) error {
 	var expired [][]byte
 	c := kvt.Cursor()
 	for k, v := c.First(); k != nil; k, v = c.Next() {
-		if len(v) != 8 {
+		if len(v) != be64Len {
 			continue // 记录异常的 TTL 不参与清理
 		}
 		if int64(binary.BigEndian.Uint64(v)) <= now {
@@ -311,21 +328,21 @@ type qCounters struct {
 
 func qCountersGet(tx *bolt.Tx, name string) qCounters {
 	v := tx.Bucket(bQS).Get(lp(name))
-	if len(v) != 24 {
+	if len(v) != qCountersLen {
 		return qCounters{}
 	}
 	return qCounters{
-		next:  int64(binary.BigEndian.Uint64(v[0:8])),
-		front: int64(binary.BigEndian.Uint64(v[8:16])),
-		count: binary.BigEndian.Uint64(v[16:24]),
+		next:  int64(binary.BigEndian.Uint64(v[qNextOff:qFrontOff])),
+		front: int64(binary.BigEndian.Uint64(v[qFrontOff:qCountOff])),
+		count: binary.BigEndian.Uint64(v[qCountOff:qCountersLen]),
 	}
 }
 
 func qCountersPut(tx *bolt.Tx, name string, c qCounters) error {
-	buf := make([]byte, 24)
-	binary.BigEndian.PutUint64(buf[0:8], uint64(c.next))
-	binary.BigEndian.PutUint64(buf[8:16], uint64(c.front))
-	binary.BigEndian.PutUint64(buf[16:24], c.count)
+	buf := make([]byte, qCountersLen)
+	binary.BigEndian.PutUint64(buf[qNextOff:qFrontOff], uint64(c.next))
+	binary.BigEndian.PutUint64(buf[qFrontOff:qCountOff], uint64(c.front))
+	binary.BigEndian.PutUint64(buf[qCountOff:qCountersLen], c.count)
 	return tx.Bucket(bQS).Put(lp(name), buf)
 }
 
@@ -430,7 +447,7 @@ func zScoreGet(tx *bolt.Tx, name, member string) (int64, bool) {
 
 func zCountGet(tx *bolt.Tx, name string) int64 {
 	v := tx.Bucket(bZC).Get(lp(name))
-	if len(v) != 8 {
+	if len(v) != be64Len {
 		return 0 // 缺失或记录异常按 0 处理
 	}
 	return int64(binary.BigEndian.Uint64(v))
@@ -530,12 +547,12 @@ func zRangeTx(tx *bolt.Tx, name string, start, stop int64) ([]core.ZItem, error)
 		}
 		if idx >= start {
 			rest := k[len(prefix):]
-			if len(rest) < 8 {
+			if len(rest) < be64Len {
 				return nil, fmt.Errorf("bolt: corrupt zset key")
 			}
 			out = append(out, core.ZItem{
-				Key:   string(rest[8:]),
-				Score: unorder(binary.BigEndian.Uint64(rest[:8])),
+				Key:   string(rest[be64Len:]),
+				Score: unorder(binary.BigEndian.Uint64(rest[:be64Len])),
 			})
 		}
 		idx++
@@ -688,7 +705,7 @@ func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
 	err := p.view(func(tx *bolt.Tx) error {
 		now := core.NowUnix()
 		v := tx.Bucket(bTTL).Get([]byte(key))
-		if v == nil || len(v) != 8 {
+		if v == nil || len(v) != be64Len {
 			return nil
 		}
 		exp := int64(binary.BigEndian.Uint64(v))

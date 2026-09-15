@@ -69,6 +69,13 @@ type Dialect struct {
 	KvDDL, QSeqDDL, QItemsDDL, ZDDL, ZIdxDDL string
 }
 
+// mysqlKeyLen 是 MySQL 键列（k / q / z）的字节上限，mysqlKeyCol 是由它生成的列类型。
+// 运行期长度校验（Dialect.MaxKeyLen）与建表语句的列宽必须严格一致：列比校验窄时，
+// 校验放行的键会在 strict 模式报 1406、非 strict 模式被静默截断。故两者共用此常量。
+const mysqlKeyLen = 255
+
+var mysqlKeyCol = fmt.Sprintf("VARBINARY(%d)", mysqlKeyLen)
+
 // MySQLDialect / SQLiteDialect / PostgresDialect 是三个内置方言，
 // 供 kvdb/mysql、kvdb/sqlite、kvdb/pg 包装包实例化本基座。
 var (
@@ -84,13 +91,13 @@ var (
 		QSeqIgnoreTail:  "ON DUPLICATE KEY UPDATE next = next",
 		ForUpdate:       " FOR UPDATE",
 		Returning:       false, // MySQL 无 UPDATE ... RETURNING（走 qSeq/事务路径）
-		MaxKeyLen:       255,   // VARBINARY(255)
-		KvDDL:           "CREATE TABLE IF NOT EXISTS kv_items (k VARBINARY(255) NOT NULL, v LONGBLOB NOT NULL, expire_at BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (k))",
-		QSeqDDL:         "CREATE TABLE IF NOT EXISTS q_seq (q VARBINARY(255) NOT NULL, next BIGINT NOT NULL, prev BIGINT NOT NULL, PRIMARY KEY (q))",
-		QItemsDDL:       "CREATE TABLE IF NOT EXISTS q_items (q VARBINARY(255) NOT NULL, seq BIGINT NOT NULL, v LONGBLOB NOT NULL, PRIMARY KEY (q, seq))",
+		MaxKeyLen:       mysqlKeyLen,
+		KvDDL:           "CREATE TABLE IF NOT EXISTS kv_items (k " + mysqlKeyCol + " NOT NULL, v LONGBLOB NOT NULL, expire_at BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (k))",
+		QSeqDDL:         "CREATE TABLE IF NOT EXISTS q_seq (q " + mysqlKeyCol + " NOT NULL, next BIGINT NOT NULL, prev BIGINT NOT NULL, PRIMARY KEY (q))",
+		QItemsDDL:       "CREATE TABLE IF NOT EXISTS q_items (q " + mysqlKeyCol + " NOT NULL, seq BIGINT NOT NULL, v LONGBLOB NOT NULL, PRIMARY KEY (q, seq))",
 		// MySQL 无 CREATE INDEX IF NOT EXISTS（不幂等），索引内联在 CREATE TABLE
 		// 的 KEY 子句；ZIdxDDL 留空让 New 跳过独立索引 DDL（见表 DDL 注释）。
-		ZDDL:    "CREATE TABLE IF NOT EXISTS z_items (z VARBINARY(255) NOT NULL, k VARBINARY(255) NOT NULL, s BIGINT NOT NULL, PRIMARY KEY (z, k), KEY idx_z_items_s (z, s, k))",
+		ZDDL:    "CREATE TABLE IF NOT EXISTS z_items (z " + mysqlKeyCol + " NOT NULL, k " + mysqlKeyCol + " NOT NULL, s BIGINT NOT NULL, PRIMARY KEY (z, k), KEY idx_z_items_s (z, s, k))",
 		ZIdxDDL: "",
 	}
 	SQLiteDialect = Dialect{

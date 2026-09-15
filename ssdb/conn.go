@@ -23,7 +23,10 @@ type conn struct {
 
 // maxRecordBytes 是单条记录（长度前缀声明的 body）的防御性字节上限，
 // 防止服务端异常/恶意应答超大长度导致按声明值一次性分配内存。
-const maxRecordBytes = 1 << 26 // 64 MiB
+const maxRecordBytes = 1 << 26 // 单条协议记录上限：64 MiB
+
+// connBufSize 是收发缓冲大小（读写各一个）。
+const connBufSize = 32 * 1024
 
 // dial 建立到 addr（host:port）的连接；ctx 控制拨号与后续每操作超时。
 // 无 ctx deadline 时拨号默认 10s 超时，避免对黑洞地址阻塞到内核 SYN 超时。
@@ -36,7 +39,7 @@ func dial(ctx context.Context, addr string) (*conn, error) {
 	if tcp, ok := nc.(*net.TCPConn); ok {
 		tcp.SetNoDelay(true)
 	}
-	return &conn{c: nc, br: bufio.NewReaderSize(nc, 32*1024), bw: bufio.NewWriterSize(nc, 32*1024)}, nil
+	return &conn{c: nc, br: bufio.NewReaderSize(nc, connBufSize), bw: bufio.NewWriterSize(nc, connBufSize)}, nil
 }
 
 // request 发送命令并读取完整响应。返回状态与负载记录；响应结束由空行判定。

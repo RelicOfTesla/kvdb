@@ -40,6 +40,9 @@ func OpenURI(ctx context.Context, u *url.URL) (core.KvProvider, error) {
 	if cfg.Password == "" {
 		cfg.Password = u.Query().Get("password")
 	}
+	if v := u.Query().Get("key_prefix"); v != "" {
+		cfg.KeyPrefix = v
+	}
 	return OpenWithConfig(ctx, cfg)
 }
 
@@ -59,6 +62,9 @@ type Config struct {
 	// PoolSize 是并发连接上限，<=0 取 DefaultPoolSize。SSDB 单连接为串行
 	// 请求-应答，池化让并发调用真正并行。
 	PoolSize int
+	// KeyPrefix 加在用户可见的 key / 队列名 / zset 名之前（SSDB 无 namespace
+	// 概念，靠它与其他应用在同一实例内互相隔离）。空串表示不加前缀。
+	KeyPrefix string
 }
 
 // DefaultPoolSize 是未显式配置时的连接池大小。
@@ -68,6 +74,7 @@ const DefaultPoolSize = 8
 // 用毕归还；池空时阻塞等待（受 ctx 约束）。ctx 可携带超时。
 type Provider struct {
 	addr      string
+	keyPrefix string                 // 见 Config.KeyPrefix：作用于三类数据的键名（SSDB 无 namespace）
 	password  atomic.Pointer[string] // 池级凭据：新连接一律按此认证（Auth 可在线更新）
 	idle      chan *conn             // 空闲连接队列，容量即池大小
 	total     atomic.Int32           // 已创建的连接总数（池内+在借+预建），上限 max
@@ -92,10 +99,11 @@ func OpenWithConfig(ctx context.Context, cfg Config) (*Provider, error) {
 		size = DefaultPoolSize
 	}
 	p := &Provider{
-		addr:   addr,
-		idle:   make(chan *conn, size),
-		max:    int32(size),
-		closed: make(chan struct{}),
+		addr:      addr,
+		keyPrefix: cfg.KeyPrefix,
+		idle:      make(chan *conn, size),
+		max:       int32(size),
+		closed:    make(chan struct{}),
 	}
 	p.password.Store(&cfg.Password)
 	// 预建一条连接用于启动期连通性/认证校验，失败即报错（保留原语义）。
@@ -296,6 +304,49 @@ func (p *Provider) Close() error {
 	return nil
 }
 
+// ---- 键命名空间（见 Config.KeyPrefix）----
+
+// k 给用户可见的 key / 队列名 / zset 名加前缀。
+func (p *Provider) k(key string) string {
+	if p.keyPrefix == "" {
+		return key
+	}
+	return p.keyPrefix + key
+}
+
+// un 剥掉服务端返回键名的前缀；不带前缀（非本应用写入）的键原样返回，
+// 由调用方按需要过滤。
+func (p *Provider) un(key string) string {
+	if p.keyPrefix == "" {
+		return key
+	}
+	return strings.TrimPrefix(key, p.keyPrefix)
+}
+
+// has 判断服务端键名是否属于本前缀命名空间。
+func (p *Provider) has(key string) bool {
+	return p.keyPrefix == "" || strings.HasPrefix(key, p.keyPrefix)
+}
+
+// scanEnd 计算带前缀扫描的上界：显式 end 加前缀；空 end 用前缀的"下一个键"
+// （末字节 +1）作为开区间上界，从而只覆盖本命名空间的键。
+func (p *Provider) scanEnd(end string) string {
+	if end != "" {
+		return p.k(end)
+	}
+	if p.keyPrefix == "" {
+		return ""
+	}
+	b := []byte(p.keyPrefix)
+	for i := len(b) - 1; i >= 0; i-- {
+		if b[i] < 0xff {
+			b[i]++
+			return string(b[:i+1])
+		}
+	}
+	return p.keyPrefix // 全 0xff 前缀（极端情况）：退化为不设上界
+}
+
 // do 执行一次命令并返回 (status, payload)。
 func (p *Provider) do(ctx context.Context, args ...string) (string, [][]byte, error) {
 	c, err := p.acquire(ctx)
@@ -361,6 +412,7 @@ func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 	if err := p.check(); err != nil {
 		return err
 	}
+	key = p.k(key)
 	if key == "" {
 		// SSDB 对空 key 返回 ok 却不写数据（SSDBImpl::set 直接返回 0），
 		// 写入侧拒绝，避免"报成功但丢数据"。
@@ -381,6 +433,7 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 	if err := p.check(); err != nil {
 		return err
 	}
+	key = p.k(key)
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
@@ -401,6 +454,7 @@ func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	if err := p.check(); err != nil {
 		return nil, false, err
 	}
+	key = p.k(key)
 	return p.getLocked(ctx, key)
 }
 
@@ -424,6 +478,7 @@ func (p *Provider) Del(ctx context.Context, key string) error {
 	if err := p.check(); err != nil {
 		return err
 	}
+	key = p.k(key)
 	st, _, err := p.do(ctx, "del", key)
 	if err != nil {
 		return err
@@ -438,6 +493,7 @@ func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 	if err := p.check(); err != nil {
 		return false, err
 	}
+	key = p.k(key)
 	st, recs, err := p.do(ctx, "exists", key)
 	if err != nil {
 		return false, err
@@ -452,6 +508,7 @@ func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, er
 	if err := p.check(); err != nil {
 		return 0, err
 	}
+	key = p.k(key)
 	if key == "" {
 		return 0, fmt.Errorf("ssdb: incr: key must not be empty")
 	}
@@ -474,7 +531,11 @@ func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte,
 		// 至少 1 个 key，会回 client_error）。
 		return map[string][]byte{}, nil
 	}
-	args := append([]string{"multi_get"}, keys...)
+	args := make([]string, 0, len(keys)+1)
+	args = append(args, "multi_get")
+	for _, key := range keys {
+		args = append(args, p.k(key))
+	}
 	st, recs, err := p.do(ctx, args...)
 	if err != nil {
 		return nil, err
@@ -484,7 +545,11 @@ func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte,
 	}
 	out := make(map[string][]byte, len(recs)/2)
 	for i := 0; i+1 < len(recs); i += 2 {
-		out[string(recs[i])] = recs[i+1]
+		k := string(recs[i])
+		if !p.has(k) {
+			continue // 不属于本命名空间的键不外泄
+		}
+		out[p.un(k)] = recs[i+1]
 	}
 	return out, nil
 }
@@ -501,7 +566,10 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 	// 真实 SSDB 的 scan 语义为 start 开区间、end 闭区间（分页便利），
 	// SDK 契约统一为闭区间：对存在的 start 键做一次 get 补偿；补偿导致
 	// 超页时截掉扫出的最后一个键，保证返回"闭区间的前 limit 个"。
-	st, recs, err := p.do(ctx, "scan", start, end, strconv.Itoa(limit))
+	// 带 KeyPrefix 时把扫描区间夹到本命名空间内：SSDB 的 scan 按全库字典序推进，
+	// 不夹住会把其他应用的键扫进来（end 为空时上界取前缀的下一个键）。
+	lo, hi := p.k(start), p.scanEnd(end)
+	st, recs, err := p.do(ctx, "scan", lo, hi, strconv.Itoa(limit))
 	if err != nil {
 		return nil, err
 	}
@@ -510,12 +578,16 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 	}
 	out := make([]core.KeyValue, 0, len(recs)/2)
 	for i := 0; i+1 < len(recs); i += 2 {
-		out = append(out, core.KeyValue{Key: string(recs[i]), Value: recs[i+1]})
+		k := string(recs[i])
+		if !p.has(k) {
+			continue
+		}
+		out = append(out, core.KeyValue{Key: p.un(k), Value: recs[i+1]})
 	}
 	if start == "" {
 		return out, nil
 	}
-	if v, ok, err := p.getLocked(ctx, start); err != nil {
+	if v, ok, err := p.getLocked(ctx, lo); err != nil { // 用带前缀的键读，与上面的 scan 一致
 		return nil, err
 	} else if ok {
 		if len(out) >= limit {
@@ -530,6 +602,7 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	if err := p.check(); err != nil {
 		return err
 	}
+	key = p.k(key)
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
@@ -547,6 +620,7 @@ func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
 	if err := p.check(); err != nil {
 		return 0, false, err
 	}
+	key = p.k(key)
 	st, recs, err := p.do(ctx, "ttl", key)
 	if err != nil {
 		return 0, false, err
@@ -579,6 +653,7 @@ func (p *Provider) qpush(ctx context.Context, name string, value []byte, cmd str
 	if err := p.check(); err != nil {
 		return err
 	}
+	name = p.k(name)
 	if name == "" {
 		return fmt.Errorf("ssdb: %s: queue name must not be empty", cmd)
 	}
@@ -664,6 +739,7 @@ func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) erro
 	if err := p.check(); err != nil {
 		return err
 	}
+	name = p.k(name)
 	if name == "" || key == "" {
 		return fmt.Errorf("ssdb: zset: zset name and member must not be empty")
 	}
@@ -681,6 +757,7 @@ func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, err
 	if err := p.check(); err != nil {
 		return 0, false, err
 	}
+	name = p.k(name)
 	st, recs, err := p.do(ctx, "zget", name, key)
 	if err != nil {
 		return 0, false, err
@@ -700,6 +777,7 @@ func (p *Provider) ZDel(ctx context.Context, name, key string) error {
 	if err := p.check(); err != nil {
 		return err
 	}
+	name = p.k(name)
 	st, _, err := p.do(ctx, "zdel", name, key)
 	if err != nil {
 		return err
@@ -714,6 +792,7 @@ func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
 	if err := p.check(); err != nil {
 		return 0, err
 	}
+	name = p.k(name)
 	st, recs, err := p.do(ctx, "zsize", name)
 	if err != nil {
 		return 0, err
@@ -728,6 +807,7 @@ func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, er
 	if err := p.check(); err != nil {
 		return 0, false, err
 	}
+	name = p.k(name)
 	st, recs, err := p.do(ctx, "zrank", name, key)
 	if err != nil {
 		return 0, false, err
@@ -747,6 +827,7 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 	if err := p.check(); err != nil {
 		return nil, err
 	}
+	name = p.k(name)
 	// SSDB 原生 zrange 为 offset/limit（无负索引）语义，客户端按
 	// Redis 风格 start/stop 索引换算：负索引先经 zsize 归一化。
 	offset, limit, err := p.zrangeArgs(ctx, name, start, stop)
@@ -810,6 +891,7 @@ func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (in
 	if err := p.check(); err != nil {
 		return 0, err
 	}
+	name = p.k(name)
 	if name == "" || key == "" {
 		return 0, fmt.Errorf("ssdb: zincr: zset name and member must not be empty")
 	}
@@ -850,7 +932,7 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 	}
 	reqs := make([][][]byte, 0, len(ops))
 	for _, op := range ops {
-		args, err := batchArgs(op)
+		args, err := p.batchArgs(op)
 		if err != nil {
 			return err
 		}
@@ -882,7 +964,7 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 }
 
 // batchArgs 把契约批操作翻译为 SSDB 命令参数。
-func batchArgs(op core.BatchOp) ([][]byte, error) {
+func (p *Provider) batchArgs(op core.BatchOp) ([][]byte, error) {
 	// SSDB 对空 key/成员静默不写（set 对空 key 返回 ok 却不落数据），拒绝之。
 	switch op.Kind {
 	case core.BatchSet, core.BatchSetEx, core.BatchDel, core.BatchExpire,
@@ -904,29 +986,29 @@ func batchArgs(op core.BatchOp) ([][]byte, error) {
 	}
 	switch op.Kind {
 	case core.BatchSet:
-		return [][]byte{[]byte("set"), []byte(op.Key), op.Value}, nil
+		return [][]byte{[]byte("set"), []byte(p.k(op.Key)), op.Value}, nil
 	case core.BatchSetEx:
 		if op.TTL <= 0 {
 			return nil, core.ErrInvalidTTL
 		}
-		return [][]byte{[]byte("setx"), []byte(op.Key), op.Value, []byte(strconv.FormatInt(op.TTL, 10))}, nil
+		return [][]byte{[]byte("setx"), []byte(p.k(op.Key)), op.Value, []byte(strconv.FormatInt(op.TTL, 10))}, nil
 	case core.BatchDel:
-		return b("del", op.Key), nil
+		return b("del", p.k(op.Key)), nil
 	case core.BatchExpire:
 		if op.TTL <= 0 {
 			return nil, core.ErrInvalidTTL
 		}
-		return b("expire", op.Key, strconv.FormatInt(op.TTL, 10)), nil
+		return b("expire", p.k(op.Key), strconv.FormatInt(op.TTL, 10)), nil
 	case core.BatchQPush:
-		return [][]byte{[]byte("qpush"), []byte(op.Key), op.Value}, nil
+		return [][]byte{[]byte("qpush"), []byte(p.k(op.Key)), op.Value}, nil
 	case core.BatchQPushFront:
-		return [][]byte{[]byte("qpush_front"), []byte(op.Key), op.Value}, nil
+		return [][]byte{[]byte("qpush_front"), []byte(p.k(op.Key)), op.Value}, nil
 	case core.BatchZSet:
-		return b("zset", op.Key, op.Member, strconv.FormatInt(op.Score, 10)), nil
+		return b("zset", p.k(op.Key), op.Member, strconv.FormatInt(op.Score, 10)), nil
 	case core.BatchZDel:
-		return b("zdel", op.Key, op.Member), nil
+		return b("zdel", p.k(op.Key), op.Member), nil
 	case core.BatchZIncr:
-		return b("zincr", op.Key, op.Member, strconv.FormatInt(op.Delta, 10)), nil
+		return b("zincr", p.k(op.Key), op.Member, strconv.FormatInt(op.Delta, 10)), nil
 	default:
 		return nil, fmt.Errorf("ssdb: unknown batch op %d", op.Kind)
 	}

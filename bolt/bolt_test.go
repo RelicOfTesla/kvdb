@@ -10,13 +10,13 @@ import (
 
 	"github.com/RelicOfTesla/kvdb/bolt"
 	"github.com/RelicOfTesla/kvdb/core"
-	"github.com/RelicOfTesla/kvdb/internal/behaviortest"
+	"github.com/RelicOfTesla/kvdb/kvdbtest"
 )
 
 // TestBehavior 跑跨基座共享合同用例（KV / Queue / ZSet / Batch，
 // 含并发 Incr 原子性与多 key 并发）。
 func TestBehavior(t *testing.T) {
-	behaviortest.Run(t, func(t *testing.T) core.KvProvider {
+	kvdbtest.Run(t, func(t *testing.T) core.KvProvider {
 		p, err := bolt.Open(context.Background(), filepath.Join(t.TempDir(), "db.bolt"), bolt.Config{})
 		if err != nil {
 			t.Fatal(err)

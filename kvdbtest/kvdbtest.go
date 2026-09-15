@@ -1,6 +1,6 @@
-// Package behaviortest 提供跨基座共享的行为用例（KV/Queue/ZSet 合同），
+// Package kvdbtest 提供跨基座共享的行为用例（KV/Queue/ZSet/Batch 合同），
 // 各基座包在测试中通过同一套用例验证其适配一致性，避免逐基座复制断言。
-package behaviortest
+package kvdbtest
 
 import (
 	"context"

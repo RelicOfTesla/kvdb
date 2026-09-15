@@ -9,7 +9,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/RelicOfTesla/kvdb/core"
-	"github.com/RelicOfTesla/kvdb/internal/behaviortest"
+	"github.com/RelicOfTesla/kvdb/kvdbtest"
 	"github.com/RelicOfTesla/kvdb/pg"
 )
 
@@ -25,7 +25,7 @@ func TestBehavior(t *testing.T) {
 	if dsn == "" {
 		t.Skip("未设置 KVDB_TEST_PG_DSN，跳过真实 PostgreSQL 测试")
 	}
-	behaviortest.Run(t, func(t *testing.T) core.KvProvider {
+	kvdbtest.Run(t, func(t *testing.T) core.KvProvider {
 		ctx := context.Background()
 		dropTables(t, dsn)
 		p, err := pg.Open(ctx, dsn)

@@ -5,12 +5,12 @@ import (
 	"testing"
 
 	"github.com/RelicOfTesla/kvdb/core"
-	"github.com/RelicOfTesla/kvdb/internal/behaviortest"
+	"github.com/RelicOfTesla/kvdb/kvdbtest"
 	"github.com/RelicOfTesla/kvdb/mem"
 )
 
 func TestBehavior(t *testing.T) {
-	behaviortest.Run(t, func(t *testing.T) core.KvProvider {
+	kvdbtest.Run(t, func(t *testing.T) core.KvProvider {
 		return mem.New()
 	})
 }

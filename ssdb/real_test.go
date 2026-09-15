@@ -14,7 +14,7 @@ import (
 	"testing"
 
 	"github.com/RelicOfTesla/kvdb/core"
-	"github.com/RelicOfTesla/kvdb/internal/behaviortest"
+	"github.com/RelicOfTesla/kvdb/kvdbtest"
 	"github.com/RelicOfTesla/kvdb/ssdb"
 )
 
@@ -29,7 +29,7 @@ func TestRealSSDB(t *testing.T) {
 	if addr == "" {
 		t.Skip("未设置 KVDB_TEST_SSDB_ADDR，跳过真实 SSDB 测试")
 	}
-	behaviortest.Run(t, func(t *testing.T) core.KvProvider {
+	kvdbtest.Run(t, func(t *testing.T) core.KvProvider {
 		if err := flushDB(addr); err != nil {
 			t.Fatal(err)
 		}

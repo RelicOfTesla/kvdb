@@ -10,7 +10,7 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 
 	"github.com/RelicOfTesla/kvdb/core"
-	"github.com/RelicOfTesla/kvdb/internal/behaviortest"
+	"github.com/RelicOfTesla/kvdb/kvdbtest"
 	"github.com/RelicOfTesla/kvdb/redis"
 )
 
@@ -24,7 +24,7 @@ func TestBehavior(t *testing.T) {
 	}
 	t.Cleanup(s.Close)
 
-	behaviortest.RunWithOptions(t, behaviortest.Options{
+	kvdbtest.RunWithOptions(t, kvdbtest.Options{
 		FastForward: func() { s.FastForward(2 * time.Second) },
 	}, func(t *testing.T) core.KvProvider {
 		s.FlushAll()
@@ -50,7 +50,7 @@ func TestRealRedis(t *testing.T) {
 			db = n
 		}
 	}
-	behaviortest.Run(t, func(t *testing.T) core.KvProvider {
+	kvdbtest.Run(t, func(t *testing.T) core.KvProvider {
 		p, err := redis.Open(t.Context(), redis.Config{Addr: addr, DB: db})
 		if err != nil {
 			t.Fatal(err)

@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/RelicOfTesla/kvdb/core"
-	"github.com/RelicOfTesla/kvdb/internal/behaviortest"
+	"github.com/RelicOfTesla/kvdb/kvdbtest"
 	"github.com/RelicOfTesla/kvdb/ssdb"
 )
 
@@ -421,7 +421,7 @@ func (f *fakeSSDB) dispatch(req [][]byte) [][]byte {
 
 func TestBehavior(t *testing.T) {
 	srv := newFakeSSDB(t)
-	behaviortest.Run(t, func(t *testing.T) core.KvProvider {
+	kvdbtest.Run(t, func(t *testing.T) core.KvProvider {
 		p, err := ssdb.Open(context.Background(), srv.addr())
 		if err != nil {
 			t.Fatal(err)

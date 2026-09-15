@@ -10,13 +10,13 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/RelicOfTesla/kvdb/core"
-	"github.com/RelicOfTesla/kvdb/internal/behaviortest"
+	"github.com/RelicOfTesla/kvdb/kvdbtest"
 	"github.com/RelicOfTesla/kvdb/sqlite"
 )
 
 // TestBehavior 用内存 SQLite 验证 sqlstore 共享实现的完整行为。
 func TestBehavior(t *testing.T) {
-	behaviortest.Run(t, func(t *testing.T) core.KvProvider {
+	kvdbtest.Run(t, func(t *testing.T) core.KvProvider {
 		p, err := sqlite.Open(t.Context(), ":memory:")
 		if err != nil {
 			t.Fatal(err)

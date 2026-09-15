@@ -79,14 +79,19 @@ URI 一览（各包也提供等价的直接构造函数，如 `sqlite.Open`）�
 ```
 mem://
 jsonl://./data.jsonl?sync=1        # sync=1 每次写 fsync
-sqlite://./data.db
+sqlite://./data.db?table_prefix=app_       # 表名前缀（mysql/pg 同名参数）
 bolt://./data.bolt?nosync=1        # nosync=1 关闭 fsync（更快，崩溃可能丢最近提交）
-mysql://user:pass@host:3306/dbname?parseTime=true
-pg://user:pass@host:5432/dbname?sslmode=disable
-redis://:password@host:6379/0
-ssdb://host:8888
+mysql://user:pass@host:3306/dbname?parseTime=true&table_prefix=app_
+pg://user:pass@host:5432/dbname?sslmode=disable&table_prefix=app_
+redis://:password@host:6379/0?key_prefix=app:   # 键命名空间前缀
+ssdb://host:8888?key_prefix=app:              # SSDB 无 namespace，用逻辑前缀隔离
 ssdb://:password@host:8888         # 服务端启用 server.auth 时
 ```
+
+**与其他应用共用一套存储时用前缀隔离**：`sqlite/mysql/pg` 的 `Config.TablePrefix`
+给四张表和二级索引加前缀；`redis` 的 `Config.KeyPrefix` 派生 `<pfx>kv:` /
+`<pfx>q:` / `<pfx>z:` 三段；`ssdb` 的 `Config.KeyPrefix` 给三类数据的键名加逻辑
+前缀（读回时自动剥除，`Scan` 也夹在该前缀内）。默认值即当前布局，不配则不变。
 
 完整演示见 [`example/main.go`](example/main.go)。
 
@@ -244,6 +249,16 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 | SQL 键长 | MySQL 键列上限 255 字节（兼容 5.6 默认索引前缀）；PG / SQLite 用 BYTEA/BLOB 无此限制 |
 | 过期键的写语义 | 所有基座统一"已过期 = 不存在"：`Set` 不继承旧 TTL、`Incr` 从 0 起算、`Expire` 不复活 |
 | 读返回值所有权 | `Get`/`MGet`/`Scan`/`QFront`/`QBack` 返回副本，调用方改写不影响库内状态 |
+
+### 测试与调优用的可注入项
+
+| 入口 | 作用 |
+|---|---|
+| `kvdb.Now` / `core.Now` | 基座取当前时刻的唯一入口（默认 `time.Now`）。测试里替换即可确定性触发 TTL 边界，不必 sleep 真实秒数 |
+| `core.SweepInterval` | 写路径顺带回收过期条目的最小间隔（秒，默认 60）；置 0 表示每次写都回收 |
+| `ssdb.DialTimeout` / `redis.ScanCount` | 连接超时、每轮 SCAN 的工作量提示 |
+
+替换全局变量不是并发安全的做法：请在测试初始化阶段设置并用 `t.Cleanup` 还原。
 
 ## 扩展：自定义基座
 

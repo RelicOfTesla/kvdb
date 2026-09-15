@@ -576,6 +576,56 @@ func TestAuth(t *testing.T) {
 	})
 }
 
+// TestAuthAppliesToWholePool 验证显式 Auth 是**池级**的：认证一次之后，
+// 池中所有（含后续新建的）连接都必须已认证。
+// 旧实现只认证当次借出的那一条连接且不更新池级密码，并发请求会大量命中
+// 未认证连接并报 "authentication required"。
+func TestAuthAppliesToWholePool(t *testing.T) {
+	ctx := context.Background()
+	const pass = "0123456789abcdef0123456789abcdef"
+	srv := newFakeSSDBWithAuth(t, pass)
+	p, err := ssdb.OpenWithConfig(ctx, ssdb.Config{Addr: srv.addr(), PoolSize: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	if err := p.Auth(ctx, pass); err != nil {
+		t.Fatalf("Auth: %v", err)
+	}
+
+	const g = 32 // 远超 PoolSize，强制反复建连/复用
+	var wg sync.WaitGroup
+	errCh := make(chan error, g)
+	for i := 0; i < g; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			key := fmt.Sprintf("poolauth%d", id)
+			if err := p.Set(ctx, key, []byte("v")); err != nil {
+				errCh <- fmt.Errorf("Set(%s): %w", key, err)
+				return
+			}
+			if v, ok, err := p.Get(ctx, key); err != nil || !ok || string(v) != "v" {
+				errCh <- fmt.Errorf("Get(%s) = %q,%v,%v", key, v, ok, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("池内存在未认证连接: %v", err)
+	}
+
+	// 认证失败不得改变池级凭据：仍然可以继续正常读写。
+	if err := p.Auth(ctx, "wrong-password"); !errors.Is(err, ssdb.ErrAuth) {
+		t.Fatalf("错误密码应 ErrAuth, got %v", err)
+	}
+	if err := p.Set(ctx, "after", []byte("ok")); err != nil {
+		t.Fatalf("认证失败后池级凭据不应被破坏: %v", err)
+	}
+}
+
 // TestPoolConcurrency 验证连接池下并发读写的正确性与互不串扰：
 // 多 goroutine 各自读写私有 key，最终值必须与各自写入一致
 // （单连接时代的串行化不会暴露连接间状态残留，池化后必须验证）。

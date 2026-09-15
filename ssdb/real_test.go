@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/RelicOfTesla/kvdb/core"
@@ -121,5 +122,38 @@ func TestRealSSDBAuth(t *testing.T) {
 	}
 	if v, ok, _ := p.Get(ctx, "k"); !ok || string(v) != "v" {
 		t.Fatalf("认证后 Get = %q,%v", v, ok)
+	}
+
+	// 显式 Auth 必须是池级的：Open 时不带密码（首连未认证），Auth 一次之后
+	// 池中所有连接（含后续新建）都要能正常收发。
+	p2, err := ssdb.OpenWithConfig(ctx, ssdb.Config{Addr: addr, PoolSize: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p2.Close()
+	if err := p2.Auth(ctx, pass); err != nil {
+		t.Fatalf("显式 Auth: %v", err)
+	}
+	const g = 32 // 远超 PoolSize，强制反复建连/复用
+	var wg sync.WaitGroup
+	errCh := make(chan error, g)
+	for i := 0; i < g; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			k := fmt.Sprintf("authpool:%d", i)
+			if err := p2.Set(ctx, k, []byte("v")); err != nil {
+				errCh <- fmt.Errorf("Set(%s): %w", k, err)
+				return
+			}
+			if v, ok, err := p2.Get(ctx, k); err != nil || !ok || string(v) != "v" {
+				errCh <- fmt.Errorf("Get(%s) = %q,%v,%v", k, v, ok, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("池内存在未认证连接: %v", err)
 	}
 }

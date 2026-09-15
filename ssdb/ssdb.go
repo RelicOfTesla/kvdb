@@ -4,7 +4,8 @@
 //
 // 认证：服务端配置 server.auth 后，除 auth 外的命令都会得到 noauth 状态。
 // 用 Config.Password 在 Open 时自动认证，连接即处于已认证状态；
-// 也可显式调用 Auth（对应 SSDB auth 命令）。
+// 也可调用 Auth 在线设置**池级**凭据（验证成功后池内旧连接被丢弃重建，
+// 后续新连接自动用新密码认证）。
 package ssdb
 
 import (
@@ -67,9 +68,9 @@ const DefaultPoolSize = 8
 // 用毕归还；池空时阻塞等待（受 ctx 约束）。ctx 可携带超时。
 type Provider struct {
 	addr      string
-	password  string
-	idle      chan *conn   // 空闲连接队列，容量即池大小
-	total     atomic.Int32 // 已创建的连接总数（池内+在借+预建），上限 max
+	password  atomic.Pointer[string] // 池级凭据：新连接一律按此认证（Auth 可在线更新）
+	idle      chan *conn             // 空闲连接队列，容量即池大小
+	total     atomic.Int32           // 已创建的连接总数（池内+在借+预建），上限 max
 	max       int32
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -91,12 +92,12 @@ func OpenWithConfig(ctx context.Context, cfg Config) (*Provider, error) {
 		size = DefaultPoolSize
 	}
 	p := &Provider{
-		addr:     addr,
-		password: cfg.Password,
-		idle:     make(chan *conn, size),
-		max:      int32(size),
-		closed:   make(chan struct{}),
+		addr:   addr,
+		idle:   make(chan *conn, size),
+		max:    int32(size),
+		closed: make(chan struct{}),
 	}
+	p.password.Store(&cfg.Password)
 	// 预建一条连接用于启动期连通性/认证校验，失败即报错（保留原语义）。
 	c, err := p.openConn(ctx)
 	if err != nil {
@@ -113,8 +114,8 @@ func (p *Provider) openConn(ctx context.Context) (*conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	if p.password != "" {
-		st, recs, err := c.request(ctx, []byte("auth"), []byte(p.password))
+	if pw := p.password.Load(); pw != nil && *pw != "" {
+		st, recs, err := c.request(ctx, []byte("auth"), []byte(*pw))
 		if err != nil {
 			c.c.Close()
 			return nil, err
@@ -150,8 +151,9 @@ func (p *Provider) acquire(ctx context.Context) (*conn, error) {
 			continue
 		default:
 		}
-		// 池内暂无空闲：若尚未达上限则新建（原子抢占一个名额）。
-		if p.total.Load() < p.max && p.total.Add(1) <= p.max {
+		// 池内暂无空闲：若尚未达上限则新建（CAS 原子预留一个名额，
+		// 避免 Load 与 Add 之间的竞争把 total 永久虚增、池容量悄悄缩水）。
+		if p.reserve() {
 			c, err := p.openConn(ctx)
 			if err != nil {
 				p.total.Add(-1)
@@ -170,6 +172,36 @@ func (p *Provider) acquire(ctx context.Context) (*conn, error) {
 			return nil, core.ErrClosed
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		}
+	}
+}
+
+// reserve 以 CAS 循环原子地预留一个连接名额；已达上限返回 false。
+// 不能用 Load()+Add(1) 组合：并发下失败分支已经自增过，没减回去就会永久
+// 虚增 total，让连接池再也补不满容量。
+func (p *Provider) reserve() bool {
+	for {
+		cur := p.total.Load()
+		if cur >= p.max {
+			return false
+		}
+		if p.total.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
+}
+
+// dropIdle 关闭并计数归零当前所有空闲连接（用于凭据变更后强制重建）。
+// 借出中的连接不在其中：它们仍用旧凭据，归还时会因存活探测/服务端拒绝而
+// 被淘汰，最迟在下一次 acquire 时重建。
+func (p *Provider) dropIdle() {
+	for {
+		select {
+		case c := <-p.idle:
+			c.c.Close()
+			p.total.Add(-1)
+		default:
+			return
 		}
 	}
 }
@@ -221,20 +253,37 @@ func (p *Provider) put(c *conn) {
 	}
 }
 
-// Auth 以 password 认证当前连接（SSDB auth 命令）。服务端未配置 auth 时
-// SSDB 一律返回 ok；密码错误返回 ErrAuth。
+// Auth 设置**池级**认证凭据（SSDB auth 命令）并立即作用于所有后续连接：
+//   - 先用一条连接验证密码，成功才写入池级状态并把池中旧凭据下建立的连接
+//     全部丢弃（后续按需重建时自动用新密码认证）；
+//   - 失败（密码错）返回 ErrAuth，池级状态与连接池保持不变。
+//
+// 注意：调用瞬间**已借出**的连接仍持有旧凭据，其上的命令可能收到 noauth；
+// 切换凭据建议在无明显并发请求时进行。
+//
+// 服务端未配置 auth 时 SSDB 一律返回 ok（此时设置任意密码都会"成功"）。
 func (p *Provider) Auth(ctx context.Context, password string) error {
 	if err := p.check(); err != nil {
 		return err
 	}
-	st, recs, err := p.do(ctx, "auth", password)
+	c, err := p.acquire(ctx)
 	if err != nil {
+		return err
+	}
+	st, recs, err := c.request(ctx, []byte("auth"), []byte(password))
+	if err != nil {
+		c.c.Close()
+		p.total.Add(-1) // 连接状态已不可信，丢弃并归还计数
 		return err
 	}
 	if st != "ok" {
 		// 服务端回复 error + "invalid password"（见 SSDB net/server.cpp proc_auth）。
+		p.put(c)
 		return fmt.Errorf("%w: %s", ErrAuth, firstOr(recs, st))
 	}
+	p.put(c)
+	p.password.Store(&password)
+	p.dropIdle()
 	return nil
 }
 
@@ -242,15 +291,7 @@ func (p *Provider) Close() error {
 	p.closeOnce.Do(func() {
 		close(p.closed)
 		// 关闭池内空闲连接；借出中的连接在归还时自行关闭。
-		for {
-			select {
-			case c := <-p.idle:
-				c.c.Close()
-				p.total.Add(-1)
-			default:
-				return
-			}
-		}
+		p.dropIdle()
 	})
 	return nil
 }
@@ -745,11 +786,10 @@ func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (in
 	return strconv.ParseInt(string(recs[0]), 10, 64)
 }
 
-// normalizeLimit 与 mem 基座相同的默认页大小约定（见 mem 包注释）。
+// normalizeLimit 保证 limit<=0 时使用 core.DefaultScanLimit（统一常量）。
 func normalizeLimit(limit int) int {
-	const defaultLimit = 100 // 与 core.DefaultScanLimit 对齐
 	if limit <= 0 {
-		return defaultLimit
+		return core.DefaultScanLimit
 	}
 	return limit
 }

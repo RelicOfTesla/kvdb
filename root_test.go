@@ -135,3 +135,22 @@ func TestCustomScheme(t *testing.T) {
 		t.Fatalf("非 Closer 基座 Close 应为空操作, got %v", err)
 	}
 }
+
+// TestOpenErrorRedactsCredentials 验证 URI 解析失败的错误信息不会泄露凭据：
+// 调用方常直接把 err 写日志，原样带上 userinfo 就等于泄露密码。
+func TestOpenErrorRedactsCredentials(t *testing.T) {
+	ctx := context.Background()
+	const secret = "sup3rs3cr3t-p4ss"
+	// 端口非数字 -> url.Parse 失败（注意 Go 不校验端口范围，99999 是合法的），
+	// 错误信息里原本会带完整 URI。
+	_, err := kvdb.Open(ctx, "mysql://user:"+secret+"@host:notaport/db")
+	if err == nil {
+		t.Fatal("非法 URI 应报错")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("错误信息泄露了密码: %v", err)
+	}
+	if !strings.Contains(err.Error(), "mysql://<redacted>") {
+		t.Fatalf("错误信息应保留脱敏后的 scheme, got %v", err)
+	}
+}

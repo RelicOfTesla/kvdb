@@ -3,8 +3,10 @@
 package jsonl
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -242,5 +244,146 @@ func TestIncrNonIntegerDoesNotPoisonLog(t *testing.T) {
 	}
 	if v, ok, _ := p2.Get(ctx, "s"); !ok || string(v) != "abc" {
 		t.Fatalf("值不应被修改, got %q,%v", v, ok)
+	}
+}
+
+// TestBatchTornWriteIsAllOrNothing 验证崩溃残留的半行不会让批"部分生效"：
+// 批写成单行记录，截断最后一行后回放应整批丢弃（多行实现会提交完整前缀）。
+func TestBatchTornWriteIsAllOrNothing(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "db.jsonl")
+	p, err := Open(ctx, path, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := kvdb.Wrap(p)
+	if err := db.Set(ctx, "pre", []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Batch(ctx, func(b *kvdb.Batch) error {
+		b.Set("k1", []byte("v1"))
+		b.Set("k2", []byte("v2"))
+		b.QPush("q", []byte("a"))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p.Close()
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := bytes.Count(raw, []byte{'\n'})
+	if lines != 2 {
+		t.Fatalf("批应只占一行（pre + batch = 2 行）, got %d 行: %s", lines, raw)
+	}
+	// 模拟写到一半掉电：砍掉最后一行的后半截。
+	if err := os.WriteFile(path, raw[:len(raw)-10], 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p2, err := Open(ctx, path, Config{})
+	if err != nil {
+		t.Fatalf("残缺末行应被容忍, got %v", err)
+	}
+	defer p2.Close()
+	db2 := kvdb.Wrap(p2)
+	if v, ok, _ := db2.Get(ctx, "pre"); !ok || string(v) != "1" {
+		t.Fatalf("残缺行之前的记录应保留, got %q,%v", v, ok)
+	}
+	for _, k := range []string{"k1", "k2"} {
+		if ok, _ := db2.Exists(ctx, k); ok {
+			t.Fatalf("半行批不得部分生效：%s 应不存在", k)
+		}
+	}
+	if n, _ := db2.QSize(ctx, "q"); n != 0 {
+		t.Fatalf("半行批不得部分生效：队列应空, got %d", n)
+	}
+}
+
+// TestReplayInvalidLastRecordIsReported 验证"完整但无法应用"的末行必须报错，
+// 不能被当成崩溃残留静默吞掉；同时确认真正的半行仍被容忍。
+func TestReplayInvalidLastRecordIsReported(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "db.jsonl")
+	p, err := Open(ctx, path, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Set(ctx, "k", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	p.Close()
+
+	// 追加一条合法 JSON 但未知 op 的末行：属于日志损坏。
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"op":"bogus"}` + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if _, err := Open(ctx, path, Config{}); err == nil {
+		t.Fatal("末行无法应用时应报错")
+	}
+
+	// 对照：真正的半行（JSON 截断）按崩溃残留容忍，日志前缀正常恢复。
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = append(raw, []byte(`{"op":"se`)...)
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 上面的 bogus 行仍在中间，因此这里应当报错；去掉 bogus 行后才是半行场景。
+	cut := bytes.Replace(raw, []byte(`{"op":"bogus"}`+"\n"), nil, 1)
+	if err := os.WriteFile(path, cut, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p2, err := Open(ctx, path, Config{})
+	if err != nil {
+		t.Fatalf("末尾半行应被容忍, got %v", err)
+	}
+	defer p2.Close()
+	if v, ok, _ := kvdb.Wrap(p2).Get(ctx, "k"); !ok || string(v) != "v" {
+		t.Fatalf("半行之前的状态应恢复, got %q,%v", v, ok)
+	}
+}
+
+// TestOversizedRecordRejected 验证超限值在**写入时**被拒绝，而不是写进去
+// 让下次 Open 因回放令牌超限而打不开。
+func TestOversizedRecordRejected(t *testing.T) {
+	if testing.Short() {
+		t.Skip("需要分配 ~64MiB 数据，-short 下跳过")
+	}
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "db.jsonl")
+	p, err := Open(ctx, path, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	// 非 UTF-8 -> base64（膨胀 4/3），MaxRecordBytes 字节的原文必然超限。
+	big := bytes.Repeat([]byte{0xff}, MaxRecordBytes)
+	if err := p.Set(ctx, "big", big); err == nil {
+		t.Fatal("超限值应被拒绝")
+	}
+	if err := p.Set(ctx, "ok", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	p.Close()
+
+	// 日志仍然可打开（没有留下打不开的记录）。
+	p2, err := Open(ctx, path, Config{})
+	if err != nil {
+		t.Fatalf("拒绝超限值后日志应仍可打开: %v", err)
+	}
+	defer p2.Close()
+	if v, ok, _ := p2.Get(ctx, "ok"); !ok || string(v) != "v" {
+		t.Fatalf("ok = %q,%v", v, ok)
 	}
 }

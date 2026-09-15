@@ -4,6 +4,7 @@ import (
 	"os"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	goredis "github.com/redis/go-redis/v9"
@@ -14,6 +15,8 @@ import (
 )
 
 // TestBehavior 用 miniredis（进程内 Redis 替身）验证基座行为。
+// miniredis 不随真实时间过期，需通过 FastForward 推进虚拟时钟；
+// 且整个实例在所有子用例间共享，故每次新建基座前清空。
 func TestBehavior(t *testing.T) {
 	s, err := miniredis.Run()
 	if err != nil {
@@ -21,7 +24,10 @@ func TestBehavior(t *testing.T) {
 	}
 	t.Cleanup(s.Close)
 
-	behaviortest.Run(t, func(t *testing.T) core.KvProvider {
+	behaviortest.RunWithOptions(t, behaviortest.Options{
+		FastForward: func() { s.FastForward(2 * time.Second) },
+	}, func(t *testing.T) core.KvProvider {
+		s.FlushAll()
 		p, err := redis.Open(t.Context(), redis.Config{Addr: s.Addr()})
 		if err != nil {
 			t.Fatal(err)

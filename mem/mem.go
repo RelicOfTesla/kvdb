@@ -57,14 +57,19 @@ func (p *Provider) checkOpen() error {
 	return nil
 }
 
-// alive 返回 key 当前是否有效（存在且未过期），并顺带清除已过期条目。
-func (p *Provider) alive(key string, now int64) (*entry, bool) {
+// lookup 返回 key 当前是否有效（存在且未过期）。purge 为 true 时顺带删除已过期
+// 条目——**只有持有写锁的调用方才能传 true**：读路径在 RLock 下 delete(map) 会与
+// 其他读者并发写同一张 map（数据竞争，甚至 "concurrent map writes" 崩溃）。
+// 只读路径传 false：过期条目由后续写操作、Scan 过滤或 Snapshot 处理。
+func (p *Provider) lookup(key string, now int64, purge bool) (*entry, bool) {
 	e, ok := p.kv[key]
 	if !ok {
 		return nil, false
 	}
 	if e.exp > 0 && e.exp <= now {
-		delete(p.kv, key)
+		if purge {
+			delete(p.kv, key)
+		}
 		return nil, false
 	}
 	return e, true
@@ -77,13 +82,14 @@ func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 	if err := p.checkOpen(); err != nil {
 		return err
 	}
-	p.setLocked(key, value)
+	p.setLocked(key, value, time.Now().Unix())
 	return nil
 }
 
-// setLocked 写入值（保留既有 TTL），调用方需持有 p.mu。
-func (p *Provider) setLocked(key string, value []byte) {
-	if e, ok := p.kv[key]; ok {
+// setLocked 写入值：保留既有**未过期**条目的 TTL；已过期的条目按"不存在"处理，
+// 不得继承其过期时间（否则写入成功却仍读不到）。调用方需持有 p.mu。
+func (p *Provider) setLocked(key string, value []byte, now int64) {
+	if e, ok := p.lookup(key, now, true); ok {
 		e.val = append([]byte(nil), value...)
 		return
 	}
@@ -101,13 +107,27 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 	if err := p.checkOpen(); err != nil {
 		return err
 	}
-	p.setExLocked(key, value, ttl)
+	p.setExLocked(key, value, ttl, time.Now().Unix())
 	return nil
 }
 
 // setExLocked 写入值并覆盖 TTL，调用方需持有 p.mu。
-func (p *Provider) setExLocked(key string, value []byte, ttl int64) {
-	p.kv[key] = &entry{val: append([]byte(nil), value...), exp: time.Now().Unix() + ttl}
+func (p *Provider) setExLocked(key string, value []byte, ttl int64, now int64) {
+	p.kv[key] = &entry{val: append([]byte(nil), value...), exp: now + ttl}
+}
+
+// ---- 读路径 ----
+//
+// 返回值所有权：Get/MGet/Scan/QFront/QBack 一律返回内部数据的**深拷贝**。
+// 若直接返回内部切片，调用方改一个字节就能篡改库内状态（也会让 jsonl 的
+// 内存态与日志回放结果不一致）。
+
+// clone 返回 b 的拷贝；b 为 nil 时返回 nil。
+func clone(b []byte) []byte {
+	if b == nil {
+		return nil
+	}
+	return append([]byte(nil), b...)
 }
 
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
@@ -117,11 +137,11 @@ func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	if err := p.checkOpen(); err != nil {
 		return nil, false, err
 	}
-	e, ok := p.alive(key, time.Now().Unix())
+	e, ok := p.lookup(key, time.Now().Unix(), false)
 	if !ok {
 		return nil, false, nil
 	}
-	return e.val, true, nil
+	return clone(e.val), true, nil
 }
 
 func (p *Provider) Del(ctx context.Context, key string) error {
@@ -145,7 +165,7 @@ func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 	if err := p.checkOpen(); err != nil {
 		return false, err
 	}
-	_, ok := p.alive(key, time.Now().Unix())
+	_, ok := p.lookup(key, time.Now().Unix(), false)
 	return ok, nil
 }
 
@@ -158,7 +178,7 @@ func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, er
 	}
 	var cur int64
 	var exp int64 // 保留原 TTL（SSDB incr 不改 ttl 表）
-	if e, ok := p.alive(key, time.Now().Unix()); ok {
+	if e, ok := p.lookup(key, time.Now().Unix(), true); ok {
 		v, err := parseInt(e.val)
 		if err != nil {
 			return 0, err
@@ -181,8 +201,8 @@ func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte,
 	now := time.Now().Unix()
 	out := make(map[string][]byte, len(keys))
 	for _, k := range keys {
-		if e, ok := p.alive(k, now); ok {
-			out[k] = e.val
+		if e, ok := p.lookup(k, now, false); ok {
+			out[k] = clone(e.val)
 		}
 	}
 	return out, nil
@@ -200,7 +220,8 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 	keys := make([]string, 0, len(p.kv))
 	for k, e := range p.kv {
 		if e.exp > 0 && e.exp <= now {
-			delete(p.kv, k)
+			// 只读路径不得改写 map（见 lookup 注释）：跳过即可，
+			// 过期条目由写操作或 Snapshot 清理。
 			continue
 		}
 		if start != "" && k < start {
@@ -217,7 +238,7 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 	}
 	out := make([]core.KeyValue, 0, len(keys))
 	for _, k := range keys {
-		out = append(out, core.KeyValue{Key: k, Value: p.kv[k].val})
+		out = append(out, core.KeyValue{Key: k, Value: clone(p.kv[k].val)})
 	}
 	return out, nil
 }
@@ -232,14 +253,15 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	if err := p.checkOpen(); err != nil {
 		return err
 	}
-	p.expireLocked(key, ttl)
+	p.expireLocked(key, ttl, time.Now().Unix())
 	return nil
 }
 
-// expireLocked 设置 TTL，调用方需持有 p.mu。
-func (p *Provider) expireLocked(key string, ttl int64) {
-	if e, ok := p.alive(key, time.Now().Unix()); ok {
-		e.exp = time.Now().Unix() + ttl
+// expireLocked 设置 TTL：已过期/不存在的 key 按不存在处理，不做"复活"。
+// 调用方需持有 p.mu。
+func (p *Provider) expireLocked(key string, ttl int64, now int64) {
+	if e, ok := p.lookup(key, now, true); ok {
+		e.exp = now + ttl
 	}
 }
 
@@ -250,7 +272,7 @@ func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
 	if err := p.checkOpen(); err != nil {
 		return 0, false, err
 	}
-	e, ok := p.alive(key, time.Now().Unix())
+	e, ok := p.lookup(key, time.Now().Unix(), false)
 	if !ok || e.exp == 0 {
 		return -1, false, nil
 	}
@@ -406,9 +428,9 @@ func (p *Provider) qfront(_ context.Context, name string, back bool) ([]byte, bo
 		return nil, false, nil
 	}
 	if back {
-		return l.Back().Value.([]byte), true, nil
+		return clone(l.Back().Value.([]byte)), true, nil
 	}
-	return l.Front().Value.([]byte), true, nil
+	return clone(l.Front().Value.([]byte)), true, nil
 }
 
 // ---- ZSet ----
@@ -530,12 +552,11 @@ func (p *Provider) zincrLocked(name, key string, delta int64) int64 {
 
 // ---- 工具 ----
 
-// normalizeLimit 保证 limit<=0 时使用与 kvdb.DefaultScanLimit 一致的分页大小
-// （基座包避免反向依赖根包，此处内联同一常量的语义并注释对齐）。
+// normalizeLimit 保证 limit<=0 时使用与 core.DefaultScanLimit 一致的页大小。
+// 统一取 core 常量（不再各处内联 100），改默认值只需改一处。
 func normalizeLimit(limit int) int {
-	const defaultLimit = 100 // 与 core.DefaultScanLimit 对齐
 	if limit <= 0 {
-		return defaultLimit
+		return core.DefaultScanLimit
 	}
 	return limit
 }
@@ -593,16 +614,17 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 			}
 		}
 	}
+	now := time.Now().Unix() // 整批共享同一"当前时刻"，避免批内语义漂移
 	for _, op := range ops {
 		switch op.Kind {
 		case core.BatchSet:
-			p.setLocked(op.Key, op.Value)
+			p.setLocked(op.Key, op.Value, now)
 		case core.BatchSetEx:
-			p.setExLocked(op.Key, op.Value, op.TTL)
+			p.setExLocked(op.Key, op.Value, op.TTL, now)
 		case core.BatchDel:
 			p.delLocked(op.Key)
 		case core.BatchExpire:
-			p.expireLocked(op.Key, op.TTL)
+			p.expireLocked(op.Key, op.TTL, now)
 		case core.BatchQPush:
 			p.qpushLocked(op.Key, op.Value, false)
 		case core.BatchQPushFront:

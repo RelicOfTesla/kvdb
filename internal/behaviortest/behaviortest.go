@@ -8,18 +8,279 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/RelicOfTesla/kvdb"
 	"github.com/RelicOfTesla/kvdb/core"
 )
 
+// Options 控制共享用例的可选行为。
+type Options struct {
+	// FastForward 推进"虚拟时钟"（如 miniredis 的 FastForward）：这类进程内替身
+	// 不随真实时间过期，等待过期的用例会调用它来推进时间。真实基座保持 nil。
+	FastForward func()
+}
+
 // Run 对 factory 产出的新实例依次跑 KV/Queue/ZSet 三套用例；
 // factory 每次调用必须返回独立的新基座（测试内部会负责 Close）。
 func Run(t *testing.T, factory func(t *testing.T) core.KvProvider) {
+	RunWithOptions(t, Options{}, factory)
+}
+
+// RunWithOptions 是 Run 的带选项版本（虚拟时钟等）。
+func RunWithOptions(t *testing.T, opt Options, factory func(t *testing.T) core.KvProvider) {
 	t.Run("KV", func(t *testing.T) { TestKV(t, newDB(t, factory)) })
 	t.Run("Queue", func(t *testing.T) { TestQueue(t, newDB(t, factory)) })
 	t.Run("ZSet", func(t *testing.T) { TestZSet(t, newDB(t, factory)) })
 	t.Run("Batch", func(t *testing.T) { TestBatch(t, newDB(t, factory)) })
+	t.Run("ExpiredWrites", func(t *testing.T) { TestExpiredWrites(t, newDB(t, factory), opt) })
+	t.Run("ReadOwnership", func(t *testing.T) { TestReadOwnership(t, newDB(t, factory)) })
+	t.Run("NamespaceIndependence", func(t *testing.T) { TestNamespaceIndependence(t, newDB(t, factory)) })
+	t.Run("ExpiredConcurrentRead", func(t *testing.T) { TestExpiredConcurrentRead(t, newDB(t, factory), opt) })
+}
+
+// waitExpired 轮询等待 key 过期（TTL 粒度为秒，不能只 sleep 固定时长：
+// 恰好卡在秒边界上会偶发失败）。opt.FastForward 非 nil 时先推进虚拟时钟。
+func waitExpired(t *testing.T, db kvdb.DB, opt Options, key string) {
+	t.Helper()
+	ctx := context.Background()
+	advanced := false
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		ok, err := db.Exists(ctx, key)
+		if err != nil {
+			t.Fatalf("Exists(%s): %v", key, err)
+		}
+		if !ok {
+			return
+		}
+		if opt.FastForward != nil && !advanced {
+			opt.FastForward()
+			advanced = true
+			continue
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("key %s 在 5s 内未过期", key)
+}
+
+// TestExpiredWrites 覆盖"过期键 = 不存在"在**写路径**上的语义：
+// 过期后 Set 必须可见（不得继承旧的过期时间）、Incr 必须从 0 起算
+// （不得在陈旧值上累加）、Expire 不得复活过期键。
+func TestExpiredWrites(t *testing.T, db kvdb.DB, opt Options) {
+	ctx := context.Background()
+
+	// Set 后必须可读，且不再带 TTL。
+	if err := db.SetEx(ctx, "ew:set", []byte("old"), 1); err != nil {
+		t.Fatal(err)
+	}
+	waitExpired(t, db, opt, "ew:set")
+	if err := db.Set(ctx, "ew:set", []byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok, err := db.Get(ctx, "ew:set"); err != nil || !ok || string(v) != "new" {
+		t.Fatalf("过期后 Set 应可见: v=%q ok=%v err=%v", v, ok, err)
+	}
+	if _, has, err := db.TTL(ctx, "ew:set"); err != nil || has {
+		t.Fatalf("过期后 Set 不应保留 TTL: has=%v err=%v", has, err)
+	}
+
+	// Incr 从 0 起算，不得复用陈旧值 5。
+	if err := db.SetEx(ctx, "ew:incr", []byte("5"), 1); err != nil {
+		t.Fatal(err)
+	}
+	waitExpired(t, db, opt, "ew:incr")
+	if n, err := db.Incr(ctx, "ew:incr", 1); err != nil || n != 1 {
+		t.Fatalf("过期后 Incr = %d,%v (want 1，不应在陈旧值上累加)", n, err)
+	}
+	if v, ok, err := db.Get(ctx, "ew:incr"); err != nil || !ok || string(v) != "1" {
+		t.Fatalf("过期后 Incr 结果应可见: v=%q ok=%v err=%v", v, ok, err)
+	}
+
+	// Incr 遇到"过期 + 非整数"：过期优先，按不存在处理。
+	if err := db.SetEx(ctx, "ew:bad", []byte("abc"), 1); err != nil {
+		t.Fatal(err)
+	}
+	waitExpired(t, db, opt, "ew:bad")
+	if n, err := db.Incr(ctx, "ew:bad", 2); err != nil || n != 2 {
+		t.Fatalf("过期后 Incr(非整数旧值) = %d,%v (want 2)", n, err)
+	}
+
+	// Expire 不得复活过期键。
+	if err := db.SetEx(ctx, "ew:exp", []byte("v"), 1); err != nil {
+		t.Fatal(err)
+	}
+	waitExpired(t, db, opt, "ew:exp")
+	if err := db.Expire(ctx, "ew:exp", 100); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := db.Exists(ctx, "ew:exp"); err != nil || ok {
+		t.Fatalf("Expire 不应复活过期键: ok=%v err=%v", ok, err)
+	}
+
+	// SetEx 覆盖过期键：正常（显式写 expire_at）。
+	if err := db.SetEx(ctx, "ew:setx", []byte("v"), 1); err != nil {
+		t.Fatal(err)
+	}
+	waitExpired(t, db, opt, "ew:setx")
+	if err := db.SetEx(ctx, "ew:setx", []byte("v2"), 100); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok, err := db.Get(ctx, "ew:setx"); err != nil || !ok || string(v) != "v2" {
+		t.Fatalf("过期后 SetEx 应可见: v=%q ok=%v err=%v", v, ok, err)
+	}
+}
+
+// TestNamespaceIndependence 验证三类数据的命名空间彼此独立：同名 KV 键、
+// 队列、zset 必须能共存且互不影响（Redis 只有单一 keyspace，必须自行隔离）。
+func TestNamespaceIndependence(t *testing.T, db kvdb.DB) {
+	ctx := context.Background()
+	const name = "ns:same"
+
+	if err := db.Set(ctx, name, []byte("kv")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QPush(ctx, name, []byte("q")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ZSet(ctx, name, "m", 3); err != nil {
+		t.Fatal(err)
+	}
+
+	if v, ok, err := db.Get(ctx, name); err != nil || !ok || string(v) != "kv" {
+		t.Fatalf("同名下 KV 键被干扰: %q,%v,%v", v, ok, err)
+	}
+	if v, ok, err := db.QFront(ctx, name); err != nil || !ok || string(v) != "q" {
+		t.Fatalf("同名下队列被干扰: %q,%v,%v", v, ok, err)
+	}
+	if s, ok, err := db.ZGet(ctx, name, "m"); err != nil || !ok || s != 3 {
+		t.Fatalf("同名下 zset 被干扰: %d,%v,%v", s, ok, err)
+	}
+	// Scan 只应看到 KV 条目（不得把队列/zset 键当成 KV，也不得报 WRONGTYPE）。
+	kvs, err := db.Scan(ctx, name, name, 10)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(kvs) != 1 || kvs[0].Key != name || string(kvs[0].Value) != "kv" {
+		t.Fatalf("Scan 混入了非 KV 条目: %v", kvs)
+	}
+
+	// 删除 KV 键不影响另两个命名空间。
+	if err := db.Del(ctx, name); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := db.Get(ctx, name); ok {
+		t.Fatal("Del 后 KV 键仍存在")
+	}
+	if v, ok, _ := db.QFront(ctx, name); !ok || string(v) != "q" {
+		t.Fatalf("Del KV 影响了队列: %q,%v", v, ok)
+	}
+	if _, ok, _ := db.ZGet(ctx, name, "m"); !ok {
+		t.Fatal("Del KV 影响了 zset")
+	}
+}
+
+// TestReadOwnership 覆盖返回值所有权：Get/MGet/Scan/QFront/QBack 返回的切片
+// 必须是副本，调用方改写不得影响库内状态（否则 mem/jsonl 的内存态可被外部
+// 篡改，且与 jsonl 重启回放结果不一致）。
+func TestReadOwnership(t *testing.T, db kvdb.DB) {
+	ctx := context.Background()
+	const orig = "abc"
+
+	if err := db.Set(ctx, "own", []byte(orig)); err != nil {
+		t.Fatal(err)
+	}
+	v, ok, err := db.Get(ctx, "own")
+	if err != nil || !ok {
+		t.Fatalf("Get: %v %v", ok, err)
+	}
+	v[0] = 'x'
+	if got, _, _ := db.Get(ctx, "own"); string(got) != orig {
+		t.Fatalf("改写 Get 返回值污染了库内状态: %q", got)
+	}
+
+	m, err := db.MGet(ctx, "own")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m["own"][0] = 'y'
+	if got, _, _ := db.Get(ctx, "own"); string(got) != orig {
+		t.Fatalf("改写 MGet 返回值污染了库内状态: %q", got)
+	}
+
+	kvs, err := db.Scan(ctx, "", "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kv := range kvs {
+		if kv.Key == "own" {
+			kv.Value[0] = 'z'
+		}
+	}
+	if got, _, _ := db.Get(ctx, "own"); string(got) != orig {
+		t.Fatalf("改写 Scan 返回值污染了库内状态: %q", got)
+	}
+
+	if err := db.QPush(ctx, "ownq", []byte(orig)); err != nil {
+		t.Fatal(err)
+	}
+	if f, ok, err := db.QFront(ctx, "ownq"); err != nil || !ok {
+		t.Fatalf("QFront: %v %v", ok, err)
+	} else {
+		f[0] = 'x'
+	}
+	if b, ok, err := db.QBack(ctx, "ownq"); err != nil || !ok {
+		t.Fatalf("QBack: %v %v", ok, err)
+	} else {
+		b[0] = 'x'
+	}
+	if f, _, _ := db.QFront(ctx, "ownq"); string(f) != orig {
+		t.Fatalf("改写 QFront/QBack 返回值污染了库内状态: %q", f)
+	}
+}
+
+// TestExpiredConcurrentRead 在 key 过期瞬间用多个读者并发触发惰性清理，
+// 配合 -race 捕捉"读锁下改写 map"的数据竞争（mem/jsonl）。
+func TestExpiredConcurrentRead(t *testing.T, db kvdb.DB, opt Options) {
+	ctx := context.Background()
+	keys := []string{"cr:1", "cr:2", "cr:3", "cr:4"}
+	for _, k := range keys {
+		if err := db.SetEx(ctx, k, []byte("v"), 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				for _, k := range keys {
+					db.Get(ctx, k)
+					db.Exists(ctx, k)
+					db.MGet(ctx, keys...)
+					db.TTL(ctx, k)
+				}
+				db.Scan(ctx, "", "", 100)
+			}
+		}()
+	}
+	// 跨越过期时刻：真实基座靠真实时间，虚拟时钟替身（miniredis）靠 FastForward。
+	if opt.FastForward != nil {
+		time.Sleep(100 * time.Millisecond)
+		opt.FastForward()
+		time.Sleep(200 * time.Millisecond)
+	} else {
+		time.Sleep(1500 * time.Millisecond)
+	}
+	close(stop)
+	wg.Wait()
 }
 
 func newDB(t *testing.T, factory func(t *testing.T) core.KvProvider) kvdb.DB {

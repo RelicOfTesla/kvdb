@@ -2,9 +2,11 @@ package kvdb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/RelicOfTesla/kvdb/core"
@@ -69,7 +71,13 @@ func Schemes() []string {
 func open(ctx context.Context, uri string) (DB, error) {
 	u, err := url.Parse(uri)
 	if err != nil {
-		return nil, fmt.Errorf("kvdb: parse uri %q: %w", uri, err)
+		// url.Parse 的错误是 *url.Error，其 Error() 会把**完整 URI**（含 userinfo
+		// 密码）拼进消息；这里只保留内层原因与脱敏后的 scheme。
+		var uerr *url.Error
+		if errors.As(err, &uerr) && uerr.Err != nil {
+			err = uerr.Err
+		}
+		return nil, fmt.Errorf("kvdb: parse uri %s: %w", redactURI(uri), err)
 	}
 	registryMu.RLock()
 	opener, ok := registry[u.Scheme]
@@ -84,6 +92,19 @@ func open(ctx context.Context, uri string) (DB, error) {
 		return nil, err
 	}
 	return Wrap(p), nil
+}
+
+// redactURI 脱敏 URI 后再放进错误信息：解析失败时错误常被直接写日志，
+// 原样带上 userinfo（mysql://user:pass@…）或 ?password= 就会泄露凭据。
+// 这里只保留 scheme（连 scheme 都无法确定时给固定占位）。
+func redactURI(uri string) string {
+	if u, err := url.Parse(uri); err == nil && u.Scheme != "" {
+		return u.Scheme + "://<redacted>"
+	}
+	if i := strings.Index(uri, "://"); i > 0 {
+		return uri[:i] + "://<redacted>"
+	}
+	return "<unparsable uri>"
 }
 
 // 内置基座的 URI 约定（各 scheme 由对应基座包注册，见各包 OpenURI）：

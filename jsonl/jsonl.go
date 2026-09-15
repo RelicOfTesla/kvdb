@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -54,9 +55,14 @@ type Config struct {
 	Sync bool
 }
 
+// MaxRecordBytes 是单条日志记录（含批量记录）的字节上限。写入侧会在此处拒绝
+// 超限值（而不是"写成功、重启时打不开"），回放侧使用同一上限。
+// 非 UTF-8 值走 base64，膨胀约 4/3，因此二进制值的可用上限约为该值的 3/4。
+const MaxRecordBytes = 64 << 20
+
 // op 是日志的一行记录；字段为各数据结构所需的最小集合。
 type op struct {
-	Op  string `json:"op"`            // set|setx|del|incr|expire|qpush|qpop|zset|zdel|zincr
+	Op  string `json:"op"`            // set|setx|del|incr|expire|qpush|qpop|zset|zdel|zincr|batch
 	K   string `json:"k,omitempty"`   // kv key / 队列名 / zset 名
 	M   string `json:"m,omitempty"`   // zset 成员
 	V   string `json:"v,omitempty"`   // set / qpush 的值（文本或 base64）
@@ -65,7 +71,22 @@ type op struct {
 	S   int64  `json:"s,omitempty"`   // zset 分数
 	At  int64  `json:"at,omitempty"`  // expire 绝对过期时间（unix 秒，必然 >0）
 	F   bool   `json:"f,omitempty"`   // qpush 到队头 / qpop 从队尾
+	// B 是批量记录的子操作（Op=="batch" 时非空）。整批只占一行，
+	// 因此崩溃只会留下"完整前缀行"或"半行"——不会出现提交半个批。
+	B []op `json:"b,omitempty"`
 }
+
+// parseError 标记"这一行不是合法 JSON"（崩溃残留的半行），与"解析成功但应用失败"
+// 区分开：只有前者可以在回放末尾被容忍。
+type parseError struct {
+	line int
+	err  error
+}
+
+func (e *parseError) Error() string {
+	return fmt.Sprintf("jsonl: replay line %d: %v", e.line, e.err)
+}
+func (e *parseError) Unwrap() error { return e.err }
 
 // Provider 是 JSONL 基座。并发安全；ctx 仅用于接口一致。
 type Provider struct {
@@ -101,7 +122,8 @@ func Open(ctx context.Context, path string, cfg Config) (*Provider, error) {
 
 // replay 打开时流式回放日志（内存峰值限单行，不缓存全文件）。
 // 容错规则：最后一行无法解析视为崩溃残留的半行直接忽略；
-// 若坏行之后还有完整行，则说明日志损坏，返回错误。
+// 若坏行之后还有完整行，则说明日志损坏，返回错误；最后一行"解析成功但无法
+// 应用"（如未知 op）属于日志损坏，必须上报而不是静默忽略。
 // 实现采用"延迟一行"策略：读入新行时先应用上一行——上一行若坏且仍读到
 // 后续行即为中间损坏；EOF 时上行的解析结果决定是否容忍。
 func (p *Provider) replay() error {
@@ -109,7 +131,9 @@ func (p *Provider) replay() error {
 		return fmt.Errorf("jsonl: seek: %w", err)
 	}
 	sc := bufio.NewScanner(p.file)
-	sc.Buffer(make([]byte, 0, 64*1024), 64*1024*1024) // 单值上限 64MiB
+	// 回放上限与写入侧校验一致：多留 1 字节，保证恰好等于 MaxRecordBytes
+	// 的合法记录不会因令牌上限被误判。
+	sc.Buffer(make([]byte, 0, 64*1024), MaxRecordBytes+1)
 
 	now := time.Now().Unix()
 	// deferred 是暂缓的一行及其序号：读入下一行前应用它，
@@ -120,13 +144,14 @@ func (p *Provider) replay() error {
 		if deferred == nil {
 			return nil
 		}
-		defer func() { deferred = nil }()
-		if *deferred == "" {
+		line, no := *deferred, lineNo
+		deferred = nil // 先取走：调用方据返回值判定，不再依赖残留状态
+		if line == "" {
 			return nil
 		}
 		var rec op
-		if err := json.Unmarshal([]byte(*deferred), &rec); err != nil {
-			return fmt.Errorf("jsonl: replay line %d: %w", lineNo, err)
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			return &parseError{line: no, err: err}
 		}
 		return p.apply(rec, now)
 	}
@@ -142,15 +167,14 @@ func (p *Provider) replay() error {
 	if err := sc.Err(); err != nil {
 		return fmt.Errorf("jsonl: read: %w", err)
 	}
-	// EOF：deferred 为最后一行。坏行（如写入中断的半行）按崩溃残留容忍；
-	// 完整行正常应用。
-	if err := flush(); err != nil && deferred != nil {
-		// 最后一行坏：仅当确实是 JSON 解析失败时忽略，其余错误（应用失败）
-		// 仍应上报。
-		var rec op
-		if uerr := json.Unmarshal([]byte(*deferred), &rec); uerr == nil {
-			return err
+	// EOF：deferred 为最后一行。仅"JSON 解析失败"按崩溃残留容忍；
+	// 应用失败（未知 op、参数非法等）说明日志本身损坏，必须上报。
+	if err := flush(); err != nil {
+		var pe *parseError
+		if errors.As(err, &pe) {
+			return nil
 		}
+		return err
 	}
 	return nil
 }
@@ -199,6 +223,15 @@ func (p *Provider) apply(rec op, now int64) error {
 	case "zincr":
 		_, err := p.mem.ZIncr(context.Background(), rec.K, rec.M, rec.D)
 		return err
+	case "batch":
+		// 整批记录：逐条应用。写入侧已保证同一事务式地落在一行里，
+		// 回放时不会出现"半个批"。
+		for _, sub := range rec.B {
+			if err := p.apply(sub, now); err != nil {
+				return err
+			}
+		}
+		return nil
 	default:
 		return fmt.Errorf("unknown op %q", rec.Op)
 	}
@@ -211,6 +244,8 @@ func (p *Provider) appendOp(rec op) error {
 
 // appendOps 把一批记录写入缓冲后只做一次 Flush（Sync 模式下一次 fsync）。
 // 单条与批量共用此路径，保证"成功返回 = 已交给 OS"的语义一致。
+// 每条记录写入前校验长度：超限值宁可在写入时报错，也不能写进去让下次
+// Open 因回放令牌超限而失败（"写得进、打不开"）。
 func (p *Provider) appendOps(recs []op) error {
 	if len(recs) == 0 {
 		return nil
@@ -220,6 +255,10 @@ func (p *Provider) appendOps(recs []op) error {
 		b, err := json.Marshal(rec)
 		if err != nil {
 			return fmt.Errorf("jsonl: marshal: %w", err)
+		}
+		if len(b)+1 > MaxRecordBytes {
+			return fmt.Errorf("jsonl: record too large: %d bytes (limit %d, non-UTF-8 values use base64 and grow ~4/3)",
+				len(b), MaxRecordBytes)
 		}
 		buf = append(buf, b...)
 		buf = append(buf, '\n')
@@ -238,8 +277,12 @@ func (p *Provider) appendOps(recs []op) error {
 
 // ---- Batch ----
 
-// ApplyBatch 实现 core.BatchProvider：整批先写成一条日志（一次 Flush，Sync 模式
-// 一次 fsync），成功后再按序应用到内存。写日志失败时内存不变，整批不生效。
+// ApplyBatch 实现 core.BatchProvider：整批写成**一行** batch 记录（一次 Flush，
+// Sync 模式一次 fsync），成功后再按序应用到内存。写日志失败时内存不变，整批不生效。
+//
+// 为什么是一行而不是多行：多行记录在崩溃时可能只写下完整前缀，回放就会提交
+// 半个批；单行记录要么完整、要么是残缺半行（回放末尾按崩溃残留丢弃），
+// 因此"整批全有或全无"在崩溃语义下也成立。
 func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 	if len(ops) == 0 {
 		return nil
@@ -258,8 +301,8 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 		}
 		recs = append(recs, rec)
 	}
-	// 日志先行：失败则内存不变。
-	if err := p.appendOps(recs); err != nil {
+	// 日志先行：失败则内存不变。整批序列化为一条记录（原子性所在）。
+	if err := p.appendOps([]op{{Op: "batch", B: recs}}); err != nil {
 		return err
 	}
 	for _, rec := range recs {
@@ -616,6 +659,9 @@ func (p *Provider) Compact(ctx context.Context) error {
 		b, err := json.Marshal(rec)
 		if err != nil {
 			return err
+		}
+		if len(b)+1 > MaxRecordBytes {
+			return fmt.Errorf("jsonl: record too large during compact: %d bytes (limit %d)", len(b)+1, MaxRecordBytes)
 		}
 		_, err = bw.Write(append(b, '\n'))
 		return err

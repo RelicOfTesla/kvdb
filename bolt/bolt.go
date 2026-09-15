@@ -206,8 +206,17 @@ func cleanupExpired(tx *bolt.Tx, now int64) error {
 
 // ---- KV（事务内实现，单条与批写共用）----
 
-func kvSetTx(tx *bolt.Tx, key string, value []byte) error {
-	return tx.Bucket(bKV).Put([]byte(key), value)
+// kvSetTx 写入值：保留既有**未过期** TTL；已过期的 TTL 必须先删除，
+// 否则 Set 成功了键却仍然读不到（过期判定在 Get/Exists 侧）。同一事务内完成，
+// 与并发读写互斥。传入 now 便于批量操作共享同一时刻。
+func kvSetTx(tx *bolt.Tx, key string, value []byte, now int64) error {
+	k := []byte(key)
+	if ttlExpired(tx, k, now) {
+		if err := tx.Bucket(bTTL).Delete(k); err != nil {
+			return err
+		}
+	}
+	return tx.Bucket(bKV).Put(k, value)
 }
 
 func kvSetExTx(tx *bolt.Tx, key string, value []byte, ttl int64) error {
@@ -227,28 +236,39 @@ func kvDelTx(tx *bolt.Tx, key string) error {
 	return tx.Bucket(bTTL).Delete([]byte(key))
 }
 
-func kvExpireTx(tx *bolt.Tx, key string, ttl int64) error {
+// kvExpireTx 设置 TTL；key 不存在**或已过期**时按不存在处理（不"复活"过期键）。
+func kvExpireTx(tx *bolt.Tx, key string, ttl int64, now int64) error {
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
-	if tx.Bucket(bKV).Get([]byte(key)) == nil {
+	k := []byte(key)
+	if tx.Bucket(bKV).Get(k) == nil || ttlExpired(tx, k, now) {
 		return nil
 	}
-	return tx.Bucket(bTTL).Put([]byte(key), be64(uint64(time.Now().Unix()+ttl)))
+	return tx.Bucket(bTTL).Put(k, be64(uint64(now+ttl)))
 }
 
-func kvIncrTx(tx *bolt.Tx, key string, delta int64) (int64, error) {
+// kvIncrTx 原子累加：已过期的键按不存在处理（从 0 起算并清除旧 TTL），
+// 未过期的键保留原 TTL（SSDB incr 不改 ttl 表）。
+func kvIncrTx(tx *bolt.Tx, key string, delta int64, now int64) (int64, error) {
+	k := []byte(key)
 	b := tx.Bucket(bKV)
+	expired := ttlExpired(tx, k, now)
 	var cur int64
-	if v := b.Get([]byte(key)); v != nil {
+	if v := b.Get(k); v != nil && !expired {
 		n, err := strconv.ParseInt(string(v), 10, 64)
 		if err != nil {
 			return 0, core.ErrNotInteger
 		}
 		cur = n
 	}
+	if expired {
+		if err := tx.Bucket(bTTL).Delete(k); err != nil {
+			return 0, err
+		}
+	}
 	cur += delta
-	if err := b.Put([]byte(key), []byte(strconv.FormatInt(cur, 10))); err != nil {
+	if err := b.Put(k, []byte(strconv.FormatInt(cur, 10))); err != nil {
 		return 0, err
 	}
 	return cur, nil
@@ -513,7 +533,8 @@ func zRankTx(tx *bolt.Tx, name, member string) (int64, bool) {
 
 func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 	_ = ctx
-	return p.update(func(tx *bolt.Tx) error { return kvSetTx(tx, key, value) })
+	now := time.Now().Unix()
+	return p.update(func(tx *bolt.Tx) error { return kvSetTx(tx, key, value, now) })
 }
 
 func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int64) error {
@@ -558,9 +579,10 @@ func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 
 func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, error) {
 	_ = ctx
+	now := time.Now().Unix()
 	var out int64
 	err := p.update(func(tx *bolt.Tx) error {
-		n, err := kvIncrTx(tx, key, delta)
+		n, err := kvIncrTx(tx, key, delta, now)
 		if err != nil {
 			return err
 		}
@@ -621,7 +643,8 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 
 func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	_ = ctx
-	return p.update(func(tx *bolt.Tx) error { return kvExpireTx(tx, key, ttl) })
+	now := time.Now().Unix()
+	return p.update(func(tx *bolt.Tx) error { return kvExpireTx(tx, key, ttl, now) })
 }
 
 func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
@@ -802,17 +825,18 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 		}
 	}
 	return p.update(func(tx *bolt.Tx) error {
+		now := time.Now().Unix() // 整批共享同一"当前时刻"
 		for i, op := range ops {
 			var err error
 			switch op.Kind {
 			case core.BatchSet:
-				err = kvSetTx(tx, op.Key, op.Value)
+				err = kvSetTx(tx, op.Key, op.Value, now)
 			case core.BatchSetEx:
 				err = kvSetExTx(tx, op.Key, op.Value, op.TTL)
 			case core.BatchDel:
 				err = kvDelTx(tx, op.Key)
 			case core.BatchExpire:
-				err = kvExpireTx(tx, op.Key, op.TTL)
+				err = kvExpireTx(tx, op.Key, op.TTL, now)
 			case core.BatchQPush:
 				err = qPushTx(tx, op.Key, op.Value, false)
 			case core.BatchQPushFront:
@@ -834,10 +858,10 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 	})
 }
 
+// normalizeLimit 保证 limit<=0 时使用 core.DefaultScanLimit（统一常量，避免散弹式修改）。
 func normalizeLimit(limit int) int {
-	const defaultLimit = 100 // 与 core.DefaultScanLimit 对齐
 	if limit <= 0 {
-		return defaultLimit
+		return core.DefaultScanLimit
 	}
 	return limit
 }

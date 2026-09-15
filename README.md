@@ -268,12 +268,16 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 | 差异点 | 处理 |
 |---|---|
 | SSDB `scan` 是 start 开区间 | ssdb 基座对存在的 start 键做一次 get 补偿，对外仍为闭区间 |
-| Redis 无字节序范围扫描 | redis 基座全量 SCAN + 客户端过滤排序，**代价与 keyspace 大小相关** |
+| Redis 无字节序范围扫描 | redis 基座全量 SCAN + 客户端过滤排序，**只扫描 KV 前缀**；代价与 KV 键数量相关 |
 | SQL 过期行 | 读取路径过滤，开库时清理一次 |
 | SQLite 并发写 | 进程内写串行化（单写者），WAL 保留读并行 |
 | BoltDB 并发写 | 单写者、多读者（MVCC）；写操作按 bbolt 事务串行提交 |
 | Redis 的 `Set` | 用 `SET ... KEEPTTL` 保持既有 TTL（需 Redis ≥ 6.0） |
+| Redis 键前缀 | 三类数据共用一个 keyspace，基座自动加 `kvdb:kv:` / `kvdb:q:` / `kvdb:z:` 前缀，保证命名空间独立；**前缀属于数据布局**，旧版本写入的裸 key 数据不再可见（`SCAN kvdb:kv:*` 可导出旧数据） |
 | SQL 键长 | MySQL 键列上限 255 字节（兼容 5.6 默认索引前缀）；PostgreSQL/SQLite 用 BYTEA/BLOB 无此限制 |
+| SQLite 旧库升级 | `kv_items.n` 列由开库迁移自动补列并回填整数投影（幂等），旧库无需手工处理 |
+| 过期键的写语义 | 所有基座统一"已过期 = 不存在"：过期后 `Set` 不继承旧 TTL、`Incr` 从 0 起算、`Expire` 不复活 |
+| 读返回值所有权 | `Get`/`MGet`/`Scan`/`QFront`/`QBack` 一律返回副本，调用方改写不影响库内状态（mem/jsonl 曾是内部切片别名） |
 
 ## 扩展：自定义基座
 

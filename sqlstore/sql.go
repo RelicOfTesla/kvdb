@@ -29,8 +29,10 @@ type Dialect struct {
 	Name string
 	// Ph 返回第 n（1 起）个参数占位符。
 	Ph func(n int) string
-	// KvUpsertTail 是 kv_items 与 q_seq INSERT 的"已存在则覆盖/忽略"冲突子句。
-	KvUpsertTail string // INSERT INTO kv_items (k, v) VALUES (...)+此尾；空尾表示不支持（不适用）
+	// KvUpsertTail 是 kv_items 的 Set（不带 TTL）冲突子句：覆盖 v，并在既有行
+	// **已过期**时把 expire_at 归零——否则 Set 成功了键仍会被读路径当过期过滤掉。
+	// `{now}` 由 makeStmts 替换为该方言"当前 unix 秒"参数的占位符。
+	KvUpsertTail string
 	// KvSetExTail 是 SetEx 的冲突子句：同时覆盖值与 expire_at。
 	KvSetExTail string
 	// IncrSeedTail 是 Incr 的占位插入冲突子句：行不存在则插入 '0'，
@@ -44,21 +46,18 @@ type Dialect struct {
 	// Returning 为 true 时用 UPDATE ... RETURNING 把"锁行 + 自增 + 写回"
 	// 合并为单条语句（PostgreSQL/SQLite 支持；MySQL 不支持走多条路径）。
 	Returning bool
-	// IncrSQL 是单语句原子自增（缺失按 0 起算、非整数报错）的完整语句模板；
-	// 空串表示该方言不具备单语句形态，Incr 走事务多语句路径。
-	// 占位符：{1}=key, {2}=delta。
+	// IncrSQL 是单语句原子自增（缺失按 0 起算、非整数报错、已过期按不存在）的
+	// 完整语句模板；空串表示该方言不具备单语句形态，Incr 走事务多语句路径。
+	// 占位符：{1}=key, {2}=delta, {3}=当前 unix 秒。
 	IncrSQL string
 	// HasNumCol 表示 kv_items 有数值投影列 n（供单语句 Incr 使用）；
 	// 为 true 时 Set/SetEx 必须同步维护 n，否则 Incr 会误判为非整数。
+	// 该列是后加的，旧库由 migrate 补列并回填（见 migrate）。
 	HasNumCol bool
 	// SerializeWrites 为 true 时基座在进程内串行化全部写操作（单写者模型）。
 	// SQLite 需要：多连接并发写即使有 busy_timeout 也会在持续竞争下报
 	// SQLITE_BUSY；进程级写锁把竞争变成排队，读仍由 WAL 并行。
 	SerializeWrites bool
-	// IncrDeltaParams 是 IncrSQL 模板中 {2}（增量）占位符的出现次数：
-	// PG 的 $n 重复引用同一参数，只需传一次；MySQL/SQLite 的 ? 为位置参数，
-	// 重复出现必须重复传值（SQLite 的 n/v 两列都需要增量）。
-	IncrDeltaParams int
 	// DDL（占位符无需参数）。
 	KvDDL, QSeqDDL, QItemsDDL, ZDDL, ZIdxDDL string
 }
@@ -67,9 +66,10 @@ type Dialect struct {
 // 供 kvdb/mysql、kvdb/sqlite、kvdb/pg 包装包实例化本基座。
 var (
 	MySQLDialect = Dialect{
-		Name:            "mysql",
-		Ph:              func(n int) string { return "?" },
-		KvUpsertTail:    "ON DUPLICATE KEY UPDATE v = VALUES(v)",
+		Name: "mysql",
+		Ph:   func(n int) string { return "?" },
+		KvUpsertTail: "ON DUPLICATE KEY UPDATE v = VALUES(v), " +
+			"expire_at = IF(kv_items.expire_at > 0 AND kv_items.expire_at <= {now}, 0, kv_items.expire_at)",
 		KvSetExTail:     "ON DUPLICATE KEY UPDATE v = VALUES(v), expire_at = VALUES(expire_at)",
 		IncrSeedTail:    "ON DUPLICATE KEY UPDATE v = v",
 		ZSetUpsertTail:  "ON DUPLICATE KEY UPDATE s = VALUES(s)",
@@ -86,9 +86,11 @@ var (
 		ZIdxDDL: "",
 	}
 	SQLiteDialect = Dialect{
-		Name:            "sqlite",
-		Ph:              func(n int) string { return "?" },
-		KvUpsertTail:    "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+		Name: "sqlite",
+		Ph:   func(n int) string { return "?" },
+		KvUpsertTail: "ON CONFLICT(k) DO UPDATE SET v = excluded.v, " +
+			"expire_at = CASE WHEN kv_items.expire_at > 0 AND kv_items.expire_at <= {now} " +
+			"THEN 0 ELSE kv_items.expire_at END",
 		KvSetExTail:     "ON CONFLICT(k) DO UPDATE SET v = excluded.v, expire_at = excluded.expire_at",
 		IncrSeedTail:    "ON CONFLICT(k) DO NOTHING",
 		ZSetUpsertTail:  "ON CONFLICT(z, k) DO UPDATE SET s = excluded.s",
@@ -99,14 +101,22 @@ var (
 		Returning:       true, // SQLite >= 3.35 支持 RETURNING
 		// 单语句 upsert：n 列缓存数值投影，v 列同步物化为十进制文本。
 		// WHERE 过滤非法值 -> 无匹配行 -> RETURNING 无结果 -> 映射 ErrNotInteger。
-		HasNumCol:       true,
-		IncrDeltaParams: 2, // {2} 出现两处（CAST 文本与数值），? 位置参数需重复传值
-		// 增量经 excluded.n 在两个分支间复用。
-		// {1}=key、{2}=增值；INSERT 分支把 n 直接置为增值（缺失按 0 起算），
-		// v 列由返回后的调用方按需回填——本语句只保证 n 与 v 的数值一致性。
-		IncrSQL: "INSERT INTO kv_items (k, v, n) VALUES ({1}, CAST({2} AS TEXT), {2}) " +
-			"ON CONFLICT(k) DO UPDATE SET v = CAST(kv_items.n + excluded.n AS TEXT), n = kv_items.n + excluded.n " +
-			"WHERE kv_items.n IS NOT NULL RETURNING kv_items.n",
+		HasNumCol: true,
+		// 单语句 upsert：n 列缓存数值投影，v 列同步物化为十进制文本。
+		// expired 分支（expire_at 非 0 且 <= {3}）把键按"不存在"处理：以增量本身为
+		// 基数并把 expire_at 归零；非 expired 分支要求 n NOT NULL，否则无匹配行 ->
+		// RETURNING 无结果 -> 映射 ErrNotInteger。
+		// {1}=key、{2}=增量、{3}=当前 unix 秒。
+		IncrSQL: "INSERT INTO kv_items (k, v, n, expire_at) VALUES ({1}, CAST({2} AS TEXT), {2}, 0) " +
+			"ON CONFLICT(k) DO UPDATE SET " +
+			"v = CASE WHEN kv_items.expire_at > 0 AND kv_items.expire_at <= {3} " +
+			"THEN CAST(excluded.n AS TEXT) ELSE CAST(kv_items.n + excluded.n AS TEXT) END, " +
+			"n = CASE WHEN kv_items.expire_at > 0 AND kv_items.expire_at <= {3} " +
+			"THEN excluded.n ELSE kv_items.n + excluded.n END, " +
+			"expire_at = CASE WHEN kv_items.expire_at > 0 AND kv_items.expire_at <= {3} " +
+			"THEN 0 ELSE kv_items.expire_at END " +
+			"WHERE (kv_items.expire_at > 0 AND kv_items.expire_at <= {3}) OR kv_items.n IS NOT NULL " +
+			"RETURNING kv_items.n",
 		KvDDL: "CREATE TABLE IF NOT EXISTS kv_items (k BLOB NOT NULL, v BLOB NOT NULL, n INTEGER NULL, " +
 			"expire_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (k))",
 		QSeqDDL:   "CREATE TABLE IF NOT EXISTS q_seq (q BLOB NOT NULL, next INTEGER NOT NULL, prev INTEGER NOT NULL, PRIMARY KEY (q))",
@@ -115,9 +125,11 @@ var (
 		ZIdxDDL:   "CREATE INDEX IF NOT EXISTS idx_z_items_s ON z_items (z, s, k)",
 	}
 	PostgresDialect = Dialect{
-		Name:            "postgres",
-		Ph:              func(n int) string { return "$" + strconv.Itoa(n) },
-		KvUpsertTail:    "ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
+		Name: "postgres",
+		Ph:   func(n int) string { return "$" + strconv.Itoa(n) },
+		KvUpsertTail: "ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v, " +
+			"expire_at = CASE WHEN kv_items.expire_at > 0 AND kv_items.expire_at <= {now} " +
+			"THEN 0 ELSE kv_items.expire_at END",
 		KvSetExTail:     "ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v, expire_at = EXCLUDED.expire_at",
 		IncrSeedTail:    "ON CONFLICT (k) DO NOTHING",
 		ZSetUpsertTail:  "ON CONFLICT (z, k) DO UPDATE SET s = EXCLUDED.s",
@@ -125,12 +137,20 @@ var (
 		QSeqIgnoreTail:  "ON CONFLICT (q) DO NOTHING",
 		ForUpdate:       " FOR UPDATE",
 		Returning:       true, // PostgreSQL 支持 RETURNING
-		// 单语句 upsert：bytea 经 convert_from/convert_to 与文本互转；
-		// 正则保证既有值是十进制整数，否则无匹配行 -> ErrNotInteger。
-		// {2} 只出现一次：增量经 excluded.v 在两个分支间复用（文本形态参与运算）。
-		IncrSQL: "INSERT INTO kv_items (k, v) VALUES ({1}, convert_to({2},'UTF8')) " +
-			"ON CONFLICT (k) DO UPDATE SET v = convert_to((convert_from(kv_items.v,'UTF8')::bigint + convert_from(excluded.v,'UTF8')::bigint)::text,'UTF8') " +
-			"WHERE convert_from(kv_items.v,'UTF8') ~ '^-?[0-9]+$' " +
+		// 单语句 upsert：bytea 经 convert_from/convert_to 与文本互转。
+		// expired 分支（expire_at 非 0 且 <= {3}）把键按"不存在"处理：以增量本身
+		// 为基数并把 expire_at 归零；非 expired 分支用正则保证既有值是十进制整数，
+		// 否则无匹配行 -> ErrNotInteger。
+		// {2} 只出现一次：增量经 excluded.v 在两个分支间复用（文本形态参与运算）；
+		// {3}=当前 unix 秒。
+		IncrSQL: "INSERT INTO kv_items (k, v, expire_at) VALUES ({1}, convert_to({2},'UTF8'), 0) " +
+			"ON CONFLICT (k) DO UPDATE SET " +
+			"v = convert_to((CASE WHEN kv_items.expire_at > 0 AND kv_items.expire_at <= {3} " +
+			"THEN convert_from(excluded.v,'UTF8')::bigint " +
+			"ELSE convert_from(kv_items.v,'UTF8')::bigint + convert_from(excluded.v,'UTF8')::bigint END)::text,'UTF8'), " +
+			"expire_at = CASE WHEN kv_items.expire_at > 0 AND kv_items.expire_at <= {3} THEN 0 ELSE kv_items.expire_at END " +
+			"WHERE (kv_items.expire_at > 0 AND kv_items.expire_at <= {3}) " +
+			"OR convert_from(kv_items.v,'UTF8') ~ '^-?[0-9]+$' " +
 			"RETURNING convert_from(kv_items.v,'UTF8')::bigint",
 		KvDDL:     "CREATE TABLE IF NOT EXISTS kv_items (k BYTEA NOT NULL, v BYTEA NOT NULL, expire_at BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (k))",
 		QSeqDDL:   "CREATE TABLE IF NOT EXISTS q_seq (q BYTEA NOT NULL, next BIGINT NOT NULL, prev BIGINT NOT NULL, PRIMARY KEY (q))",
@@ -254,6 +274,44 @@ func build(d Dialect, tpl string) string {
 	return sb.String()
 }
 
+// withNowParam 把模板中的 {now} 替换为该方言"当前 unix 秒"参数的占位符。
+// Set 语句的参数顺序固定为 k, v[, n]，因此 now 的序号是 3（无 n 列）或 4（有 n 列）。
+// {now} 不是纯数字序号，build 会原样保留，正好留到这里替换。
+func withNowParam(d Dialect, sql string) string {
+	idx := 3
+	if d.HasNumCol {
+		idx = 4
+	}
+	return strings.ReplaceAll(sql, "{now}", d.Ph(idx))
+}
+
+// expandArgs 按模板中 {n} 的出现顺序装配实参：位置占位符方言（?）重复引用同一
+// 参数序号时必须重复传值；命名占位符方言（PG 的 $n）每个参数只传一次。
+// 这样 IncrSQL 可以自由地多次引用 key/delta/now 而不必再维护"重复次数"常量。
+func expandArgs(d Dialect, tpl string, vals []any) []any {
+	if !strings.Contains(d.Ph(1), "?") {
+		return vals // $n：参数与序号一一对应
+	}
+	out := make([]any, 0, len(vals)*2)
+	for i := 0; i < len(tpl); {
+		if tpl[i] == '{' {
+			j := i + 1
+			for j < len(tpl) && tpl[j] != '}' {
+				j++
+			}
+			if j < len(tpl) {
+				if n, err := strconv.Atoi(tpl[i+1 : j]); err == nil && n >= 1 && n <= len(vals) {
+					out = append(out, vals[n-1])
+					i = j + 1
+					continue
+				}
+			}
+		}
+		i++
+	}
+	return out
+}
+
 func makeStmts(d Dialect) stmts {
 	inList := func(n int) string {
 		ps := make([]string, n)
@@ -263,18 +321,20 @@ func makeStmts(d Dialect) stmts {
 		return strings.Join(ps, ", ")
 	}
 	s := stmts{
-		kvUpsert:     build(d, kvSetTemplate(d, false)),
+		kvUpsert:     withNowParam(d, build(d, kvSetTemplate(d, false))),
 		kvSetEx:      build(d, kvSetTemplate(d, true)),
 		kvGet:        build(d, "SELECT v FROM kv_items WHERE k = {1} AND (expire_at = 0 OR expire_at > {2})"),
 		kvExists:     build(d, "SELECT 1 FROM kv_items WHERE k = {1} AND (expire_at = 0 OR expire_at > {2})"),
 		kvDel:        build(d, "DELETE FROM kv_items WHERE k = {1}"),
-		kvIncrSelect: build(d, "SELECT v FROM kv_items WHERE k = {1}"+d.ForUpdate),
+		kvIncrSelect: build(d, "SELECT v, expire_at FROM kv_items WHERE k = {1}"+d.ForUpdate),
 		kvIncrSeed:   build(d, "INSERT INTO kv_items (k, v) VALUES ({1}, '0') "+d.IncrSeedTail),
-		kvIncrUpdate: build(d, "UPDATE kv_items SET v = {1} WHERE k = {2}"),
+		// expire_at 一并写回：过期键按不存在处理时归零（{2}），未过期时保持原值。
+		kvIncrUpdate: build(d, "UPDATE kv_items SET v = {1}, expire_at = {2} WHERE k = {3}"),
 		kvIncrOne:    build(d, d.IncrSQL),
-		kvExpire:     build(d, "UPDATE kv_items SET expire_at = {1} WHERE k = {2}"),
-		kvTTL:        build(d, "SELECT expire_at FROM kv_items WHERE k = {1}"),
-		kvCleanup:    build(d, "DELETE FROM kv_items WHERE expire_at > 0 AND expire_at <= {1}"),
+		// 已过期（非 0 且 <= now）的键按不存在处理，不"复活"。
+		kvExpire:  build(d, "UPDATE kv_items SET expire_at = {1} WHERE k = {2} AND (expire_at = 0 OR expire_at > {3})"),
+		kvTTL:     build(d, "SELECT expire_at FROM kv_items WHERE k = {1}"),
+		kvCleanup: build(d, "DELETE FROM kv_items WHERE expire_at > 0 AND expire_at <= {1}"),
 		kvScan: func(hasStart, hasEnd bool) string {
 			var conds []string
 			i := 1
@@ -339,16 +399,16 @@ func makeStmts(d Dialect) stmts {
 
 // Provider 是 SQL 基座。并发安全由 database/sql 连接池与事务保障。
 type Provider struct {
-	mu              sync.Mutex
-	writeMu         *sync.Mutex // 方言要求写串行化时非 nil（SQLite 单写者）
-	db              *sql.DB
-	st              stmts
-	hasNumCol       bool // 方言是否使用数值投影列 n
-	incrDeltaParams int  // 口语化命名；实际来自方言 IncrDeltaParams
-	closed          bool
+	mu        sync.Mutex
+	writeMu   *sync.Mutex // 方言要求写串行化时非 nil（SQLite 单写者）
+	db        *sql.DB
+	st        stmts
+	dialect   Dialect // 保留方言：IncrSQL 的参数装配需按占位符风格判定
+	hasNumCol bool    // 方言是否使用数值投影列 n
+	closed    bool
 }
 
-// New 在既有 *sql.DB 上构造基座并执行建表与过期清理。
+// New 在既有 *sql.DB 上构造基座：建表、升级旧库 schema、清理过期行。
 func New(db *sql.DB, d Dialect) (*Provider, error) {
 	// 空 DDL 跳过（如 MySQL 索引已内联建表）。
 	for _, ddl := range []string{d.KvDDL, d.QSeqDDL, d.QItemsDDL, d.ZDDL, d.ZIdxDDL} {
@@ -359,11 +419,10 @@ func New(db *sql.DB, d Dialect) (*Provider, error) {
 			return nil, fmt.Errorf("sqlstore: migrate (%s): %w", d.Name, err)
 		}
 	}
-	ndp := d.IncrDeltaParams
-	if ndp <= 0 {
-		ndp = 1
+	if err := migrate(db, d); err != nil {
+		return nil, fmt.Errorf("sqlstore: migrate (%s): %w", d.Name, err)
 	}
-	p := &Provider{db: db, st: makeStmts(d), hasNumCol: d.HasNumCol, incrDeltaParams: ndp}
+	p := &Provider{db: db, st: makeStmts(d), dialect: d, hasNumCol: d.HasNumCol}
 	if d.SerializeWrites {
 		p.writeMu = &sync.Mutex{}
 	}
@@ -372,6 +431,84 @@ func New(db *sql.DB, d Dialect) (*Provider, error) {
 		return nil, fmt.Errorf("sqlstore: cleanup (%s): %w", d.Name, err)
 	}
 	return p, nil
+}
+
+// migrate 处理 CREATE TABLE IF NOT EXISTS 覆盖不到的旧库 schema 升级。
+//
+// 目前只有 SQLite 的数值投影列 n：该列是后加的（此前 kv_items 只有 k/v/expire_at），
+// 旧库升级后建表语句是 no-op，所有写路径都会报 "table kv_items has no column
+// named n"。这里用 PRAGMA 检测缺列 -> 加列 -> 回填整数投影，全程一个事务，
+// 可重复执行（幂等）。
+func migrate(db *sql.DB, d Dialect) error {
+	if !d.HasNumCol {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query("PRAGMA table_info(kv_items)")
+	if err != nil {
+		return err
+	}
+	hasN := false
+	for rows.Next() {
+		var (
+			cid, notnull, pk int
+			name, ctype      string
+			dflt             any
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "n" {
+			hasN = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if !hasN {
+		if _, err := tx.Exec("ALTER TABLE kv_items ADD COLUMN n INTEGER NULL"); err != nil {
+			return err
+		}
+	}
+	// 回填：把已有行的 n 按 numProjection 规则补齐（非整数保持 NULL）。
+	// 用 Go 侧解析而不是 SQL CAST，保证与写路径的"十进制 int64"判定完全一致。
+	br, err := tx.Query("SELECT k, v FROM kv_items WHERE n IS NULL")
+	if err != nil {
+		return err
+	}
+	type kvPair struct {
+		k, v []byte
+	}
+	var pairs []kvPair
+	for br.Next() {
+		var k, v []byte
+		if err := br.Scan(&k, &v); err != nil {
+			br.Close()
+			return err
+		}
+		if numProjection(v) != nil {
+			pairs = append(pairs, kvPair{k, v})
+		}
+	}
+	if err := br.Err(); err != nil {
+		br.Close()
+		return err
+	}
+	br.Close()
+	for _, p := range pairs {
+		if _, err := tx.Exec("UPDATE kv_items SET n = ? WHERE k = ?", numProjection(p.v), p.k); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (p *Provider) check() error {
@@ -411,10 +548,12 @@ func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 	if err := p.check(); err != nil {
 		return err
 	}
+	// 参数顺序须与 kvSetTemplate 一致：k, v[, n], now（now 供冲突子句清过期）。
 	args := []any{bs(key), value}
 	if p.hasNumCol {
 		args = append(args, numProjection(value))
 	}
+	args = append(args, time.Now().Unix())
 	if _, err := p.db.ExecContext(ctx, p.st.kvUpsert, args...); err != nil {
 		return fmt.Errorf("sqlstore: set: %w", err)
 	}
@@ -497,8 +636,8 @@ func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, er
 		return 0, err
 	}
 	// 快路径：PostgreSQL/SQLite 用单语句 upsert + RETURNING 完成
-	// 「缺失按 0 起算 + 原子累加 + 校验非整数 + 取回新值」，一条语句一次 fsync，
-	// 实测约为事务多语句路径的 2 倍吞吐（见 README 性能一节）。
+	// 「缺失按 0 起算 + 原子累加 + 校验非整数 + 已过期按不存在 + 取回新值」，
+	// 一条语句一次 fsync，实测约为事务多语句路径的 2 倍吞吐（见 README 性能一节）。
 	if p.st.kvIncrOne != "" {
 		return p.incrOne(ctx, key, delta)
 	}
@@ -514,16 +653,28 @@ func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, er
 		return 0, fmt.Errorf("sqlstore: incr seed: %w", err)
 	}
 
+	now := time.Now().Unix()
 	var raw []byte
-	if err := tx.QueryRowContext(ctx, p.st.kvIncrSelect, bs(key)).Scan(&raw); err != nil {
+	var expireAt int64
+	if err := tx.QueryRowContext(ctx, p.st.kvIncrSelect, bs(key)).Scan(&raw, &expireAt); err != nil {
 		return 0, fmt.Errorf("sqlstore: incr select: %w", err)
 	}
-	cur, e := strconv.ParseInt(string(raw), 10, 64)
-	if e != nil {
-		return 0, core.ErrNotInteger
+	// 已过期的键契约上视为不存在：忽略陈旧值，从 0 起算并清除过期时间。
+	expired := expireAt > 0 && expireAt <= now
+	var cur int64
+	if !expired {
+		v, e := strconv.ParseInt(string(raw), 10, 64)
+		if e != nil {
+			return 0, core.ErrNotInteger
+		}
+		cur = v
 	}
 	newVal := cur + delta
-	if _, err := tx.ExecContext(ctx, p.st.kvIncrUpdate, strconv.FormatInt(newVal, 10), bs(key)); err != nil {
+	newExpire := expireAt
+	if expired {
+		newExpire = 0
+	}
+	if _, err := tx.ExecContext(ctx, p.st.kvIncrUpdate, strconv.FormatInt(newVal, 10), newExpire, bs(key)); err != nil {
 		return 0, fmt.Errorf("sqlstore: incr update: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -533,20 +684,18 @@ func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, er
 }
 
 // incrOne 是单语句自增快路径。方言的 IncrSQL 在既有值非十进制整数时
-// 不匹配 WHERE（SQLite/PG），语句因此不返回任何行——据此映射 ErrNotInteger。
+// 不匹配 WHERE（SQLite/PG），语句因此不返回任何行——据此映射 ErrNotInteger；
+// 已过期的行会被语句按"不存在"处理（从 0 起算并清除 expire_at）。
 // 行被原子地加锁并更新，无需显式事务。
 func (p *Provider) incrOne(ctx context.Context, key string, delta int64) (int64, error) {
 	var newVal int64
 	// 增量以文本形态传参：SQLite 的 CAST(? AS INTEGER/TEXT) 与
 	// PG 的 ?::bigint 都能由文本隐式/显式转换，避免 pgx 对 int64->text 编码失败。
 	ds := strconv.FormatInt(delta, 10)
-	args := []any{bs(key), ds}
-	for i := 1; i < p.incrDeltaParams; i++ {
-		args = append(args, ds)
-	}
+	args := expandArgs(p.dialect, p.dialect.IncrSQL, []any{bs(key), ds, time.Now().Unix()})
 	err := p.db.QueryRowContext(ctx, p.st.kvIncrOne, args...).Scan(&newVal)
 	if errors.Is(err, sql.ErrNoRows) {
-		// upsert 未命中：key 已存在且值不是十进制整数。
+		// upsert 未命中：key 已存在、未过期且值不是十进制整数。
 		return 0, core.ErrNotInteger
 	}
 	if err != nil {
@@ -642,7 +791,9 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
-	if _, err := p.db.ExecContext(ctx, p.st.kvExpire, time.Now().Unix()+ttl, bs(key)); err != nil {
+	now := time.Now().Unix()
+	// 参数：新过期时间、key、当前秒（用于把"已过期 = 不存在"写进 WHERE，不复活过期键）。
+	if _, err := p.db.ExecContext(ctx, p.st.kvExpire, now+ttl, bs(key), now); err != nil {
 		return fmt.Errorf("sqlstore: expire: %w", err)
 	}
 	return nil
@@ -946,11 +1097,10 @@ func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (in
 	return s, nil
 }
 
-// normalizeLimit 与 mem/ssdb/redis 基座相同的默认页大小约定。
+// normalizeLimit 与 mem/ssdb/redis 基座相同的默认页大小约定（统一取 core 常量）。
 func normalizeLimit(limit int) int {
-	const defaultLimit = 100 // 与 core.DefaultScanLimit 对齐
 	if limit <= 0 {
-		return defaultLimit
+		return core.DefaultScanLimit
 	}
 	return limit
 }
@@ -1012,6 +1162,7 @@ func (p *Provider) batchOp(ctx context.Context, tx *sql.Tx, op core.BatchOp, now
 		if p.hasNumCol {
 			args = append(args, numProjection(op.Value))
 		}
+		args = append(args, now) // kvUpsert 的冲突子句需要"当前秒"以清除已过期 TTL
 		_, err := tx.ExecContext(ctx, p.st.kvUpsert, args...)
 		return err
 	case core.BatchSetEx:
@@ -1025,7 +1176,7 @@ func (p *Provider) batchOp(ctx context.Context, tx *sql.Tx, op core.BatchOp, now
 		_, err := tx.ExecContext(ctx, p.st.kvDel, bs(op.Key))
 		return err
 	case core.BatchExpire:
-		_, err := tx.ExecContext(ctx, p.st.kvExpire, now+op.TTL, bs(op.Key))
+		_, err := tx.ExecContext(ctx, p.st.kvExpire, now+op.TTL, bs(op.Key), now)
 		return err
 	case core.BatchQPush:
 		return p.qpushTx(ctx, tx, op.Key, op.Value, false)

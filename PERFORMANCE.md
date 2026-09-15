@@ -48,6 +48,12 @@
   Incr 约 20 万 op/s，在 drvfs(9p) 上约 1.7k op/s，差 ~100 倍）；
 - SSDB/Redis 单操作受**网络往返**支配（本机容器 ~0.4–0.6 ms/次），并发靠连接池放大。
 
+注：`Get` 类数值已包含**返回值的深拷贝**（mem/jsonl 为保证调用方无法绕过 API
+篡改库内状态，见 README「各基座差异」）；拷贝成本与 value 大小成正比，~20B 的
+value 下可忽略（实测 mem 的 `Get` 与 `Set` 同为 ~210ns/op）。文件基座的 `Set`
+在 drvfs(9p) 上受 fsync 影响极大：同一 bolt 代码在 9p 上约 8.0ms/op，在 /dev/shm
+上约 16µs/op。
+
 ## 3. 写入成本模型（每操作）
 
 | 操作 | mem | jsonl | bolt | sqlite / pg | mysql | redis | ssdb |

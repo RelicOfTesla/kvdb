@@ -21,7 +21,7 @@ n, err := db.Incr(ctx, "visits", 1)
 - **接口化返回**：`kvdb.Open` 返回接口 `DB`，业务可窄依赖 `KvProvider` 等子接口，便于 mock
 - **批量写**：一批操作映射到各基座原生机制（事务 / MULTI/EXEC / 流水线 / 单次 flush）
 - **字节 ↔ 泛型辅助**：`B` / `P` / `D` / `DMust` 支持标量与结构体（默认 JSON，编解码可替换），标量编码与 `Incr` 互操作
-- **Go 1.27.1+ 可选薄壳**：`kvdb.Typed(db)` 提供 `db.Get[T](...)` 泛型方法（构建约束隔离，不影响旧版本）
+- **Go 1.27.1+ 可选薄壳**：`kvdb.Typed(db)` 提供 `db.Get[T](...)` 泛型方法（构建约束隔离）
 - 纯 Go 依赖，无 CGO
 
 需要 Go 1.25+。依赖按基座引入：`sqlite`（modernc.org/sqlite）、`mysql`
@@ -198,53 +198,26 @@ func init() {
 
 ### Go 1.27.1+：`TypedDB` 薄壳（`db.Get[T](...)`）
 
-用 Go 1.27.1+ 构建时会额外提供 `TypedDB` 薄壳，把「取字节 + 解码」合并为泛型方法
-（方法级类型参数需 1.27.1+）：
-
 ```go
 tdb := kvdb.Typed(db)
 u, err := tdb.Get[User](ctx, "user:1")    // = kvdb.D[User](db.Get(ctx, "user:1"))
-n, err := tdb.Get[int64](ctx, "visits")
+n, err := tdb.Get[int64](ctx, "visits")   // 标量走文本编码，与 Incr 互操作
 job, err := tdb.QPop[string](ctx, "jobs")
 ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 ```
 
-- 提供 `Get` / `GetOK` / `MGet` / `QPop` / `QPopBack` / `QFront` / `QBack`；
-  缺失的 key 返回 `ErrNotFound`（`GetOK` 保留 `ok` 语义）；
-- 编码解码复用 `B`/`P` 与可替换的 `Marshal`/`Unmarshal`，标量仍与 `Incr` 互操作；
-- 其余方法（`Set` / `QPush` / `ZSet` / `Batch` / `Close` …）经内嵌 `DB` 直接透传；
-  但泛型方法会遮蔽同名方法，**`TypedDB` 不再满足 `DB` 接口**，需要 DB 语义时用
-  `tdb.DB` 或保留原始 `db`；
-- 需要 **Go 1.27.1+**（方法级类型参数自 1.27 起支持，但 1.27.0 有泛型方法相关的
-  编译器缺陷，如 [golang/go#81195](https://github.com/golang/go/issues/81195) 的
-  `malformed linker symbol`，已在 1.27.1 修复）。实现放在带 `//go:build go1.27`
-  约束的文件中，**本模块和消费方的 `go` 指令都无需抬高**：1.27 之前的工具链不编译
-  此文件，`TypedDB` / `Typed` 不存在，其余功能不受影响。
-
-版本/门禁实测矩阵（同一份探针代码，`go.mod` 写 `go 1.25.0`；✅ 编译、❌ 报错）：
-
-| 探针 | go1.25.1 | go1.26.5 | go1.26.6 | go1.27.1 |
-| --- | --- | --- | --- | --- |
-| 泛型方法，无构建标签 | ❌ `method must have no type parameters` | ❌ 同左 | ❌ 同左 | ❌ `generic method requires go1.27 or later (-lang was set to go1.25; check go.mod)` |
-| 泛型方法，`//go:build go1.27` | 文件被排除 | 文件被排除 | 文件被排除 | ✅ |
-| 泛型方法，`//go:build go1.26` | 文件被排除 | 文件被排除 | 文件被排除 | ❌ `generic method requires go1.27 or later (file declares //go:build go1.26)` |
-| 文件名 `xxx_go1.26.5.go` / `xxx_go1265.go` / `xxx_go1.99.go` | ✅ 全被编译 | ✅ | ✅ | ✅ |
-| 仅 `//go:build go1.26.5`（补丁级标签） | 文件被排除 | 文件被排除 | 文件被排除 | 文件被排除 |
-| `go.mod` 写 `go 1.26.5` / `go 1.26.6` | 合法，但要求 1.26.5+ 工具链 | ✅ | ✅ | ✅ |
-
-由此可确认三点：
-
-1. **补丁级构建标签不存在**：`ReleaseTags` 只有 `… go1.25` / `… go1.26` / `… go1.27`，
-   写 `//go:build go1.26.5` 永远不成立，而且**不报错**（静默排除文件），所以无法表达
-   "1.27.1+"，只能按 1.27 系列放行。`go.mod` 里写补丁级 `go` 指令倒合法，但那是工具链
-   下限，不是文件门禁。
-2. **文件名后缀不产生任何约束**：Go 只认 `*_GOOS` / `*_GOARCH` / `*_GOOS_GOARCH`；
-   `xxx_go1.99.go` 在 go1.25.1 上照样编译。`typed_go1.27.go` 里的 `go1.27` 纯属可读性
-   命名，真正的门禁是文件内的 `//go:build` 行。
-3. **`//go:build go1.27` 一举两得**：既是文件选择门禁，又会按 Go 规则把该文件的
-   language version 抬到 `go1.27`（cmd/go 依文件内的 `go1.N` 约束传 `-lang`），这正是
-   `go.mod` 只写 `go 1.25.0` 也能用 `db.Get[T](...)` 的原因；去掉这行就会在 1.27.1 上
-   编译失败（见上表），所以**不要**为了"顺便兼容 1.25"而删掉它。
+- 提供 `Get` / `GetOK` / `MGet` / `QPop` / `QPopBack` / `QFront` / `QBack`，
+  缺失的 key 返回 `ErrNotFound`（`GetOK` 保留 `ok` 语义）；编码复用 `B`/`P`
+  与可替换的 `Marshal`/`Unmarshal`；
+- 其余方法经内嵌 `DB` 透传；泛型方法会遮蔽同名方法，**`TypedDB` 不满足 `DB`
+  接口**，需要 DB 语义时用 `tdb.DB` 或保留原始 `db`；
+- 版本与门禁：方法级类型参数自 Go 1.27 起支持，但 1.27.0 存在泛型方法相关的
+  编译器缺陷（[golang/go#81195](https://github.com/golang/go/issues/81195)），
+  建议 **1.27.1+**。实现在带 `//go:build go1.27` 的文件中，该行既是文件门禁
+  （低版本工具链不编译它，`TypedDB` / `Typed` 不存在，其余功能不受影响），又把
+  该文件的 language version 抬到 `go1.27`，因此**本模块与消费方的 `go` 指令都
+  无需抬高**。构建标签只有系列级（没有补丁级标签），无法表达"1.27.1+"；
+  文件名后缀没有约束语义，`typed_go1.27.go` 中的 `go1.27` 仅为命名。
 
 ## 语义要点
 
@@ -268,16 +241,15 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 | 差异点 | 处理 |
 |---|---|
 | SSDB `scan` 是 start 开区间 | ssdb 基座对存在的 start 键做一次 get 补偿，对外仍为闭区间 |
-| Redis 无字节序范围扫描 | redis 基座全量 SCAN + 客户端过滤排序，**只扫描 KV 前缀**；代价与 KV 键数量相关 |
+| Redis 无字节序范围扫描 | redis 基座 SCAN KV 前缀 + 客户端过滤排序，代价与 KV 键数量相关 |
+| Redis keyspace | 三类数据自动加 `kvdb:kv:` / `kvdb:q:` / `kvdb:z:` 前缀，保证命名空间独立 |
+| Redis 的 `Set` | 用 `SET ... KEEPTTL` 保持既有 TTL（需 Redis ≥ 6.0） |
 | SQL 过期行 | 读取路径过滤，开库时清理一次 |
 | SQLite 并发写 | 进程内写串行化（单写者），WAL 保留读并行 |
 | BoltDB 并发写 | 单写者、多读者（MVCC）；写操作按 bbolt 事务串行提交 |
-| Redis 的 `Set` | 用 `SET ... KEEPTTL` 保持既有 TTL（需 Redis ≥ 6.0） |
-| Redis 键前缀 | 三类数据共用一个 keyspace，基座自动加 `kvdb:kv:` / `kvdb:q:` / `kvdb:z:` 前缀，保证命名空间独立；**前缀属于数据布局**，旧版本写入的裸 key 数据不再可见（`SCAN kvdb:kv:*` 可导出旧数据） |
-| SQL 键长 | MySQL 键列上限 255 字节（兼容 5.6 默认索引前缀）；PostgreSQL/SQLite 用 BYTEA/BLOB 无此限制 |
-| SQL schema 变更 | **尚未发 tag，不做旧库兼容**：模块既不迁移也不探测，旧库请手动删除重建（表已存在时建表语句 `IF NOT EXISTS` 不生效，旧结构会在写入时报错） |
-| 过期键的写语义 | 所有基座统一"已过期 = 不存在"：过期后 `Set` 不继承旧 TTL、`Incr` 从 0 起算、`Expire` 不复活 |
-| 读返回值所有权 | `Get`/`MGet`/`Scan`/`QFront`/`QBack` 一律返回副本，调用方改写不影响库内状态（mem/jsonl 曾是内部切片别名） |
+| SQL 键长 | MySQL 键列上限 255 字节（兼容 5.6 默认索引前缀）；PG / SQLite 用 BYTEA/BLOB 无此限制 |
+| 过期键的写语义 | 所有基座统一"已过期 = 不存在"：`Set` 不继承旧 TTL、`Incr` 从 0 起算、`Expire` 不复活 |
+| 读返回值所有权 | `Get`/`MGet`/`Scan`/`QFront`/`QBack` 返回副本，调用方改写不影响库内状态 |
 
 ## 扩展：自定义基座
 
@@ -310,8 +282,7 @@ func init() {
 | Redis | 7.x |
 | SSDB | 原生协议，支持 `server.auth` |
 
-SQLite 采用纯 Go 驱动：实测在真实存储上，纯 Go 与 CGO（mattn/go-sqlite3）
-吞吐基本一致（瓶颈是每事务的持久化，而非驱动实现），因此不引入 CGO 依赖。
+SQLite 采用纯 Go 驱动（modernc），吞吐与 CGO 驱动相当，不引入 CGO 依赖。
 
 ## 性能
 
@@ -356,8 +327,9 @@ KVDB_TEST_REDIS_ADDR=127.0.0.1:6379 \
 | `KVDB_TEST_SSDB_ADDR` | SSDB 地址（用例前 flushdb） |
 | `KVDB_TEST_SSDB_AUTH_ADDR` / `KVDB_TEST_SSDB_AUTH_PASS` | 启用 `server.auth` 的 SSDB 实例 |
 
-所有基座共用 `internal/behaviortest` 的合同用例（KV / Queue / ZSet / Batch，
-含并发原子性）；SSDB 另用进程内假服务器交叉验证线协议编码。
+所有基座共用 `internal/behaviortest` 的合同用例（KV / Queue / ZSet / Batch /
+过期写语义 / 返回值所有权 / 命名空间，含并发原子性）；SSDB 另用进程内假服务器
+交叉验证线协议编码。
 
 ## 目录结构
 

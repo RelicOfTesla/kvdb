@@ -137,7 +137,7 @@ func TestTypedPassthrough(t *testing.T) {
 		t.Fatalf("Batch 写入后 Get = %q, %v", v, err)
 	}
 
-	// 泛型方法遮蔽后 TypedDB 不再满足 DB，但可通过内嵌字段取回
+	// 泛型方法遮蔽后 TypedDB 不满足 DB，但可通过内嵌字段取回
 	var asDB kvdb.DB = tdb.DB
 	if v, ok, err := asDB.Get(ctx, "k"); err != nil || !ok || string(v) != "v" {
 		t.Fatalf("底层 DB Get = %q,%v,%v", v, ok, err)

@@ -57,7 +57,7 @@ type Config struct {
 	// Password 非空时在 Open 阶段自动执行 auth；密码错返回 ErrAuth。
 	Password string
 	// PoolSize 是并发连接上限，<=0 取 DefaultPoolSize。SSDB 单连接为串行
-	// 请求-应答，池化让并发调用真正并行（此前单连接下并发无提升）。
+	// 请求-应答，池化让并发调用真正并行。
 	PoolSize int
 }
 

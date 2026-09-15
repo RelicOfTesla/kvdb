@@ -52,7 +52,6 @@ type Dialect struct {
 	IncrSQL string
 	// HasNumCol 表示 kv_items 有数值投影列 n（供单语句 Incr 使用）；
 	// 为 true 时 Set/SetEx 必须同步维护 n，否则 Incr 会误判为非整数。
-	// 该列是后加的；未发 tag 期间不做旧库兼容，旧表请手动删除重建。
 	HasNumCol bool
 	// SerializeWrites 为 true 时基座在进程内串行化全部写操作（单写者模型）。
 	// SQLite 需要：多连接并发写即使有 busy_timeout 也会在持续竞争下报
@@ -408,7 +407,7 @@ type Provider struct {
 	closed    bool
 }
 
-// New 在既有 *sql.DB 上构造基座：建表、升级旧库 schema、清理过期行。
+// New 在既有 *sql.DB 上构造基座：建表、清理过期行。
 func New(db *sql.DB, d Dialect) (*Provider, error) {
 	// 空 DDL 跳过（如 MySQL 索引已内联建表）。
 	for _, ddl := range []string{d.KvDDL, d.QSeqDDL, d.QItemsDDL, d.ZDDL, d.ZIdxDDL} {

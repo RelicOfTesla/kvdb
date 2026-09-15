@@ -577,9 +577,7 @@ func TestAuth(t *testing.T) {
 }
 
 // TestAuthAppliesToWholePool 验证显式 Auth 是**池级**的：认证一次之后，
-// 池中所有（含后续新建的）连接都必须已认证。
-// 旧实现只认证当次借出的那一条连接且不更新池级密码，并发请求会大量命中
-// 未认证连接并报 "authentication required"。
+// 池中所有（含后续新建的）连接都必须已认证，并发请求不得命中未认证连接。
 func TestAuthAppliesToWholePool(t *testing.T) {
 	ctx := context.Background()
 	const pass = "0123456789abcdef0123456789abcdef"

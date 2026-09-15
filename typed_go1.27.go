@@ -9,24 +9,16 @@ import (
 	"fmt"
 )
 
-// TypedDB 是 DB 的薄壳，建议 Go 1.27.1+：本文件带 go1.27 构建约束，未满足时
-// 工具链不会编译它（因此 kvdb.TypedDB / kvdb.Typed 在更低版本下不存在），而模块
-// 本身仍保持较低的 go 指令，其余代码照常可用。
+// TypedDB 是 DB 的薄壳，需要 Go 1.27.1+：方法级类型参数自 1.27 起支持，
+// 1.27.0 存在泛型方法相关的编译器缺陷（golang/go#81195，1.27.1 修复）。
 //
-// 版本口径与门禁（实测矩阵见 README 的「TypedDB 薄壳」小节）：
-//   - 方法级类型参数自 Go 1.27（含 1.27.0）起支持；1.27.0 存在泛型方法相关的编译器
-//     缺陷（指针别名接收者的 malformed linker symbol，golang/go#81195，1.27.1 修复），
-//     故建议 1.27.1+；
-//   - 构建标签只有系列级：ReleaseTags 里没有 go1.27.0 / go1.27.1（也没有 go1.26.5）
-//     这类补丁级标签，所以 //go:build go1.27.1 永远不成立，而且不报错，只会静默
-//     排除文件——无法用它表达"1.27.1+"；
-//   - 上面这行 //go:build go1.27 同时干两件事：① 1.27 之前的工具链不编译该文件
-//     （1.25.1 / 1.26.6 下 kvdb.TypedDB / kvdb.Typed 不存在，其余 API 照常）；
-//     ② 按 Go 规则把该文件的 language version 抬到 go1.27（cmd/go 依文件内的
-//     go1.N 约束传 -lang），因此模块与消费方的 go 指令都无需抬高。实测去掉本行、
-//     go.mod 写 go 1.25 时，1.27.1 报 "generic method requires go1.27 or later
-//     (-lang was set to go1.25; check go.mod)"；写成 //go:build go1.26 则报
-//     "... (file declares //go:build go1.26)"；只有 go1.27 能通过。
+// 门禁说明：
+//   - 本文件带 //go:build go1.27：更低版本的工具链不编译它，kvdb.TypedDB / Typed
+//     不存在，其余 API 不受影响；
+//   - 该行同时把本文件的 language version 抬到 go1.27（cmd/go 依文件内的 go1.N
+//     约束传 -lang），因此模块与消费方的 go 指令都无需抬高；
+//   - 构建标签只有系列级（没有 go1.27.0 / go1.27.1 这类补丁级标签），无法表达
+//     "1.27.1+"，只能按 1.27 系列放行。
 //
 // 薄壳把「取字节 + 解码」合并为泛型方法：
 //
@@ -38,7 +30,7 @@ import (
 // 编码/解码沿用 B/P/D 的规则与可替换的 Marshal/Unmarshal（见 bytes.go）。
 //
 // 注意：泛型方法 Get/GetOK/MGet/QPop/QPopBack/QFront/QBack 会遮蔽内嵌 DB 的同名
-// 方法，因此 TypedDB **不再满足 DB 接口**。其余方法（Set/QPush/ZSet/Batch/Close…）
+// 方法，因此 TypedDB 不满足 DB 接口。其余方法（Set/QPush/ZSet/Batch/Close…）
 // 仍经内嵌字段直接透传；需要 DB 语义时用 tdb.DB 或保留原始 db。
 type TypedDB struct {
 	DB

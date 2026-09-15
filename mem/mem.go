@@ -552,8 +552,8 @@ func (p *Provider) zincrLocked(name, key string, delta int64) int64 {
 
 // ---- 工具 ----
 
-// normalizeLimit 保证 limit<=0 时使用与 core.DefaultScanLimit 一致的页大小。
-// 统一取 core 常量（不再各处内联 100），改默认值只需改一处。
+// normalizeLimit 保证 limit<=0 时使用 core.DefaultScanLimit 的页大小，
+// 改默认值只需改一处。
 func normalizeLimit(limit int) int {
 	if limit <= 0 {
 		return core.DefaultScanLimit

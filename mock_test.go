@@ -11,7 +11,7 @@ import (
 
 // fakeKV 是只实现 KV 能力的最小 mock：证明业务函数可以只依赖窄接口
 // （kvdb.KvProvider 等 core 能力接口），测试里无需实现 Queue/ZSet/Batch——这些
-// 接口 core 已经提供，根包不再重复定义。
+// 接口 core 已经提供，根包不重复定义。
 type fakeKV struct {
 	data   map[string][]byte
 	failOn string // 命中该 key 的 Set 返回错误

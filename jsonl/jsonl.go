@@ -145,7 +145,7 @@ func (p *Provider) replay() error {
 			return nil
 		}
 		line, no := *deferred, lineNo
-		deferred = nil // 先取走：调用方据返回值判定，不再依赖残留状态
+		deferred = nil // 先取走：调用方据返回值判定，不依赖残留状态
 		if line == "" {
 			return nil
 		}

@@ -51,7 +51,6 @@ var (
 // 三类数据共存于同一个 Redis keyspace，而 core.KvProvider 约定"命名空间彼此独立"，
 // 因此用前缀隔离：同名 KV 键 / 队列 / zset 互不干扰，Scan 也只扫描 KV 前缀
 // （否则会在 List/Sorted Set 键上触发 WRONGTYPE）。
-// 注意：前缀是数据布局的一部分，与"裸 key 写入"的旧版本数据不兼容。
 const (
 	kvPrefix = "kvdb:kv:"
 	qPrefix  = "kvdb:q:"

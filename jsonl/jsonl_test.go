@@ -7,8 +7,8 @@ import (
 	"testing"
 
 	"github.com/RelicOfTesla/kvdb/core"
-	"github.com/RelicOfTesla/kvdb/kvdbtest"
 	"github.com/RelicOfTesla/kvdb/jsonl"
+	"github.com/RelicOfTesla/kvdb/kvdbtest"
 )
 
 // factory 每个用例使用独立临时文件。
@@ -23,7 +23,7 @@ func factory(t *testing.T) core.KvProvider {
 }
 
 func TestBehavior(t *testing.T) {
-	kvdbtest.Run(t, factory)
+	kvdbtest.RunWithOptions(t, kvdbtest.VirtualClock(t), factory)
 }
 
 // TestReopen 验证 WAL 回放恢复 KV/Queue/ZSet/Incr/TTL 状态。

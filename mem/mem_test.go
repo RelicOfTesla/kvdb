@@ -10,7 +10,7 @@ import (
 )
 
 func TestBehavior(t *testing.T) {
-	kvdbtest.Run(t, func(t *testing.T) core.KvProvider {
+	kvdbtest.RunWithOptions(t, kvdbtest.VirtualClock(t), func(t *testing.T) core.KvProvider {
 		return mem.New()
 	})
 }

@@ -58,3 +58,7 @@ var (
 func Open(ctx context.Context, uri string) (DB, error) {
 	return open(ctx, uri)
 }
+
+// Now 是基座取当前时刻的唯一入口（可注入），等价于 core.Now。
+// 测试里 `defer func(old func() time.Time){ core.Now = old }(kvdb.Now)` 后改写 kvdb.Now 即可。
+var Now = core.Now

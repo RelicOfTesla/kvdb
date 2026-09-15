@@ -65,7 +65,7 @@ func Open(ctx context.Context, path string, cfg Config) (*Provider, error) {
 		return nil, err
 	}
 	// init 已做过一次全量清理，节流起点从现在起算。
-	p.lastSweep.Store(time.Now().Unix())
+	p.lastSweep.Store(core.NowUnix())
 	return p, nil
 }
 
@@ -105,7 +105,7 @@ func (p *Provider) init() error {
 			}
 		}
 		// 打开时清理已过期项（运行期读取路径同样会过滤）。
-		return cleanupExpired(tx, time.Now().Unix())
+		return cleanupExpired(tx, core.NowUnix())
 	})
 }
 
@@ -139,7 +139,7 @@ func (p *Provider) update(fn func(*bolt.Tx) error) error {
 		// 写事务开头按节流回收过期条目：TTL 磨损负载下过期键可能不再被
 		// 任何写触碰，挂在写事务上保证长期运行进程的磁盘占用有界
 		//（Open 时另有一次全量清理）。清理失败回滚整个事务，可重试。
-		now := time.Now().Unix()
+		now := core.NowUnix()
 		if now-p.lastSweep.Load() >= sweepInterval {
 			p.lastSweep.Store(now)
 			if err := cleanupExpired(tx, now); err != nil {
@@ -253,7 +253,7 @@ func kvSetExTx(tx *bolt.Tx, key string, value []byte, ttl int64) error {
 		return err
 	}
 	// AddTTL 饱和：now+ttl 溢出为负再经 uint64 编码会被所有读者判"已过期"。
-	return tx.Bucket(bTTL).Put([]byte(key), be64(uint64(core.AddTTL(time.Now().Unix(), ttl))))
+	return tx.Bucket(bTTL).Put([]byte(key), be64(uint64(core.AddTTL(core.NowUnix(), ttl))))
 }
 
 func kvDelTx(tx *bolt.Tx, key string) error {
@@ -572,7 +572,7 @@ func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 	// now 在事务内采样：等待 bbolt 单写者锁期间若跨过键的过期点，
 	// 事务外的陈旧 now 会让 kvSetTx 保留已失效的 TTL（写成功却不可见）。
 	return p.update(func(tx *bolt.Tx) error {
-		return kvSetTx(tx, key, value, time.Now().Unix())
+		return kvSetTx(tx, key, value, core.NowUnix())
 	})
 }
 
@@ -586,7 +586,7 @@ func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	var out []byte
 	var ok bool
 	err := p.view(func(tx *bolt.Tx) error {
-		now := time.Now().Unix()
+		now := core.NowUnix()
 		k := []byte(key)
 		v := tx.Bucket(bKV).Get(k)
 		if v == nil || ttlExpired(tx, k, now) {
@@ -607,7 +607,7 @@ func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 	_ = ctx
 	var ok bool
 	err := p.view(func(tx *bolt.Tx) error {
-		now := time.Now().Unix()
+		now := core.NowUnix()
 		k := []byte(key)
 		v := tx.Bucket(bKV).Get(k)
 		ok = v != nil && !ttlExpired(tx, k, now)
@@ -620,7 +620,7 @@ func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, er
 	_ = ctx
 	var out int64
 	err := p.update(func(tx *bolt.Tx) error {
-		n, err := kvIncrTx(tx, key, delta, time.Now().Unix())
+		n, err := kvIncrTx(tx, key, delta, core.NowUnix())
 		if err != nil {
 			return err
 		}
@@ -634,7 +634,7 @@ func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte,
 	_ = ctx
 	out := make(map[string][]byte, len(keys))
 	err := p.view(func(tx *bolt.Tx) error {
-		now := time.Now().Unix()
+		now := core.NowUnix()
 		b := tx.Bucket(bKV)
 		for _, key := range keys {
 			k := []byte(key)
@@ -654,7 +654,7 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 	limit = normalizeLimit(limit)
 	var out []core.KeyValue
 	err := p.view(func(tx *bolt.Tx) error {
-		now := time.Now().Unix()
+		now := core.NowUnix()
 		c := tx.Bucket(bKV).Cursor()
 		var k, v []byte
 		if start != "" {
@@ -681,7 +681,7 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 
 func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	_ = ctx
-	return p.update(func(tx *bolt.Tx) error { return kvExpireTx(tx, key, ttl, time.Now().Unix()) })
+	return p.update(func(tx *bolt.Tx) error { return kvExpireTx(tx, key, ttl, core.NowUnix()) })
 }
 
 func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
@@ -689,7 +689,7 @@ func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
 	var secs int64
 	var ok bool
 	err := p.view(func(tx *bolt.Tx) error {
-		now := time.Now().Unix()
+		now := core.NowUnix()
 		v := tx.Bucket(bTTL).Get([]byte(key))
 		if v == nil || len(v) != 8 {
 			return nil
@@ -862,7 +862,7 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 		}
 	}
 	return p.update(func(tx *bolt.Tx) error {
-		now := time.Now().Unix() // 整批共享同一"当前时刻"
+		now := core.NowUnix() // 整批共享同一"当前时刻"
 		for i, op := range ops {
 			var err error
 			switch op.Kind {

@@ -16,7 +16,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/RelicOfTesla/kvdb/core"
 )
@@ -416,12 +415,12 @@ func makeStmts(d Dialect) stmts {
 // Provider 是 SQL 基座。并发安全由 database/sql 连接池与事务保障。
 type Provider struct {
 	mu        sync.Mutex
-	writeMu   *sync.Mutex  // 方言要求写串行化时非 nil（SQLite 单写者）
+	writeMu   *sync.Mutex // 方言要求写串行化时非 nil（SQLite 单写者）
 	db        *sql.DB
 	st        stmts
-	dialect   Dialect      // 保留方言：IncrSQL 的参数装配需按占位符风格判定
-	hasNumCol bool         // 方言是否使用数值投影列 n
-	maxKeyLen int          // 方言键长上限（0 = 不限），写入侧校验
+	dialect   Dialect // 保留方言：IncrSQL 的参数装配需按占位符风格判定
+	hasNumCol bool    // 方言是否使用数值投影列 n
+	maxKeyLen int     // 方言键长上限（0 = 不限），写入侧校验
 	closed    atomic.Bool
 }
 
@@ -441,7 +440,7 @@ func New(db *sql.DB, d Dialect) (*Provider, error) {
 		p.writeMu = &sync.Mutex{}
 	}
 	// 打开时兜底清理已过期行（运行期读取路径已过滤）。
-	if _, err := db.Exec(p.st.kvCleanup, time.Now().Unix()); err != nil {
+	if _, err := db.Exec(p.st.kvCleanup, core.NowUnix()); err != nil {
 		return nil, fmt.Errorf("sqlstore: cleanup (%s): %w", d.Name, err)
 	}
 	return p, nil
@@ -505,7 +504,7 @@ func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 	if p.hasNumCol {
 		args = append(args, numProjection(value))
 	}
-	args = append(args, time.Now().Unix())
+	args = append(args, core.NowUnix())
 	if _, err := p.db.ExecContext(ctx, p.st.kvUpsert, args...); err != nil {
 		return fmt.Errorf("sqlstore: set: %w", err)
 	}
@@ -534,7 +533,7 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 	if err := p.checkLen("setex", key); err != nil {
 		return err
 	}
-	args := []any{bs(key), value, core.AddTTL(time.Now().Unix(), ttl)}
+	args := []any{bs(key), value, core.AddTTL(core.NowUnix(), ttl)}
 	if p.hasNumCol {
 		args = append(args, numProjection(value))
 	}
@@ -549,7 +548,7 @@ func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 		return nil, false, err
 	}
 	var v []byte
-	err := p.db.QueryRowContext(ctx, p.st.kvGet, bs(key), time.Now().Unix()).Scan(&v)
+	err := p.db.QueryRowContext(ctx, p.st.kvGet, bs(key), core.NowUnix()).Scan(&v)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
@@ -575,7 +574,7 @@ func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 		return false, err
 	}
 	var one int
-	err := p.db.QueryRowContext(ctx, p.st.kvExists, bs(key), time.Now().Unix()).Scan(&one)
+	err := p.db.QueryRowContext(ctx, p.st.kvExists, bs(key), core.NowUnix()).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -611,7 +610,7 @@ func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, er
 		return 0, fmt.Errorf("sqlstore: incr seed: %w", err)
 	}
 
-	now := time.Now().Unix()
+	now := core.NowUnix()
 	var raw []byte
 	var expireAt int64
 	if err := tx.QueryRowContext(ctx, p.st.kvIncrSelect, bs(key)).Scan(&raw, &expireAt); err != nil {
@@ -654,7 +653,7 @@ func (p *Provider) incrOne(ctx context.Context, key string, delta int64) (int64,
 	// 增量以文本形态传参：SQLite 的 CAST(? AS INTEGER/TEXT) 与
 	// PG 的 ?::bigint 都能由文本隐式/显式转换，避免 pgx 对 int64->text 编码失败。
 	ds := strconv.FormatInt(delta, 10)
-	args := expandArgs(p.dialect, p.dialect.IncrSQL, []any{bs(key), ds, time.Now().Unix()})
+	args := expandArgs(p.dialect, p.dialect.IncrSQL, []any{bs(key), ds, core.NowUnix()})
 	err := p.db.QueryRowContext(ctx, p.st.kvIncrOne, args...).Scan(&newVal)
 	if errors.Is(err, sql.ErrNoRows) {
 		// upsert 未命中：key 已存在、未过期且值不是十进制整数。
@@ -697,7 +696,7 @@ func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte,
 		for _, k := range chunk {
 			args = append(args, bs(k))
 		}
-		args = append(args, time.Now().Unix())
+		args = append(args, core.NowUnix())
 		rows, err := p.db.QueryContext(ctx, p.st.kvMGet(len(chunk)), args...)
 		if err != nil {
 			return nil, fmt.Errorf("sqlstore: mget: %w", err)
@@ -738,7 +737,7 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 	if hasEnd {
 		args = append(args, bs(end))
 	}
-	args = append(args, time.Now().Unix(), limit)
+	args = append(args, core.NowUnix(), limit)
 	rows, err := p.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("sqlstore: scan: %w", err)
@@ -768,7 +767,7 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	if err := p.checkLen("expire", key); err != nil {
 		return err
 	}
-	now := time.Now().Unix()
+	now := core.NowUnix()
 	// 参数：新过期时间、key、当前秒（用于把"已过期 = 不存在"写进 WHERE，不复活过期键）。
 	if _, err := p.db.ExecContext(ctx, p.st.kvExpire, core.AddTTL(now, ttl), bs(key), now); err != nil {
 		return fmt.Errorf("sqlstore: expire: %w", err)
@@ -788,7 +787,7 @@ func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
 	if err != nil {
 		return 0, false, fmt.Errorf("sqlstore: ttl: %w", err)
 	}
-	now := time.Now().Unix()
+	now := core.NowUnix()
 	if exp == 0 || exp <= now {
 		return -1, false, nil
 	}
@@ -1171,7 +1170,7 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 	}
 	defer tx.Rollback()
 
-	now := time.Now().Unix()
+	now := core.NowUnix()
 	for i, op := range ops {
 		if err := p.batchOp(ctx, tx, op, now); err != nil {
 			return fmt.Errorf("sqlstore: batch op %d (kind %d): %w", i, op.Kind, err)

@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strconv"
 	"sync"
-	"time"
 
 	"github.com/RelicOfTesla/kvdb"
 	"github.com/RelicOfTesla/kvdb/core"
@@ -85,7 +84,7 @@ func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 	if err := p.checkOpen(); err != nil {
 		return err
 	}
-	p.setLocked(key, value, time.Now().Unix())
+	p.setLocked(key, value, core.NowUnix())
 	return nil
 }
 
@@ -110,7 +109,7 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 	if err := p.checkOpen(); err != nil {
 		return err
 	}
-	p.setExLocked(key, value, ttl, time.Now().Unix())
+	p.setExLocked(key, value, ttl, core.NowUnix())
 	return nil
 }
 
@@ -169,7 +168,7 @@ func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	if err := p.checkOpen(); err != nil {
 		return nil, false, err
 	}
-	e, ok := p.lookup(key, time.Now().Unix(), false)
+	e, ok := p.lookup(key, core.NowUnix(), false)
 	if !ok {
 		return nil, false, nil
 	}
@@ -197,7 +196,7 @@ func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 	if err := p.checkOpen(); err != nil {
 		return false, err
 	}
-	_, ok := p.lookup(key, time.Now().Unix(), false)
+	_, ok := p.lookup(key, core.NowUnix(), false)
 	return ok, nil
 }
 
@@ -210,7 +209,7 @@ func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, er
 	}
 	var cur int64
 	var exp int64 // 保留原 TTL（SSDB incr 不改 ttl 表）
-	if e, ok := p.lookup(key, time.Now().Unix(), true); ok {
+	if e, ok := p.lookup(key, core.NowUnix(), true); ok {
 		v, err := parseInt(e.val)
 		if err != nil {
 			return 0, err
@@ -230,7 +229,7 @@ func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte,
 	if err := p.checkOpen(); err != nil {
 		return nil, err
 	}
-	now := time.Now().Unix()
+	now := core.NowUnix()
 	out := make(map[string][]byte, len(keys))
 	for _, k := range keys {
 		if e, ok := p.lookup(k, now, false); ok {
@@ -248,7 +247,7 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 		return nil, err
 	}
 	limit = normalizeLimit(limit)
-	now := time.Now().Unix()
+	now := core.NowUnix()
 	keys := make([]string, 0, len(p.kv))
 	for k, e := range p.kv {
 		if e.exp > 0 && e.exp <= now {
@@ -285,7 +284,7 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	if err := p.checkOpen(); err != nil {
 		return err
 	}
-	p.expireLocked(key, ttl, time.Now().Unix())
+	p.expireLocked(key, ttl, core.NowUnix())
 	return nil
 }
 
@@ -305,7 +304,7 @@ func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
 	if err := p.checkOpen(); err != nil {
 		return 0, false, err
 	}
-	now := time.Now().Unix()
+	now := core.NowUnix()
 	e, ok := p.lookup(key, now, false)
 	if !ok || e.exp == 0 {
 		return -1, false, nil
@@ -340,7 +339,7 @@ type Snapshot struct {
 func (p *Provider) Snapshot() Snapshot {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	now := time.Now().Unix()
+	now := core.NowUnix()
 	s := Snapshot{
 		KV:    make(map[string][]byte, len(p.kv)),
 		Exp:   make(map[string]int64),
@@ -666,7 +665,7 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 			return fmt.Errorf("mem: unknown batch op %d", op.Kind)
 		}
 	}
-	now := time.Now().Unix() // 整批共享同一"当前时刻"，避免批内语义漂移
+	now := core.NowUnix() // 整批共享同一"当前时刻"，避免批内语义漂移
 	for _, op := range ops {
 		switch op.Kind {
 		case core.BatchSet:

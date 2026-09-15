@@ -27,6 +27,23 @@ func Run(t *testing.T, factory func(t *testing.T) core.KvProvider) {
 	RunWithOptions(t, Options{}, factory)
 }
 
+// VirtualClock 返回一个用注入时钟推进过期的 Options：把 core.Now 换成可控假时钟，
+// FastForward 只移动假时钟，因此本地基座（mem/jsonl/bolt/sqlite）的过期用例
+// 不再依赖真实秒与轮询。
+//
+// 注意：必须在被测基座创建前后都使用同一份时钟；测试结束由 t.Cleanup 还原，
+// 避免污染同包其他用例。服务端基座（redis/ssdb/mysql/pg）的时钟在服务端，
+// 不要用这个选项（改用 Options{} 走真实等待）。
+func VirtualClock(t *testing.T) Options {
+	t.Helper()
+	base := time.Now()
+	offset := time.Duration(0)
+	real := core.Now
+	core.Now = func() time.Time { return base.Add(offset) }
+	t.Cleanup(func() { core.Now = real })
+	return Options{FastForward: func() { offset += 2 * time.Second }}
+}
+
 // RunWithOptions 是 Run 的带选项版本（虚拟时钟等）。
 func RunWithOptions(t *testing.T, opt Options, factory func(t *testing.T) core.KvProvider) {
 	t.Run("KV", func(t *testing.T) { TestKV(t, newDB(t, factory)) })

@@ -22,7 +22,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 	"unicode/utf8"
 
 	"github.com/RelicOfTesla/kvdb"
@@ -137,7 +136,7 @@ func (p *Provider) replay() error {
 		return fmt.Errorf("jsonl: seek: %w", err)
 	}
 	rd := bufio.NewReaderSize(p.file, 64*1024)
-	now := time.Now().Unix()
+	now := core.NowUnix()
 
 	// readLine 以 '\n' 分隔读一行（含行尾换行符）；与 Scanner 的
 	// ErrTooLong 语义等价，但能同时给出字节偏移供截断使用。
@@ -367,7 +366,7 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 		return core.ErrClosed
 	}
 	recs := make([]op, 0, len(ops))
-	now := time.Now().Unix()
+	now := core.NowUnix()
 	for _, o := range ops {
 		rec, err := toRecord(o, now)
 		if err != nil {
@@ -447,7 +446,7 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
-	if err := p.appendOp(encOp(op{Op: "setx", At: core.AddTTL(time.Now().Unix(), ttl)}, key, "", value)); err != nil {
+	if err := p.appendOp(encOp(op{Op: "setx", At: core.AddTTL(core.NowUnix(), ttl)}, key, "", value)); err != nil {
 		return err
 	}
 	return p.mem.SetEx(ctx, key, value, ttl)
@@ -531,7 +530,7 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
-	if err := p.appendOp(encOp(op{Op: "expire", At: core.AddTTL(time.Now().Unix(), ttl)}, key, "", nil)); err != nil {
+	if err := p.appendOp(encOp(op{Op: "expire", At: core.AddTTL(core.NowUnix(), ttl)}, key, "", nil)); err != nil {
 		return err
 	}
 	return p.mem.Expire(ctx, key, ttl)

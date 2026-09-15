@@ -32,6 +32,8 @@
 | sqlite（tmpfs） | ~24k | ~25k | ~10.6k | ~6.1k |
 | bolt（sync） | ~58k | ~900k | ~57k | ~27k |
 | bolt（nosync） | ~50k | ~500k | ~54k | ~35k |
+| leveldb（tmpfs） | ~186k | ~750k | ~152k | ~165k |
+| leveldb（drvfs(9p)） | ~306 | ~750k | ~300 | ~300 |
 | ssdb | ~1.7k–3.7k | ~1.6k–4.0k | ~1.8k–3.8k | ~1.6k–3.4k |
 | redis | ~2.1k–4.2k | ~2.3k–4.1k | ~2.4k–4.6k | ~2.0k–3.6k |
 | mysql（8.0） | ~900 | ~1.0k | ~90–160 | ~83–105 |
@@ -56,12 +58,12 @@ value 下可忽略（实测 mem 的 `Get` 与 `Set` 同为 ~210ns/op）。文件
 
 ## 3. 写入成本模型（每操作）
 
-| 操作 | mem | jsonl | bolt | sqlite / pg | mysql | redis | ssdb |
-|---|---|---|---|---|---|---|---|
-| Set | map 写 | 1 次 append+flush | 1 个事务（1 fsync） | 1 条 upsert | 1 条 upsert | 1 命令 | 1 往返 |
-| Incr | map 写 | 1 次 append+flush | 1 个事务 | 1 条 upsert+`RETURNING` | 事务：3 条语句 | 1 命令 | 1 往返 |
-| QPush | map 写 | 1 次 append+flush | 1 个事务 | 事务：2 条语句 | 事务：4 条语句 | 1 命令 | 1 往返 |
-| Batch(N) | N 次写（1 次持锁） | 1 次 write+flush | **1 个事务** | **1 个事务** | **1 个事务** | 1 次 MULTI/EXEC | 1 次流水线 |
+| 操作 | mem | jsonl | bolt | leveldb | sqlite / pg | mysql | redis | ssdb |
+|---|---|---|---|---|---|---|---|---|
+| Set | map 写 | 1 次 append+flush | 1 个事务（1 fsync） | 1 次 `Write(batch)`（1 fsync） | 1 条 upsert | 1 条 upsert | 1 命令 | 1 往返 |
+| Incr | map 写 | 1 次 append+flush | 1 个事务 | 分片锁内读-改-写 + 1 次 `Write` | 1 条 upsert+`RETURNING` | 事务：3 条语句 | 1 命令 | 1 往返 |
+| QPush | map 写 | 1 次 append+flush | 1 个事务 | 1 次 `Write`（元素+计数器同批） | 事务：2 条语句 | 事务：4 条语句 | 1 命令 | 1 往返 |
+| Batch(N) | N 次写（1 次持锁） | 1 次 write+flush | **1 个事务** | **1 个 Batch** | **1 个事务** | **1 个事务** | 1 次 MULTI/EXEC | 1 次流水线 |
 
 SQL 写入的瓶颈是**每个事务一次持久化（fsync）**，而不是语句条数。同机隔离实验
 （MySQL，300 次单语句自增）：
@@ -142,6 +144,40 @@ SQL 的批内仍是逐条语句、往返次数未减少，所以提升小于 Red
   需要 SQL、复杂查询或多进程共享同一文件时选 `sqlite`/`mysql`/`pg`
   （bbolt 文件同时只能被一个进程以写模式打开）。
 
+## 6b. LevelDB 基座（syndtr/goleveldb）
+
+`leveldb` 基座基于 `github.com/syndtr/goleveldb`（纯 Go LSM-tree）。实测在
+`/dev/shm`（tmpfs）上，benchtime=2000x：
+
+| 基准 | leveldb（默认 sync） | leveldb（nosync=1） |
+|---|---|---|
+| Set | 5.4 µs（186k/s） | 7.5 µs |
+| Get | 1.3 µs（750k/s） | 2.0 µs |
+| Incr（单键） | 6.6 µs（152k/s） | 5.3 µs |
+| Incr 并发热点（同 key） | 7.7 µs | 5.4 µs |
+| Incr 并发多 key | 10.1 µs | 11.3 µs |
+| BatchSet100 | 207 µs（2.1 µs/写） | 221 µs（2.2 µs/写） |
+| QPush | 6.1 µs（165k/s） | 5.0 µs |
+
+> 未与 bbolt 并列比较：§6 的 bolt 数据取自 drvfs(9p)，介质不同不可直接对照；
+> 需要二者横评时请在同一目录重跑（见 §10）。
+
+要点：
+
+- **介质主导**：同一份代码在 drvfs(9p) 上 Set 约 3.27 ms/op、在 tmpfs 上 5.4 µs/op，
+  差近 600×；跨基座比较必须在同一介质上做。
+- **写成本＝一次提交一次 fsync**：与 bbolt 同因，故 Set / Incr / QPush 同量级；
+  批写把 100 次提交压成 1 次（2.1 µs/写，相对单写约 **84×**）。
+- `nosync=1` 无稳定收益（本轮各项都在噪声内），却牺牲崩溃持久性，**不建议默认开启**。
+- **无事务但有原子 Batch**：`Write(batch)` 一次 WAL 追加＋memtable 应用即原子；
+  本基座把所有多键写（值+TTL、zset 双侧索引、队列元素+计数器）收进一个 Batch。
+- **Batch 是写缓冲、读不到未提交内容**：因此批内涉及同一队列/zset 的多条操作
+  必须经"待提交叠加层"读取彼此的效果（read-your-writes），否则同批两次 `QPush`
+  会拿到同一个序号互相覆盖。该缺陷由共享合同用例的批内队列顺序断言捕获。
+- 选型：需要**写吞吐优先、可接受后台压缩抖动**（LSM 特性）时选 `leveldb`；
+  需要强一致点查与 mmap 读性能时选 `bolt`；需要 SQL 能力时选 SQL 系基座。
+  LevelDB 目录同样只能被一个进程以写模式打开。
+
 ## 7. SQLite 驱动选择：纯 Go vs CGO
 
 同一 `sqlstore` 实现，仅替换底层驱动（pure-Go = `modernc.org/sqlite`，
@@ -197,6 +233,8 @@ KVDB_BENCH_URI=jsonl://./bench.jsonl   go test -bench . -benchtime 2000x
 KVDB_BENCH_URI=sqlite://./bench.db     go test -bench . -benchtime 2000x
 KVDB_BENCH_URI=bolt://./bench.bolt     go test -bench . -benchtime 2000x
 KVDB_BENCH_URI='bolt://./bench.bolt?nosync=1' go test -bench . -benchtime 2000x
+KVDB_BENCH_URI=/dev/shm/bench.ldb                go test -bench . -benchtime 2000x   # LevelDB 用目录
+KVDB_BENCH_URI='/dev/shm/bench.ldb?nosync=1'    go test -bench . -benchtime 2000x
 
 # 服务型基座（先起容器，见 README「测试」）
 KVDB_BENCH_URI=redis://127.0.0.1:6379/0            go test -bench . -benchtime 2000x

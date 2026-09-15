@@ -14,7 +14,7 @@ n, err := db.Incr(ctx, "visits", 1)
 
 ## 特性
 
-- **8 个内置基座**，同一套 API：`mem` / `jsonl` / `bolt` / `sqlite` / `mysql` / `pg` / `redis` / `ssdb`
+- **9 个内置基座**，同一套 API：`mem` / `jsonl` / `bolt` / `leveldb` / `sqlite` / `mysql` / `pg` / `redis` / `ssdb`
 - **能力可选、按需探测**：KV 必选；Queue / ZSet / Batch / 生命周期为可选能力，
   未实现时返回 `ErrUnsupported`，可用 `Capabilities()` 探测
 - **注册表默认空**：用哪个基座就 `import _` 哪个包，根包不引入任何驱动依赖
@@ -32,7 +32,7 @@ n, err := db.Incr(ctx, "visits", 1)
 | `kvdb`（根，含 `core` / `kvdbtest`） | 1.18 | 零第三方依赖 |
 | `kvdb/mem`、`kvdb/jsonl` | 1.18 | 仅标准库 |
 | `kvdb/sqlstore` | 1.18 | 仅标准库（`database/sql` 抽象） |
-| `kvdb/ssdb` | 1.19 | 用到 `atomic.Pointer[T]` |
+| `kvdb/ssdb`、`kvdb/leveldb` | 1.19 | 用到 `atomic.Bool` / `atomic.Pointer[T]` |
 | `kvdb/bolt`、`kvdb/sqlite`、`kvdb/mysql`、`kvdb/pg`、`kvdb/redis` | 1.25 | 由驱动及其传递依赖决定（如 `golang.org/x/sys` 要求 1.25） |
 | `kvdb/all`、`kvdb/bench`、`kvdb/example` | 1.25 | 聚合了上述模块 |
 
@@ -96,6 +96,7 @@ mem://
 jsonl://./data.jsonl?sync=1        # sync=1 每次写 fsync
 sqlite://./data.db?table_prefix=app_       # 表名前缀（mysql/pg 同名参数）
 bolt://./data.bolt?nosync=1        # nosync=1 关闭 fsync（更快，崩溃可能丢最近提交）
+leveldb://./data.dir?nosync=1&cache=8&wb=4   # 目录型存储；cache/wb 单位 MiB
 mysql://user:pass@host:3306/dbname?parseTime=true&table_prefix=app_
 pg://user:pass@host:5432/dbname?sslmode=disable&table_prefix=app_
 redis://:password@host:6379/0?key_prefix=app:   # 键命名空间前缀
@@ -117,6 +118,7 @@ ssdb://:password@host:8888         # 服务端启用 server.auth 时
 | 纯内存 | `mem` | ✅ | ✅ | ✅ | 不落盘，测试/缓存 |
 | JSONL 日志 | `jsonl` | ✅ | ✅ | ✅ | append-only WAL，打开时回放，支持 `Compact()`；单进程内嵌 |
 | BoltDB | `bolt` | ✅ | ✅ | ✅ | bbolt 单文件 B+tree（纯 Go）；每写一次事务提交，批写整批一次提交 |
+| LevelDB | `leveldb` | ✅ | ✅ | ✅ | syndtr/goleveldb LSM-tree（纯 Go）；批写收进单个 Batch 原子提交 |
 | SQLite | `sqlite` | ✅ | ✅ | ✅ | 纯 Go 驱动（modernc），无 CGO |
 | MySQL | `mysql` | ✅ | ✅ | ✅ | 共享 `sqlstore` |
 | PostgreSQL | `pg` | ✅ | ✅ | ✅ | 共享 `sqlstore` |
@@ -261,6 +263,8 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 | SQL 过期行 | 读取路径过滤，开库时清理一次 |
 | SQLite 并发写 | 进程内写串行化（单写者），WAL 保留读并行 |
 | BoltDB 并发写 | 单写者、多读者（MVCC）；写操作按 bbolt 事务串行提交 |
+| LevelDB 无 bucket / 无事务 | 单一有序键空间，三类数据用首字节命名空间标签隔离；`Write(batch)` 本身原子，所有多键写（含值+TTL、zset 双侧索引）都收进一个 Batch。批内还维护待提交叠加层以支持 read-your-writes（否则同批多次 push 会互相覆盖序号） |
+| LevelDB 并发 Incr | LevelDB 无 CAS 原语，同 key 的读-改-写由分片锁串行化（不同 key 仍并行） |
 | SQL 键长 | MySQL 键列上限 255 字节（兼容 5.6 默认索引前缀）；PG / SQLite 用 BYTEA/BLOB 无此限制 |
 | 过期键的写语义 | 所有基座统一"已过期 = 不存在"：`Set` 不继承旧 TTL、`Incr` 从 0 起算、`Expire` 不复活 |
 | 读返回值所有权 | `Get`/`MGet`/`Scan`/`QFront`/`QBack` 返回副本，调用方改写不影响库内状态 |
@@ -386,7 +390,7 @@ bytes.go               B / P / D / DMust 字节编解码
 registry.go            Register / MustRegister / Schemes
 kvdbtest/              跨基座共享合同用例（公开包，供各基座模块测试引用）
 all/                   聚合注册包：import _ 即接入全部内置基座
-mem/ jsonl/ sqlite/ mysql/ pg/ redis/ ssdb/   各基座实现（各自独立模块）
+mem/ jsonl/ leveldb/ sqlite/ mysql/ pg/ redis/ ssdb/   各基座实现（各自独立模块）
 sqlstore/              MySQL / SQLite / PG 共享的 database/sql 实现（方言参数化）
 bench/                 基准测试（独立模块，import .../all）
 example/               可运行演示

@@ -11,6 +11,7 @@ require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/RelicOfTesla/kvdb/bolt v0.0.0 // indirect
 	github.com/RelicOfTesla/kvdb/jsonl v0.0.0 // indirect
+	github.com/RelicOfTesla/kvdb/leveldb v0.0.0 // indirect
 	github.com/RelicOfTesla/kvdb/mem v0.0.0 // indirect
 	github.com/RelicOfTesla/kvdb/mysql v0.0.0 // indirect
 	github.com/RelicOfTesla/kvdb/pg v0.0.0 // indirect
@@ -21,6 +22,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/go-sql-driver/mysql v1.10.1 // indirect
+	github.com/golang/snappy v0.0.0-20180518054509-2e65f85255db // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
@@ -30,6 +32,7 @@ require (
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/redis/go-redis/v9 v9.22.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	github.com/syndtr/goleveldb v1.0.0 // indirect
 	go.etcd.io/bbolt v1.5.0 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
@@ -46,6 +49,7 @@ replace (
 	github.com/RelicOfTesla/kvdb/all => ../all
 	github.com/RelicOfTesla/kvdb/bolt => ../bolt
 	github.com/RelicOfTesla/kvdb/jsonl => ../jsonl
+	github.com/RelicOfTesla/kvdb/leveldb => ../leveldb
 	github.com/RelicOfTesla/kvdb/mem => ../mem
 	github.com/RelicOfTesla/kvdb/mysql => ../mysql
 	github.com/RelicOfTesla/kvdb/pg => ../pg

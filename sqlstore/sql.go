@@ -1229,6 +1229,12 @@ func min(a, b int) int {
 // ApplyBatch 实现 core.BatchProvider：整批操作在**一个事务**内执行，提交时
 // 只产生一次持久化（InnoDB redo / WAL fsync），把 N 次提交开销摊成 1 次。
 // 任一步失败即回滚，整批不生效。SQLite 仍受进程内写锁串行化。
+// BatchComposed 恒为 true：本基座在同一把锁/同一事务内逐条应用批操作，
+// 批内后续操作能看到前序效果（见 core.BatchComposedProvider）。
+func (p *Provider) BatchComposed() bool { return true }
+
+var _ core.BatchComposedProvider = (*Provider)(nil)
+
 func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 	if err := p.check(); err != nil {
 		return err

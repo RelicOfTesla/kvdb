@@ -538,7 +538,8 @@ func TestKV(t *testing.T, db kvdb.DB) {
 
 func TestQueue(t *testing.T, db kvdb.DB) {
 	ctx := context.Background()
-	hasQueue, _, _ := db.Capabilities()
+	caps := db.Capabilities()
+	hasQueue := caps.Queue
 	if !hasQueue {
 		t.Skip("基座未实现 Queue 能力")
 	}
@@ -589,7 +590,7 @@ func TestQueue(t *testing.T, db kvdb.DB) {
 
 func TestZSet(t *testing.T, db kvdb.DB) {
 	ctx := context.Background()
-	_, hasZSet, _ := db.Capabilities()
+	hasZSet := db.Capabilities().ZSet
 	if !hasZSet {
 		t.Skip("基座未实现 ZSet 能力")
 	}
@@ -670,7 +671,7 @@ func TestZSet(t *testing.T, db kvdb.DB) {
 // 验证顺序、覆盖语义、TTL、以及与逐条读的一致性。
 func TestBatch(t *testing.T, db kvdb.DB) {
 	ctx := context.Background()
-	if _, _, hasBatch := db.Capabilities(); !hasBatch {
+	if !db.Capabilities().Batch {
 		t.Skip("基座未实现 Batch 能力")
 	}
 
@@ -700,8 +701,13 @@ func TestBatch(t *testing.T, db kvdb.DB) {
 	if v, ok, _ := db.Get(ctx, "bk1"); !ok || string(v) != "v1" {
 		t.Fatalf("bk1 = %q,%v", v, ok)
 	}
-	if v, ok, _ := db.Get(ctx, "bk2"); !ok || string(v) != "new" {
-		t.Fatalf("同批覆盖应取后者, bk2 = %q,%v", v, ok)
+	// 以下三项属于"批内可见性"（同批后续操作看到前序效果）。契约不要求它，
+	// 各基座取决于自身机制，因此只在 Capabilities().BatchComposed 为真时断言。
+	composed := db.Capabilities().BatchComposed
+	if composed {
+		if v, ok, _ := db.Get(ctx, "bk2"); !ok || string(v) != "new" {
+			t.Fatalf("同批覆盖应取后者, bk2 = %q,%v", v, ok)
+		}
 	}
 	if secs, has, _ := db.TTL(ctx, "bk3"); !has || secs <= 0 || secs > 100 {
 		t.Fatalf("bk3 TTL = %d,%v", secs, has)
@@ -733,14 +739,26 @@ func TestBatch(t *testing.T, db kvdb.DB) {
 	if ok, _ := db.Exists(ctx, "bk4"); ok {
 		t.Fatal("批内 Del 应生效")
 	}
-	// 队列顺序：z, a, b
-	for _, want := range []string{"z", "a", "b"} {
-		if v, ok, _ := db.QPop(ctx, "bq"); !ok || string(v) != want {
-			t.Fatalf("批内队列顺序 QPop = %q,%v; want %q", v, ok, want)
+	// 队列顺序与 zset 累加同样只在具备批内可见性时断言。
+	if composed {
+		for _, want := range []string{"z", "a", "b"} {
+			if v, ok, _ := db.QPop(ctx, "bq"); !ok || string(v) != want {
+				t.Fatalf("批内队列顺序 QPop = %q,%v; want %q", v, ok, want)
+			}
 		}
-	}
-	if s, ok, _ := db.ZGet(ctx, "bz", "m1"); !ok || s != 8 {
-		t.Fatalf("批内 ZSet+ZIncr = %d,%v (5+3=8)", s, ok)
+		if s, ok, _ := db.ZGet(ctx, "bz", "m1"); !ok || s != 8 {
+			t.Fatalf("批内 ZSet+ZIncr = %d,%v (5+3=8)", s, ok)
+		}
+	} else {
+		// 不具备批内可见性的基座：至少要求整批已落库（元素数 > 0 且成员存在），
+		// 具体终值依机制而定，不作断言。
+		if n, err := db.QSize(ctx, "bq"); err != nil || n == 0 {
+			t.Fatalf("批写后队列不应为空: n=%d err=%v", n, err)
+		}
+		if _, ok, _ := db.ZGet(ctx, "bz", "m1"); !ok {
+			t.Fatal("批写后 zset 成员应存在")
+		}
+		db.Del(ctx, "bq")
 	}
 
 	// 空批：无操作、无错误

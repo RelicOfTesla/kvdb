@@ -51,8 +51,8 @@ func TestOpenLocalBackends(t *testing.T) {
 		if v, ok, _ := db.Get(ctx, "k"); !ok || string(v) != "v" {
 			t.Fatalf("Open(%q) Get = %q,%v", uri, v, ok)
 		}
-		if hasQ, hasZ, hasB := db.Capabilities(); !hasQ || !hasZ || !hasB {
-			t.Fatalf("Open(%q) 应具备 queue/zset 能力, got q=%v z=%v", uri, hasQ, hasZ)
+		if c := db.Capabilities(); !c.Queue || !c.ZSet || !c.Batch {
+			t.Fatalf("Open(%q) 应具备 queue/zset/batch 能力, got %+v", uri, c)
 		}
 		db.Close()
 	}

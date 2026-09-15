@@ -638,6 +638,12 @@ func sliceRange(items []core.ZItem, start, stop int64) []core.ZItem {
 
 // ApplyBatch 在单次持锁内按序应用整批操作：要么全部生效，要么（参数非法时）
 // 一条都不生效。批内均为无条件写，故正常情况下不会失败。
+// BatchComposed 恒为 true：本基座在同一把锁/同一事务内逐条应用批操作，
+// 批内后续操作能看到前序效果（见 core.BatchComposedProvider）。
+func (p *Provider) BatchComposed() bool { return true }
+
+var _ core.BatchComposedProvider = (*Provider)(nil)
+
 func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 	_ = ctx
 	if len(ops) == 0 {

@@ -475,7 +475,6 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 		}
 	}
 	now := core.NowUnix()
-	pd := newPending()
 	var b gldb.Batch
 	// 队列/zset 的计数与双侧索引需要读当前状态：按涉及的名称加锁，
 	// 与单条写路径共用同一把分片锁，避免并发批互相覆盖计数。
@@ -510,23 +509,23 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 		case core.BatchExpire:
 			b.Put(ttlKey(op.Key), be64(uint64(core.AddTTL(now, op.TTL))))
 		case core.BatchQPush:
-			if err = p.batchQPush(pd, &b, op.Key, op.Value, false); err != nil {
+			if err = p.batchQPush(&b, op.Key, op.Value, false); err != nil {
 				return err
 			}
 		case core.BatchQPushFront:
-			if err = p.batchQPush(pd, &b, op.Key, op.Value, true); err != nil {
+			if err = p.batchQPush(&b, op.Key, op.Value, true); err != nil {
 				return err
 			}
 		case core.BatchZSet:
-			if err = p.batchZSet(pd, &b, op.Key, op.Member, op.Score); err != nil {
+			if err = p.batchZSet(&b, op.Key, op.Member, op.Score); err != nil {
 				return err
 			}
 		case core.BatchZDel:
-			if err = p.batchZDel(pd, &b, op.Key, op.Member); err != nil {
+			if err = p.batchZDel(&b, op.Key, op.Member); err != nil {
 				return err
 			}
 		case core.BatchZIncr:
-			if err = p.batchZIncr(pd, &b, op.Key, op.Member, op.Delta); err != nil {
+			if err = p.batchZIncr(&b, op.Key, op.Member, op.Delta); err != nil {
 				return err
 			}
 		}
@@ -537,8 +536,8 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 	return p.write(&b, "batch")
 }
 
-func (p *Provider) batchQPush(pd *pending, b *gldb.Batch, name string, value []byte, front bool) error {
-	c, err := pd.qCountersOf(p, name)
+func (p *Provider) batchQPush(b *gldb.Batch, name string, value []byte, front bool) error {
+	c, err := p.qCountersGet(name)
 	if err != nil {
 		return err
 	}
@@ -553,37 +552,34 @@ func (p *Provider) batchQPush(pd *pending, b *gldb.Batch, name string, value []b
 	c.count++
 	b.Put(qItemKey(name, seq), value)
 	putQCounters(b, name, c)
-	pd.setQCounters(name, c)
 	return nil
 }
 
-func (p *Provider) batchZSet(pd *pending, b *gldb.Batch, name, member string, score int64) error {
-	old, existed, err := pd.zScoreOf(p, name, member)
+func (p *Provider) batchZSet(b *gldb.Batch, name, member string, score int64) error {
+	old, existed, err := p.zScoreGet(name, member)
 	if err != nil {
 		return err
 	}
 	b.Put(zScoreKey(name, score, member), nil)
 	b.Put(zMemberKey(name, member), be64(ordered(score)))
 	if !existed {
-		n, err := pd.zCountOf(p, name)
+		n, err := p.zCountGet(name)
 		if err != nil {
 			return err
 		}
 		b.Put(zCountKey(name), be64(uint64(n+1)))
-		pd.setZCount(name, n+1)
 	} else if old != score {
 		b.Delete(zScoreKey(name, old, member))
 	}
-	pd.putZScore(name, member, score)
 	return nil
 }
 
-func (p *Provider) batchZDel(pd *pending, b *gldb.Batch, name, member string) error {
-	score, existed, err := pd.zScoreOf(p, name, member)
+func (p *Provider) batchZDel(b *gldb.Batch, name, member string) error {
+	score, existed, err := p.zScoreGet(name, member)
 	if err != nil || !existed {
 		return err
 	}
-	n, err := pd.zCountOf(p, name)
+	n, err := p.zCountGet(name)
 	if err != nil {
 		return err
 	}
@@ -591,14 +587,12 @@ func (p *Provider) batchZDel(pd *pending, b *gldb.Batch, name, member string) er
 	b.Delete(zMemberKey(name, member))
 	if n > 0 {
 		b.Put(zCountKey(name), be64(uint64(n-1)))
-		pd.setZCount(name, n-1)
 	}
-	pd.delZScore(name, member)
 	return nil
 }
 
-func (p *Provider) batchZIncr(pd *pending, b *gldb.Batch, name, member string, delta int64) error {
-	old, existed, err := pd.zScoreOf(p, name, member)
+func (p *Provider) batchZIncr(b *gldb.Batch, name, member string, delta int64) error {
+	old, existed, err := p.zScoreGet(name, member)
 	if err != nil {
 		return err
 	}
@@ -606,87 +600,16 @@ func (p *Provider) batchZIncr(pd *pending, b *gldb.Batch, name, member string, d
 	b.Put(zScoreKey(name, next, member), nil)
 	b.Put(zMemberKey(name, member), be64(ordered(next)))
 	if !existed {
-		n, err := pd.zCountOf(p, name)
+		n, err := p.zCountGet(name)
 		if err != nil {
 			return err
 		}
 		b.Put(zCountKey(name), be64(uint64(n+1)))
-		pd.setZCount(name, n+1)
 	} else if old != next {
 		b.Delete(zScoreKey(name, old, member))
 	}
-	pd.putZScore(name, member, next)
 	return nil
 }
-
-// ---- 批内待提交状态（read-your-writes）----
-//
-// LevelDB 的 Batch 只是写缓冲，读不到未提交内容。若批内多条操作涉及同一队列/
-// zset，每次都从库里读计数器与旧分数，就会互相覆盖（表现为顺序错乱、成员数少算、
-// 旧分数键未被清理）。因此在批生命周期内维护一份待提交状态叠加层：
-// 读时先查叠加层、未命中再落库；写时同时更新叠加层。
-type pending struct {
-	qc map[string]qCounters         // 队列计数器
-	zs map[zMemberKeyT]zMemberState // zset 成员的分数状态
-	zn map[string]int64             // zset 成员数
-}
-
-type zMemberKeyT struct{ name, member string }
-
-// zMemberState 记录该成员在批内的目标分数；absent=true 表示批内已删除。
-type zMemberState struct {
-	score  int64
-	exists bool
-	absent bool
-}
-
-func newPending() *pending {
-	return &pending{qc: map[string]qCounters{}, zs: map[zMemberKeyT]zMemberState{}, zn: map[string]int64{}}
-}
-
-// qCountersOf 取队列计数器：优先批内值。
-func (pd *pending) qCountersOf(p *Provider, name string) (qCounters, error) {
-	if c, ok := pd.qc[name]; ok {
-		return c, nil
-	}
-	c, err := p.qCountersGet(name)
-	return c, err
-}
-
-func (pd *pending) setQCounters(name string, c qCounters) { pd.qc[name] = c }
-
-// zScoreOf 取成员分数：批内已删除 -> 不存在；批内有新值 -> 用之。
-func (pd *pending) zScoreOf(p *Provider, name, member string) (int64, bool, error) {
-	key := zMemberKeyT{name, member}
-	if st, ok := pd.zs[key]; ok {
-		if st.absent {
-			return 0, false, nil
-		}
-		if st.exists {
-			return st.score, true, nil
-		}
-	}
-	return p.zScoreGet(name, member)
-}
-
-func (pd *pending) putZScore(name, member string, score int64) {
-	pd.zs[zMemberKeyT{name, member}] = zMemberState{score: score, exists: true}
-}
-
-func (pd *pending) delZScore(name, member string) {
-	pd.zs[zMemberKeyT{name, member}] = zMemberState{absent: true}
-}
-
-// zCountOf 取 zset 成员数：优先批内值。
-func (pd *pending) zCountOf(p *Provider, name string) (int64, error) {
-	if n, ok := pd.zn[name]; ok {
-		return n, nil
-	}
-	n, err := p.zCountGet(name)
-	return n, err
-}
-
-func (pd *pending) setZCount(name string, n int64) { pd.zn[name] = n }
 
 // lockKeys 按稳定顺序加锁（避免不同批之间的死锁），返回一次性解锁函数。
 func (p *Provider) lockKeys(keys []string) func() {

@@ -114,19 +114,58 @@ type BatchOp struct {
 	Delta  int64 // ZIncr
 }
 
+// Caps 描述一个基座实际具备的能力。用结构体而不是多返回值，是为了新增能力时
+// 不必改动方法签名与所有调用点；零值表示"仅 KV"。
+type Caps struct {
+	// Queue 实现了 QueueProvider。
+	Queue bool
+	// ZSet 实现了 ZSetProvider。
+	ZSet bool
+	// Batch 实现了 BatchProvider（可一次提交一批操作）。
+	Batch bool
+	// BatchComposed 在 Batch 为 true 的前提下进一步表示：批内后续操作**能看到**
+	// 本批前序操作的效果（同批覆盖同一 key、队列按声明顺序入队、ZSet+ZIncr 累加）。
+	// 契约不要求该性质，取决于基座机制：在同一事务/同一把锁内逐条应用的为 true；
+	// LevelDB / Redis / SSDB 这类"提交前读不到未提交内容"的为 false。
+	BatchComposed bool
+}
+
 // BatchProvider 是可选的批量写能力：把一批操作以一次提交发出，降低往返与
 // 持久化开销（SQL 一次事务一次 fsync、Redis 一次 MULTI/EXEC、SSDB 一次流水线、
-// jsonl 一次 flush）。收集逻辑由根包共享的 Batch 提供，基座只需实现 ApplyBatch。
+// jsonl 一次 flush、LevelDB 一个原子 Batch）。收集逻辑由根包共享的 Batch 提供，
+// 基座只需实现 ApplyBatch。
 //
-// 提交语义：
-//   - 整批按 ops 顺序生效；空批为空操作；
-//   - 提交失败时：具备事务能力的基座（mysql/sqlite/pg/jsonl/mem）保证整批
-//     不生效；Redis 走 MULTI/EXEC，网络/协议错误整批不生效，但命令级错误
-//     （如 WRONGTYPE/OOM）时 EXEC 不回滚，之前的命令可能已生效；SSDB 无事务，
-//     采用流水线，失败时可能部分生效（其价值在于减少往返）；
-//   - 批内不含 Incr/QPop 这类依赖当前状态的操作（需先校验再写），如需请单独调用。
+// 提交语义（契约只覆盖这一条）：
+//   - 空批为空操作；提交成功即整批写入完成。
+//
+// **批内组合结果不属于契约**：同批多条操作涉及同一 key / 同一队列 / 同一 zset 成员
+// 时，最终值取决于基座的执行机制，允许各基座不同——
+//   - 在同一事务或同一把锁内逐条应用的基座（mem / jsonl / bolt / sqlite / mysql / pg）
+//     天然能读到本批前序操作的效果，表现为"后者覆盖前者""队列按声明顺序入队"
+//     "ZSet+ZIncr 累加"；
+//   - LevelDB 的 Batch 只是写缓冲，读不到未提交内容，因此按"各自独立读库状态"
+//     计算，同批内针对同一队列/zset 的多条操作可能互相覆盖。这是其机制的自然结果，
+//     SDK 不额外补偿。
+//   - Redis 的 MULTI/EXEC、SSDB 的流水线同理不保证批内可见性。
+//
+// 需要确定性的组合结果时，把相互依赖的操作拆到不同批次或改用单键操作。
+// 是否具备批内可见性可由 BatchComposedProvider 探测。
+//
+// 批内不含 Incr/QPop 这类依赖当前状态的操作（需先校验再写），如需请单独调用。
 type BatchProvider interface {
 	ApplyBatch(ctx context.Context, ops []BatchOp) error
+}
+
+// BatchComposedProvider 是可选的能力声明：实现它表示该基座的 ApplyBatch **保证**
+// 批内后续操作能看到本批前序操作的效果（批内 read-your-writes）。
+//
+// 未实现该接口的基座不承诺这一点——同一批在两个基座上可能得到不同的终值。
+// 业务据此决定"能否安全地把相互依赖的操作放进同一批"：
+//
+//	if _, ok := kvdb.Unwrap(db).(core.BatchComposedProvider); ok { /* 可组合 */ }
+type BatchComposedProvider interface {
+	// BatchComposed 恒为 true，仅作能力标记：存在即代表批内可见。
+	BatchComposed() bool
 }
 
 // FullProvider 是集齐全部能力与生命周期的"完整基座"组合接口，

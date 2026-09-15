@@ -121,8 +121,8 @@ func TestCustomScheme(t *testing.T) {
 	if v, ok, _ := db.Get(ctx, "k"); !ok || string(v) != "v" {
 		t.Fatalf("Get = %q,%v", v, ok)
 	}
-	if hasQ, hasZ, hasB := db.Capabilities(); hasQ || hasZ || hasB {
-		t.Fatalf("kvOnly 不应上报能力, got q=%v z=%v", hasQ, hasZ)
+	if c := db.Capabilities(); c.Queue || c.ZSet || c.Batch {
+		t.Fatalf("kvOnly 不应上报能力, got %+v", c)
 	}
 	if _, _, err := db.QPop(ctx, "q"); !errors.Is(err, core.ErrUnsupported) {
 		t.Fatalf("未实现 queue 应 ErrUnsupported, got %v", err)

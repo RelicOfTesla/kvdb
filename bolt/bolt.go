@@ -862,6 +862,12 @@ func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (in
 
 // ApplyBatch 在**一个 bbolt 事务**内按序执行整批操作：一次提交、一次 fsync；
 // 任一步失败即整体回滚（原子）。批内均为无条件写。
+// BatchComposed 恒为 true：本基座在同一把锁/同一事务内逐条应用批操作，
+// 批内后续操作能看到前序效果（见 core.BatchComposedProvider）。
+func (p *Provider) BatchComposed() bool { return true }
+
+var _ core.BatchComposedProvider = (*Provider)(nil)
+
 func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 	_ = ctx
 	if len(ops) == 0 {

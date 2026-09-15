@@ -379,6 +379,12 @@ func (p *Provider) appendOps(recs []op) error {
 // 为什么是一行而不是多行：多行记录在崩溃时可能只写下完整前缀，回放就会提交
 // 半个批；单行记录要么完整、要么是残缺半行（回放末尾按崩溃残留丢弃），
 // 因此"整批全有或全无"在崩溃语义下也成立。
+// BatchComposed 恒为 true：本基座在同一把锁/同一事务内逐条应用批操作，
+// 批内后续操作能看到前序效果（见 core.BatchComposedProvider）。
+func (p *Provider) BatchComposed() bool { return true }
+
+var _ core.BatchComposedProvider = (*Provider)(nil)
+
 func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 	if len(ops) == 0 {
 		return nil

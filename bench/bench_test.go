@@ -116,7 +116,7 @@ const benchBatchSize = 100
 func BenchmarkBatchSet100(b *testing.B) {
 	ctx := context.Background()
 	db := benchDB(b)
-	if _, _, hasBatch := db.Capabilities(); !hasBatch {
+	if !db.Capabilities().Batch {
 		b.Skip("基座未实现 Batch 能力")
 	}
 	b.ResetTimer()

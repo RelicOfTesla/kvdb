@@ -139,11 +139,24 @@ type DB interface {
     ZSetProvider    // sorted set
     Batcher         // db.Batch(ctx, fn)
     Closer          // Close
-    Capabilities() (hasQueue, hasZSet, hasBatch bool)
+    Capabilities() core.Caps   // 实际具备的能力
 }
 ```
 
 - 基座未实现的能力：调用返回 `ErrUnsupported`，先用 `Capabilities()` 探测可避免。
+  `core.Caps` 是结构体（新增能力不改签名）：
+
+```go
+c := db.Capabilities()
+c.Queue, c.ZSet, c.Batch           // 是否实现对应接口
+c.BatchComposed                    // 批内后续操作能否看到本批前序效果
+```
+
+- **批内可见性是可感知、非强制的能力**：同一批内多条操作涉及同一 key / 队列 /
+  zset 成员时，终值取决于基座机制。在同一事务或同一把锁内逐条应用的基座
+  （`mem` / `jsonl` / `bolt` / `sqlite` / `mysql` / `pg`）为 `true`；
+  LevelDB 的 Batch、Redis 的 MULTI/EXEC、SSDB 的流水线在提交前读不到未提交内容，
+  为 `false`。需要确定性组合时，先探测再决定，或直接把相互依赖的操作拆批。
 - **窄依赖**：业务函数只需声明用到的能力接口，测试里实现对应方法即可，无需实现整个 `DB`：
 
 ```go
@@ -263,7 +276,7 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 | SQL 过期行 | 读取路径过滤，开库时清理一次 |
 | SQLite 并发写 | 进程内写串行化（单写者），WAL 保留读并行 |
 | BoltDB 并发写 | 单写者、多读者（MVCC）；写操作按 bbolt 事务串行提交 |
-| LevelDB 无 bucket / 无事务 | 单一有序键空间，三类数据用首字节命名空间标签隔离；`Write(batch)` 本身原子，所有多键写（含值+TTL、zset 双侧索引）都收进一个 Batch。批内还维护待提交叠加层以支持 read-your-writes（否则同批多次 push 会互相覆盖序号） |
+| LevelDB 无 bucket / 无事务 | 单一有序键空间，三类数据用首字节命名空间标签隔离；`Write(batch)` 本身原子，所有多键写（含值+TTL、zset 双侧索引）都收进一个 Batch。**Batch 是写缓冲、读不到未提交内容**，故 `Capabilities().BatchComposed=false`：同批内针对同一队列/zset 成员的多条操作可能互相覆盖，需确定性组合请拆批 |
 | LevelDB 并发 Incr | LevelDB 无 CAS 原语，同 key 的读-改-写由分片锁串行化（不同 key 仍并行） |
 | SQL 键长 | MySQL 键列上限 255 字节（兼容 5.6 默认索引前缀）；PG / SQLite 用 BYTEA/BLOB 无此限制 |
 | 过期键的写语义 | 所有基座统一"已过期 = 不存在"：`Set` 不继承旧 TTL、`Incr` 从 0 起算、`Expire` 不复活 |

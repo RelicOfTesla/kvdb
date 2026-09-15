@@ -26,8 +26,8 @@ type DB interface {
 	ZSetProvider
 	Batcher
 	Closer
-	// Capabilities 报告底层基座实现了哪些可选能力（queue / zset / batch）。
-	Capabilities() (hasQueue, hasZSet, hasBatch bool)
+	// Capabilities 报告底层基座实际具备的能力（见 core.Caps）。
+	Capabilities() core.Caps
 }
 
 // adapter 是 DB 接口的默认实现：内部持有一个 KvProvider，并在构造时通过类型
@@ -57,9 +57,13 @@ func Unwrap(d DB) core.KvProvider {
 	return nil
 }
 
-// Capabilities 报告底层基座是否实现了 queue / zset / batch 可选能力。
-func (a *adapter) Capabilities() (hasQueue, hasZSet, hasBatch bool) {
-	return a.q != nil, a.z != nil, a.batch != nil
+// Capabilities 报告底层基座实际具备的能力。
+func (a *adapter) Capabilities() core.Caps {
+	c := core.Caps{Queue: a.q != nil, ZSet: a.z != nil, Batch: a.batch != nil}
+	if _, ok := a.p.(core.BatchComposedProvider); ok {
+		c.BatchComposed = true
+	}
+	return c
 }
 
 // KvProvider 返回底层基座，便于使用能力接口做类型断言。

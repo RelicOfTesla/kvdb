@@ -51,7 +51,8 @@ func main() {
 	}
 	defer db.Close()
 
-	hasQ, hasZ, hasBatch := db.Capabilities()
+	caps := db.Capabilities()
+	hasQ, hasZ, hasBatch := caps.Queue, caps.ZSet, caps.Batch
 	fmt.Printf("== 基座 %s（queue=%v zset=%v batch=%v） ==\n", *uri, hasQ, hasZ, hasBatch)
 
 	// ---- KV ----

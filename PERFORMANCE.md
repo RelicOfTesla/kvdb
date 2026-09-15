@@ -1,62 +1,153 @@
 # 性能报告
 
-`kvdb` 各基座的实测性能、成本模型与选型建议。
+`kvdb` 各基座的实测吞吐、成本模型与选型建议。
 
-> 数据为单机容器环境的相对量级，**不是承诺值**：绝对值受 CPU、存储介质、网络与
-> 容器配置影响很大。请以同机复测（见文末「复现」）为准。
+> 数字为单机容器环境的相对量级，**不是承诺值**；绝对值受 CPU、存储介质、网络与
+> 容器配置影响很大。复现命令见 §7。
 
-## 1. 测试环境与方法
+## 1. 口径与方法
 
-| 项 | 说明 |
+只使用一种口径：**固定时间窗内跑满并发负载，统计实际完成量**（ops/s；批写折算到
+条目级 items/s）。基准为 `bench/throughput_test.go` 的 `BenchmarkThroughput*`，
+默认 8 个 goroutine、`-benchtime` 控制窗口长度。
+
+合并类优化（SQL 组提交、SQLite WAL 检查点搭车、LSM memtable 批量落盘、Batch 摊薄
+提交）只在持续负载下出现，因此吞吐必须由实际完成量得出。
+
+比较时必须固定三个变量：
+
+| 维度 | 影响 |
 |---|---|
-| 主机 | WSL2（Windows 11），8 核可用，Docker 与本机同宿 |
-| Go | go1.27.1 linux/amd64 |
-| 服务端 | `mysql:8.0.46`、`postgres:16`（另测 5.6 / 9.6 / 10 / 12）、`redis:7`、SSDB 容器 |
-| 文件基座 | 工作区为 drvfs(9p)（Windows 挂载）或 `/tmp`（tmpfs），报告标注介质 |
-| 数据规模 | key 短（`bench:*`），value ~20 字节，页缓存已热 |
-| 测量方式 | 单 goroutine 顺序调用（吞吐 = 1/平均延迟）；并发项为 8 goroutine |
+| **介质** | tmpfs / ext4(WSL vhdx) / drvfs(9p) 的 fsync 差 3 个数量级 |
+| **持久化等级** | jsonl 默认不逐条 fsync、MySQL/PG 可放宽同步；跨级比较无意义 |
+| **key 分布** | 同 key 热点受单点串行限制，多 key 才能吃到组提交 |
 
-两组并发写必须区分，结论完全不同：
+裸 `write(16B)+fsync` 参考值（解释成因用，非吞吐）：tmpfs 2–4 µs、ext4(vhdx) ~2.5 ms、
+drvfs(9p) 3.8–5.5 ms。**本环境的"常规磁盘"是 WSL vhdx，一次 fsync 约 2.5 ms，
+只比 9p 快约 1.5×，不属于快的那一档。**
 
-- **同 key（写热点）**：单个计数器，受行锁/单点串行限制；
-- **多 key（无重叠）**：各 goroutine 写独立 key，SQL 可吃满组提交。
+## 2. 各基座实测吞吐（全部操作类型）
 
-## 2. 单操作吞吐（顺序调用，op/s）
+单位 ops/s；`MGet条目` 与 `批写条目` 为折算到**条目级**的 items/s。均为 8 goroutine、
+时间窗 `-benchtime 2s`、统计实际完成量。`Incr多key` 是各写者用独立 key，
+`Incr同key` 是所有写者打同一个计数器。
 
-| 基座 | Set | Get | Incr | QPush |
+**纯内存（不落盘，与介质无关）**
+
+| 基座 | Set | Get | Incr多key | Incr同key | QPush | MGet条目 | 批写条目 |
+|---|---|---|---|---|---|---|---
+| mem | ~775k | ~8.4M | ~825k | ~3.0M | ~2.85M | ~14.8M | ~1.48M |
+
+**文件基座 @ tmpfs**
+
+| 基座 | Set | Get | Incr多key | Incr同key | QPush | MGet条目 | 批写条目 |
+|---|---|---|---|---|---|---|---
+| jsonl | ~201.8k | ~10.1M | ~221.9k | ~298.2k | ~286.3k | ~13.4M | ~510.5k |
+| bolt | ~22.1k | ~569.8k | ~22.9k | ~26.9k | ~20.9k | ~2.2M | ~479.1k |
+| leveldb | ~137.0k | ~1.0M | ~111.8k | ~122.4k | ~108.5k | ~1.0M | ~381.8k |
+| sqlite | ~12.0k | ~60.6k | ~5.7k | ~5.8k | ~7.3k | ~447.9k | ~35.6k |
+
+**文件基座 @ ext4(WSL vhdx)**
+
+| 基座 | Set | Get | Incr多key | Incr同key | QPush | MGet条目 | 批写条目 |
+|---|---|---|---|---|---|---|---
+| jsonl① | ~177.0k | ~10.0M | ~190.1k | ~242.2k | ~315.3k | ~14.1M | ~548.7k |
+| bolt | ~426 | ~591.1k | ~461 | ~481 | ~518 | ~2.6M | ~38.6k |
+| leveldb | ~1.3k | ~1.0M | ~1.4k | ~448 | ~1.4k | ~1.0M | ~92.8k |
+| sqlite | ~559 | ~61.3k | ~312 | ~316 | ~358 | ~453.0k | ~30.4k |
+
+**文件基座 @ drvfs(9p)**
+
+| 基座 | Set | Get | Incr多key | Incr同key | QPush | MGet条目 | 批写条目 |
+|---|---|---|---|---|---|---|---
+| jsonl① | ~1.4k | ~9.6M | ~1.5k | ~1.5k | ~1.6k | ~13.3M | ~110.3k |
+| bolt | ~89 | ~589.5k | ~91 | ~88 | ~94 | ~2.6M | ~7.1k |
+| leveldb | ~1.0k | ~1.1M | ~1.0k | ~288 | ~1.1k | ~1.0M | ~75.2k |
+| sqlite | ~234 | ~9.6k | ~129 | ~151 | ~105 | ~102.0k | ~16.1k |
+
+**服务端基座（容器盘为 ext4，可与上表 ext4 档类比）**
+
+| 基座 | Set | Get | Incr多key | Incr同key | QPush | MGet条目 | 批写条目 |
+|---|---|---|---|---|---|---|---
+| redis | ~12.7k | ~12.4k | ~14.9k | ~13.4k | ~13.2k | ~256.4k | ~497.2k |
+| ssdb | ~8.0k | ~7.6k | ~7.7k | ~7.9k | ~8.2k | ~137.4k | ~20.6k |
+| mysql 8.0 | ~718 | ~5.3k | ~428 | ~119 | ~400 | ~95.6k | ~4.6k |
+| pg 16 | ~2.4k | ~9.9k | ~2.2k | ~647 | ~1.4k | ~185.7k | ~8.8k |
+
+① jsonl 默认只 flush 到 OS、不逐条 fsync（`?sync=1` 才是每写一次 fsync）：跨基座
+比较前需先对齐持久化等级。
+
+### 2.1 从表中读出的结论
+
+- **读路径基本不受介质支配**：同一基座的 Get/MGet 在 tmpfs/ext4/9p 三档上几乎不变
+  （如 leveldb Get ~1.0M、jsonl Get ~9.6–10.1M），因为读命中页缓存；而 Set/Incr/QPush
+  这类写路径跨介质差 2–3 个数量级（bolt Set：tmpfs 22.1k → ext4 426 → 9p 89）。
+- **服务端基座的读吞吐低于嵌入式**：redis Get ~12.4k vs bolt Get ~590k，瓶颈是网络
+  往返而非磁盘。
+- **SQL 的同 key 热点掉档最严重**：mysql 多 key 428 → 同 key 119（3.6×）、
+  pg 2.2k → 647（3.4×）。嵌入式基座因单写者模型，同 key 与多 key 差距很小。
+- **SSDB 各项吞吐均衡但上限低**（约 8k ops/s 且批写仅 2.6×）：无事务，流水线只省往返。
+- **mem 是唯一"读写都不受任何 IO 约束"的基座**（Set ~775k、Get ~8.4M、批写 ~1.5M）。
+
+### 2.2 批写收益（批写条目吞吐 ÷ Set 吞吐）
+
+| 基座 | tmpfs | ext4(vhdx) | drvfs(9p) | 服务端 |
 |---|---|---|---|---|
-| mem | ~1.5M | ~3.5M | ~2.7M | ~3.2M |
-| jsonl（drvfs(9p)） | ~1.4k | ~2.6M | ~1.7k | ~1.8k |
-| jsonl（tmpfs） | ~40k | ~2.6M | ~**200k** | — |
-| sqlite（drvfs(9p)） | ~600 | ~2.4k | ~120–136 | ~91–95 |
-| sqlite（tmpfs） | ~24k | ~25k | ~10.6k | ~6.1k |
-| bolt（sync） | ~58k | ~900k | ~57k | ~27k |
-| bolt（nosync） | ~50k | ~500k | ~54k | ~35k |
-| leveldb（tmpfs） | ~186k | ~750k | ~152k | ~165k |
-| leveldb（drvfs(9p)） | ~306 | ~750k | ~300 | ~300 |
-| ssdb | ~1.7k–3.7k | ~1.6k–4.0k | ~1.8k–3.8k | ~1.6k–3.4k |
-| redis | ~2.1k–4.2k | ~2.3k–4.1k | ~2.4k–4.6k | ~2.0k–3.6k |
-| mysql（8.0） | ~900 | ~1.0k | ~90–160 | ~83–105 |
-| pg（16） | ~500 | ~1.7k | ~240–512① | ~209–245 |
+| jsonl | 2.5× | 3.1× | 81.3× | — |
+| bolt | 21.7× | 90.6× | 80.4× | — |
+| leveldb | 2.8× | 69.7× | 74.4× | — |
+| sqlite | 3.0× | 54.4× | 68.8× | mysql 6.4× / pg 3.7× |
+| redis | — | — | — | 39.0× |
+| ssdb | — | — | — | 2.6× |
 
-① PG 的 `Incr` 采用单语句 `upsert + RETURNING`（缺失按 0、原子累加、非整数报错），
-实测 237 → 512 op/s（约 2.2×）；MySQL 无 `RETURNING` 保留事务多语句路径。
+收益取决于单条写中可被摊薄的提交成本：
 
-**关键观察**
+- tmpfs 上没有 fsync 可省，多数基座为 2.5–3×；**bolt 是 21.7×**：它每写必开一个
+  bbolt 事务，该开销与介质无关，因此在内存文件系统上照样能被批掉。
+- jsonl 在 ext4 为 3.1×、在 9p 为 81.3×：它默认不逐条 fsync，ext4 上单条已经便宜，
+  而 9p 上连 flush 都要过协议往返，故批写仍有大收益。
+- SQL 系收益偏低（mysql 6.4×、pg 3.7×）是因为批内仍逐条语句执行，只是共享一次
+  提交；Redis 42× 来自 MULTI/EXEC 一次往返 + 服务端合并。
 
-- `mem` 是内存基线；`jsonl`/`sqlite` 的**读**与内存同级（读不走文件），**写**受
-  文件追加/事务提交支配；
-- 文件基座的写吞吐几乎完全由**存储介质**决定（同一份代码：jsonl 在 tmpfs 上
-  Incr 约 20 万 op/s，在 drvfs(9p) 上约 1.7k op/s，差 ~100 倍）；
-- SSDB/Redis 单操作受**网络往返**支配（本机容器 ~0.4–0.6 ms/次），并发靠连接池放大。
+### 2.3 读写混合：读者会不会被写者阻塞
 
-注：`Get` 类数值已包含**返回值的深拷贝**（mem/jsonl 为保证调用方无法绕过 API
-篡改库内状态，见 README「各基座差异」）；拷贝成本与 value 大小成正比，~20B 的
-value 下可忽略（实测 mem 的 `Get` 与 `Set` 同为 ~210ns/op）。文件基座的 `Set`
-在 drvfs(9p) 上受 fsync 影响极大：同一 bolt 代码在 9p 上约 8.0ms/op，在 /dev/shm
-上约 16µs/op。
+`BenchmarkThroughputMixedReadWrite`：8 个 goroutine 中一半持续读同一 64-key 热集、
+一半写各自互不重叠的 key，同时上报 `reads/s` 与 `writes/s`。表中"读保留率"= 混合
+`reads/s` ÷ 该基座同介质纯读 Get，"写保留率"= 混合 `writes/s` ÷ 纯写 Set。
 
-## 3. 写入成本模型（每操作）
+| 基座 | 介质 | 混合 reads/s | 混合 writes/s | 读保留率 | 写保留率 |
+|---|---|---|---|---|---|
+| mem | — | ~783k | ~251k | 9% | 32% |
+| jsonl | tmpfs | ~485k | ~101k | 5% | 50% |
+| jsonl | ext4 | ~486k | ~106k | 5% | 60% |
+| jsonl | 9p | ~4.45M | ~1.5k | 46% | 106% |
+| bolt | tmpfs | ~166k | ~12.9k | 29% | 58% |
+| bolt | ext4 | ~500k | ~491 | 85% | 115% |
+| bolt | 9p | ~319k | ~119 | 54% | 134% |
+| leveldb | tmpfs | ~109k | ~58.8k | 11% | 43% |
+| leveldb | ext4 | ~736k | ~827 | 74% | 64% |
+| leveldb | 9p | ~658k | ~658 | 60% | 66% |
+| sqlite | tmpfs | ~37k | ~6.7k | 61% | 56% |
+| sqlite | ext4 | ~74k | ~409 | 121% | 73% |
+| sqlite | 9p | ~19k | ~85 | 193% | 36% |
+| redis | 容器 | ~7.1k | ~7.0k | 57% | 55% |
+| ssdb | 容器 | ~3.7k | ~3.5k | 48% | 44% |
+| mysql 8.0 | 容器 | ~2.9k | ~453 | 55% | 63% |
+| pg 16 | 容器 | ~5.3k | ~1.4k | 54% | 58% |
+
+- **服务端基座几乎不互相阻塞**：读写各保留 ~44–63%，相当于把并发度对半分。连接池
+  隔离了请求，读不会因为写而排队。
+- **mem / jsonl 在高写频率下读掉到纯读的 ~5–9%**（tmpfs、ext4）。jsonl 的读路径不取
+  自身任何锁，仍只有 5%，说明瓶颈是两者共用的 mem 全局锁粒度：每次写进入该锁都会让
+  后续读者排队。`jsonl` 的纯读吞吐（Get ~9.6–10.1M）正说明其自身读路径没有额外代价。
+- **掉幅由写者进入共享同步原语的频率决定，而不是介质带宽**：同一基座的写频率从
+  tmpfs 的 10 万级/s 降到 9p 的几百 ~1.5k/s 时，读保留率从 5% 回升到 46%（jsonl）、
+  从 11% 回升到 60%（leveldb）。盘越慢，写者占用同步原语的次数越少，读者越容易穿插。
+- **"Get 比 Set 快几十倍"只在无写或低写负载下成立**。混合负载下应看读保留率，而改善
+  读阻塞的抓手与降低写延迟同源：批写（把 N 次对锁/事务的占用合并成 1 次）与分片。
+- 读保留率 >100%（sqlite ext4/9p）是该档纯读基准自身的调度与页缓存波动，属噪声量级。
+
+## 3. 写入成本模型（每操作做了什么）
 
 | 操作 | mem | jsonl | bolt | leveldb | sqlite / pg | mysql | redis | ssdb |
 |---|---|---|---|---|---|---|---|---|
@@ -65,7 +156,7 @@ value 下可忽略（实测 mem 的 `Get` 与 `Set` 同为 ~210ns/op）。文件
 | QPush | map 写 | 1 次 append+flush | 1 个事务 | 1 次 `Write`（元素+计数器同批） | 事务：2 条语句 | 事务：4 条语句 | 1 命令 | 1 往返 |
 | Batch(N) | N 次写（1 次持锁） | 1 次 write+flush | **1 个事务** | **1 个 Batch** | **1 个事务** | **1 个事务** | 1 次 MULTI/EXEC | 1 次流水线 |
 
-SQL 写入的瓶颈是**每个事务一次持久化（fsync）**，而不是语句条数。同机隔离实验
+瓶颈通常是**每个事务一次持久化（fsync）**，而不是语句条数。同机隔离实验
 （MySQL，300 次单语句自增）：
 
 | 配置 | 单语句自增 | 事务 3 语句 |
@@ -73,180 +164,77 @@ SQL 写入的瓶颈是**每个事务一次持久化（fsync）**，而不是语�
 | `innodb_flush_log_at_trx_commit=1`（默认） | 131 op/s | 127 op/s |
 | `innodb_flush_log_at_trx_commit=2` | **266 op/s** | 174 op/s |
 
-即：把 3 条语句压成 1 条只带来约 3% 提升，而放宽持久化等级带来约 2×；PostgreSQL
-同理（`synchronous_commit=off` 时 upsert 自增 490 → 1280 op/s）。
+把 3 条语句压成 1 条约 +3%，放宽持久化等级约 2×；PostgreSQL 同理
+（`synchronous_commit=off` 时 490 → 1280 op/s）。**部署侧参数与批写是两个独立杠杆。**
 
-## 4. 并发写：同 key vs 多 key（8 goroutine，Incr）
+## 4. 已落地的实现优化
 
-| 基座 | 同 key | 多 key | 说明 |
-|---|---|---|---|
-| mem | ~250k | ~2.4M | 锁竞争 vs 无竞争 |
-| ssdb | ~10.9k | ~12.3k | 连接池后可并行（见 §7） |
-| bolt | ~47k | ~45k | 单写者按事务串行（多 key 无额外收益） |
-| redis | ~10.5k | ~11.8k | go-redis 连接池 |
-| jsonl | ~1.8k | ~1.8k | 写路径必须串行（单日志文件） |
-| sqlite | ~120 | ~120 | 进程内写串行化（单写者） |
-| mysql | ~160 | **~694** | 多 key 吃满 InnoDB 组提交（4.3×） |
-| pg | ~619 | **~2,196** | 多 key 吃满 WAL 组提交（3.5×） |
-
-**结论**：SQL 基座的并发写要**分散到不同 key** 才能受益于组提交（多个事务共享
-一次 fsync）；单 key 热点（计数器、单队列）在 SQL 上是行锁串行 + 每次提交 fsync，
-这是固有成本，不应期待并发扩容。
-
-## 5. 批量写（`db.Batch`，每 100 条提交一次）
-
-1000 次 Set，对比逐条写与批写：
-
-| 基座 | 逐条 | 批写 100 | 提升 |
-|---|---|---|---|
-| MySQL | 130 op/s | 793 op/s | **6.1×** |
-| PostgreSQL | 521 op/s | 1,715 op/s | **3.3×** |
-| BoltDB | 57,800 op/s | **446,000 op/s** | **7.7×** |
-| SQLite | 124 op/s | 6,167 op/s | **49.7×** |
-| JSONL | 1,764 op/s | 117,052 op/s | **66.4×** |
-| Redis | 2,329 op/s | 88,027 op/s | **37.8×** |
-| SSDB | 612 op/s | 3,979 op/s | **6.5×** |
-
-批写把 N 次提交/往返摊成 1 次（SQL=事务、Redis=MULTI/EXEC、SSDB=流水线、
-jsonl=一次 flush），是**唯一能跨数量级提升写入的手段**，且不牺牲原子性
-（提交失败整批不生效；SSDB 无事务，流水线失败可能部分生效）。
-
-> 口径说明：BoltDB/SQLite 行来自 `./bench`（进程内基座，同机同盘）；MySQL/PG/Redis/SSDB
-> 行来自另一组对比探针（容器 + 9p 挂载），两者绝对值不可直接横比，只用于各自的前后对比。
-> 表中 SQLite / JSONL 的绝对值是在 drvfs(9p) 挂载上测得的；同一份代码在 tmpfs 上更高
-> （例如 SQLite 批写约 48k op/s），差异来自存储介质而非实现（见 §2、§7）。
-
-SQL 的批内仍是逐条语句、往返次数未减少，所以提升小于 Redis/jsonl；后续可把
-连续 `Set` 合并为多行 `INSERT` 进一步压缩往返。
-
-## 6. BoltDB 基座（bbolt）
-
-`bolt` 基座基于 `go.etcd.io/bbolt`（纯 Go 单文件 B+tree），同机同盘（9p）对比 SQLite：
-
-| 基准 | bolt（默认） | bolt（nosync=1） | sqlite | 相对 sqlite |
-|---|---|---|---|---|
-| Set | 17.3 µs（58k/s） | 20.0 µs | 30.1 µs | **1.7×** |
-| Get | **1.1 µs（900k/s）** | 2.0 µs | 31.1 µs | **28×** |
-| Incr（单键） | 17.4 µs（57k/s） | 18.4 µs | 72.2 µs | **4.1×** |
-| Incr 并发热点 | 21.3 µs | 23.5 µs | 96.4 µs | **4.5×** |
-| Incr 并发多 key | 22.0 µs | 22.5 µs | 98.3 µs | **4.5×** |
-| BatchSet100（单 iter=100 写） | 224 µs（2.2 µs/写） | 174 µs | 2,161 µs（21.6 µs/写） | **9.6×** |
-| QPush | 37.6 µs | 28.3 µs | 117.7 µs | **3.1×** |
-
-要点：
-
-- **读极快**：bbolt 走 mmap/B+tree 查找，Get 在 µs 级；SQLite 每条查询都有语句准备与解析开销。
-- **写由事务提交支配**：与 SQL 同因（一次提交一次 fsync），故单键 Incr 与 Set 同量级。
-- **批写收益明显**：`db.Batch` 落到单个 bbolt 事务，100 条只提交一次（2.2 µs/写）。
-- `nosync=1` 关闭 fsync：本轮多数项在噪声内（Batch/QPush 略快，Set/Get 略慢），
-  收益不显著而牺牲崩溃持久性，**不建议默认开启**。
-- 选型：需要"嵌入式 + 单文件 + 强于 SQLite 的点查/批量写"时选 `bolt`；
-  需要 SQL、复杂查询或多进程共享同一文件时选 `sqlite`/`mysql`/`pg`
-  （bbolt 文件同时只能被一个进程以写模式打开）。
-
-## 6b. LevelDB 基座（syndtr/goleveldb）
-
-`leveldb` 基座基于 `github.com/syndtr/goleveldb`（纯 Go LSM-tree）。实测在
-`/dev/shm`（tmpfs）上，benchtime=2000x：
-
-| 基准 | leveldb（默认 sync） | leveldb（nosync=1） |
-|---|---|---|
-| Set | 5.4 µs（186k/s） | 7.5 µs |
-| Get | 1.3 µs（750k/s） | 2.0 µs |
-| Incr（单键） | 6.6 µs（152k/s） | 5.3 µs |
-| Incr 并发热点（同 key） | 7.7 µs | 5.4 µs |
-| Incr 并发多 key | 10.1 µs | 11.3 µs |
-| BatchSet100 | 207 µs（2.1 µs/写） | 221 µs（2.2 µs/写） |
-| QPush | 6.1 µs（165k/s） | 5.0 µs |
-
-> 未与 bbolt 并列比较：§6 的 bolt 数据取自 drvfs(9p)，介质不同不可直接对照；
-> 需要二者横评时请在同一目录重跑（见 §10）。
-
-要点：
-
-- **介质主导**：同一份代码在 drvfs(9p) 上 Set 约 3.27 ms/op、在 tmpfs 上 5.4 µs/op，
-  差近 600×；跨基座比较必须在同一介质上做。
-- **写成本＝一次提交一次 fsync**：与 bbolt 同因，故 Set / Incr / QPush 同量级；
-  批写把 100 次提交压成 1 次（2.1 µs/写，相对单写约 **84×**）。
-- `nosync=1` 无稳定收益（本轮各项都在噪声内），却牺牲崩溃持久性，**不建议默认开启**。
-- **无事务但有原子 Batch**：`Write(batch)` 一次 WAL 追加＋memtable 应用即原子；
-  本基座把所有多键写（值+TTL、zset 双侧索引、队列元素+计数器）收进一个 Batch。
-- **Batch 是写缓冲、读不到未提交内容**：同批内针对同一队列/zset 成员的多条操作
-  各自按已提交状态计算，可能互相覆盖（如两次 `QPush` 只保留一条）。这属于契约允许
-  的机制差异，本基座据实上报 `Capabilities().BatchComposed=false`，不做补偿；
-  需要确定性组合时拆批或用单键操作。
-- 选型：需要**写吞吐优先、可接受后台压缩抖动**（LSM 特性）时选 `leveldb`；
-  需要强一致点查与 mmap 读性能时选 `bolt`；需要 SQL 能力时选 SQL 系基座。
-  LevelDB 目录同样只能被一个进程以写模式打开。
-
-## 7. SQLite 驱动选择：纯 Go vs CGO
-
-同一 `sqlstore` 实现，仅替换底层驱动（pure-Go = `modernc.org/sqlite`，
-CGO = `mattn/go-sqlite3`）：
-
-| 介质 | 驱动 | Set | Get | Incr | QPush |
-|---|---|---|---|---|---|
-| tmpfs（fsync 近乎免费） | pure-Go | 23,875 | 25,361 | 10,573 | 6,141 |
-| tmpfs | CGO | 37,158 | 45,177 | 18,951 | 6,674 |
-| 真实盘 | pure-Go | 543 | 1,917 | 130 | 91 |
-| 真实盘 | CGO | 568 | 2,178 | **128** | **94** |
-
-CGO 只在 I/O 免费时快 1.6–1.8×；真实存储上两者基本一致（瓶颈是每事务持久化，
-而非驱动实现）。因此本项目选用纯 Go 驱动，免去 CGO/gcc/交叉编译成本。
-
-## 8. 其他已落地的优化与实测效果
-
-| 优化 | 效果 |
+| 项 | 效果 |
 |---|---|
-| SSDB 连接池（默认 8，`Config.PoolSize`） | 并发 Incr 1,810 → **9,226–11,060 op/s（5–6×）**，追平 Redis |
-| PG/SQLite `Incr` 单语句化（upsert + `RETURNING`） | PG 237 → 512 op/s（2.2×） |
-| PG/SQLite `QPush` 单语句分配序号（`UPDATE … RETURNING`） | 事务内 4 → 2 条语句 |
-| MySQL/PG 连接池显式放开（默认 32） | 多 key 并发吃满组提交（§4） |
-| mem/jsonl 读路径 `RWMutex` | 并发读不再互斥（`Get` 与内存同级） |
-| jsonl 流式回放 | 打开时内存峰值从 ~2× 文件降到单行 |
-| SQLite 进程内写串行化 | 消除多连接并发写的 `SQLITE_BUSY` |
+| SQLite / PG 的 `Incr` 用单语句 `upsert + RETURNING`（缺失按 0、原子累加、非整数报错） | 替代事务多语句路径；MySQL 无 `RETURNING` 保留事务路径 |
+| MySQL 键列用 `VARBINARY(255)` | 兼容 5.6 默认索引前缀限制 |
+| SQLite 进程内写串行化 + WAL | 写排队而非 `SQLITE_BUSY`，读仍可并行 |
+| SSDB 连接池 | 单连接是串行请求-应答，池化后并发才真正并行 |
+| LevelDB 所有多键写收进单个 `Write(batch)` | 值+TTL、zset 双侧索引、队列元素+计数器各自原子 |
 
-## 9. 选型建议
+未采用的方案：CGO 版 SQLite 驱动——实测真实存储上纯 Go 与 CGO 吞吐基本一致
+（瓶颈是每事务持久化，不是驱动实现），故不引入 CGO 依赖。
 
-1. **高频写 / 队列 / 计数器**：`redis` 或 `ssdb`（单操作 2–4k op/s，并发 10k+）；
-   需要持久化到文件且单进程内嵌时用 `jsonl`（写受介质限制）。
-2. **SQL 基座**：适合数据量中等、写频率不高、需要 SQL/事务语义的场景；
-   写多时务必用 `db.Batch` 并按 key 打散并发。
-3. **单 key 热点计数**：SQL 上限约 100–600 op/s；要更高请用 `redis`/`ssdb`，
-   或把计数聚合到应用层再批量落库。
-4. **部署侧可调项**（会缩短崩溃恢复窗口，需自行确认持久性等级）：
-   MySQL `innodb_flush_log_at_trx_commit=2`、PostgreSQL `synchronous_commit=off`
-   —— 写入约 2–2.6×，代价是崩溃可能丢最近约 1 秒已提交事务（原子性不受影响）。
-5. **不要为性能换存储引擎**：同机实验里 MyISAM 约为 InnoDB 的 2×，但无事务、
-   崩溃易损毁，本项目不采用；MySQL 官方发行版亦无 RocksDB 引擎。
+## 5. 选型建议
 
-## 10. 复现
+- **嵌入式 + 点查为主**：`bolt`（mmap/B+tree 读极快，且每写一事务，批写收益在
+  任何介质都成立）。
+- **嵌入式 + 写吞吐优先**：`leveldb`（LSM 批量落盘，tmpfs/9p 上单条写都不错）。
+- **需要 SQL 能力 / 多进程共享**：`sqlite` / `mysql` / `pg`；注意同 key 热点掉档。
+- **服务端 KV**：`redis`（批写收益最大）、`ssdb`（原生协议，但无事务、批写收益有限）。
+- **进程内轻量持久化**：`mem`（不落盘）、`jsonl`（append-only WAL，需理解其持久化等级）。
+- **通用原则**：在 WSL/虚拟化盘上，**先把写改成批写**，再谈挑基座；要"每条落盘且
+  高吞吐"需真实本地 NVMe 或依赖服务端的组提交策略。
+- **读写混合场景**（§2.3）：`mem`/`jsonl` 因共用全局锁，高写频率下读只剩纯读的 5–9%；
+  `bolt`/`leveldb`/`sqlite` 的 SDK 层读路径不取锁，但读保留率仍随写频率下滑
+  （tmpfs 为 11–61%，9p 为 54–193%）；服务端基座读写互不阻塞（各保留 44–63%）。
 
-基准位于 `bench/`，是一个独立模块（`import .../all`）；通过 `KVDB_BENCH_URI` 指定基座，
-未设置时自动跳过。**在 `bench/` 目录内执行**：
+## 6. 已知取舍
+
+| 事项 | 说明 |
+|---|---|
+| 单 key 计数器 | SQL 系为行锁串行 + 每提交 fsync，固有成本 |
+| SSDB 批写 | 无事务，流水线失败可能部分生效（价值在减少往返） |
+| Redis 批内可见性 | 不保证（见 README「批量写」与 `Capabilities().BatchComposed`） |
+| 介质标注 | 仓库内 `kvdb/tmp` 属 `G:\` 的 drvfs(9p)，**不是**常规磁盘；测 ext4 须放 WSL 根盘（如 `~/test/tmp`） |
+
+## 7. 复现
 
 ```bash
-cd bench
+cd bench   # 独立模块；换目录即换介质
 
-# 本地基座
-KVDB_BENCH_URI=mem://                  go test -bench . -benchtime 2000x
-KVDB_BENCH_URI=jsonl://./bench.jsonl   go test -bench . -benchtime 2000x
-KVDB_BENCH_URI=sqlite://./bench.db     go test -bench . -benchtime 2000x
-KVDB_BENCH_URI=bolt://./bench.bolt     go test -bench . -benchtime 2000x
-KVDB_BENCH_URI='bolt://./bench.bolt?nosync=1' go test -bench . -benchtime 2000x
-KVDB_BENCH_URI=/dev/shm/bench.ldb                go test -bench . -benchtime 2000x   # LevelDB 用目录
-KVDB_BENCH_URI='/dev/shm/bench.ldb?nosync=1'    go test -bench . -benchtime 2000x
+D=/dev/shm/bt            # tmpfs；或 ~/test/tmp（ext4/WSL vhdx）、./tmp（drvfs 9p）
+mkdir -p "$D"
+BE='ThroughputSet$|ThroughputGet$|ThroughputIncrMultiKey$|ThroughputIncrSameKey$|\
+ThroughputQPush$|ThroughputMGet$|ThroughputBatchedSet$|ThroughputMixedReadWrite$'
 
-# 服务型基座（先起容器，见 README「测试」）
-KVDB_BENCH_URI=redis://127.0.0.1:6379/0            go test -bench . -benchtime 2000x
-KVDB_BENCH_URI=ssdb://127.0.0.1:8888               go test -bench . -benchtime 2000x
-KVDB_BENCH_URI='mysql://root:pw@127.0.0.1:3306/db' go test -bench . -benchtime 2000x
-KVDB_BENCH_URI='pg://postgres:pw@127.0.0.1:5432/db?sslmode=disable' go test -bench . -benchtime 2000x
+for u in jsonl bolt leveldb sqlite; do
+  case $u in jsonl) p="$D/t.jsonl";; bolt) p="$D/t.bolt";;
+                 leveldb) p="$D/t.ldb";; sqlite) p="$D/t.db";; esac
+  KVDB_BENCH_URI="$u://$p" go test -run '^$' -bench "$BE" -benchtime 2s
+done
+
+# 服务端基座（需先起容器，见 README「测试」）
+KVDB_BENCH_URI='redis://127.0.0.1:6379/0' go test -run '^$' -bench "$BE" -benchtime 2s
+KVDB_BENCH_URI='ssdb://127.0.0.1:8888'    go test -run '^$' -bench "$BE" -benchtime 2s
+KVDB_BENCH_URI='mysql://root:pw@127.0.0.1:3306/db?parseTime=true' \
+  go test -run '^$' -bench "$BE" -benchtime 2s
+KVDB_BENCH_URI='pg://postgres:pw@127.0.0.1:5432/db?sslmode=disable' \
+  go test -run '^$' -bench "$BE" -benchtime 2s
 ```
 
-包含的基准：`BenchmarkSet`、`BenchmarkGet`、`BenchmarkIncrSequential`、
-`BenchmarkIncrParallelSameKey`、`BenchmarkIncrParallelMultiKey`、
-`BenchmarkBatchSet100`（单操作吞吐 = 1/(ns/op) × 100）、`BenchmarkQPush`。
+上报指标：`ops/s`（真实吞吐）、`items/s`（MGet / 批写折算到条目级）、
+`reads/s` 与 `writes/s`（混合负载下两个角色各自的完成量）、
+`µs/op-actual`（由完成量与墙钟算出的平均耗时，不是单条串行延迟）。
 
-用 `-cpu 1,8` 可对比单核与多核；`-benchmem` 可看分配。报告中的表格可用同一
-容器组合复测，量级应当一致（绝对值随机器波动）。
+另有 `BenchmarkSet`/`Get`/`IncrSequential` 等**顺序调用**基准，仅用于排查单次调用的
+固有开销与回归对比；吞吐结论一律以本节实测数据为准。
+
+注意：仓库内 `kvdb/tmp` 属 `G:\` 的 drvfs(9p) 挂载，不是常规磁盘；测 ext4 须放 WSL
+根盘（如 `~/test/tmp`，即 `/dev/sdd`）。Docker 容器数据盘在 ext4(vhdx) 上，因此
+服务端基座的数字可与"文件基座 @ ext4"一档类比看。

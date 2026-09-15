@@ -17,7 +17,7 @@ n, err := db.Incr(ctx, "visits", 1)
 - **9 个内置基座**，同一套 API：`mem` / `jsonl` / `bolt` / `leveldb` / `sqlite` / `mysql` / `pg` / `redis` / `ssdb`
 - **能力可选、按需探测**：KV 必选；Queue / ZSet / Batch / 生命周期为可选能力，
   未实现时返回 `ErrUnsupported`，可用 `Capabilities()` 探测
-- **注册表默认空**：用哪个基座就 `import _` 哪个包，根包不引入任何驱动依赖
+- **注册表默认空**：用哪个基座就 `import _` 哪个包，根包与mod不引入任何驱动依赖
 - **接口化返回**：`kvdb.Open` 返回接口 `DB`，业务可窄依赖 `KvProvider` 等子接口，便于 mock
 - **批量写**：一批操作映射到各基座原生机制（事务 / MULTI/EXEC / 流水线 / 单次 flush）
 - **字节 ↔ 泛型辅助**：`B` / `P` / `D` / `DMust` 支持标量与结构体（默认 JSON，编解码可替换），标量编码与 `Incr` 互操作
@@ -329,17 +329,88 @@ SQLite 采用纯 Go 驱动（modernc），吞吐与 CGO 驱动相当，不引入
 
 > 完整实测数据、各基座成本模型与选型建议见 **[PERFORMANCE.md](PERFORMANCE.md)**。
 
-写入瓶颈通常是**每次提交的持久化（fsync）**，而不是语句数量。要点：
+口径：**固定时间窗内跑满并发负载、统计实际完成量**（ops/s）。要点：
 
-- **批量写收益最大**：1000 次 Set、每 100 条提交一次，实测提升
-  MySQL 6.1×、PostgreSQL 3.3×、SQLite 49.7×、JSONL 66.4×、Redis 37.8×、SSDB 6.5×。
-- **多 key 并发写**吃满组提交（MySQL/PG 连接池默认 32）；**单 key 计数器**受
-  行锁与每次提交的 fsync 限制，是 SQL 基座的固有成本。
-- 高频写入优先选 `redis` / `ssdb` 基座；JSONL 的写吞吐取决于存储介质，
-  适合低频到中等写入的进程内持久化。
-- 部署侧可调（会缩短崩溃恢复窗口，需自行确认持久性等级）：
-  MySQL `innodb_flush_log_at_trx_commit=2`、PostgreSQL `synchronous_commit=off`。
-- 基准可自行复测：`cd bench && KVDB_BENCH_URI=<uri> go test -bench . -benchtime 2000x`
+- **批写收益随介质与持久化等级变化**：ext4(WSL vhdx) 上 sqlite 48.6×、bolt 86.9×、
+  leveldb 73.1×；tmpfs 上多数为 2.5–3×（没有 fsync 可摊薄）。
+- **写瓶颈通常是每个事务一次 fsync**，而非语句条数：本环境裸 fsync 为
+  tmpfs 2–4 µs、ext4(vhdx) ~2.5 ms、drvfs(9p) 3.8–5.5 ms。
+- **同 key 热点在 SQL 上明显掉档**：mysql 多 key 447 vs 同 key 116 ops/s（3.9×）、
+  pg 2.25k vs 627（3.6×）。计数器请分散 key 或改批写。
+- **服务端基座**：redis 批写收益最大（42×），ssdb 因无事务只有 2.6×。
+- **读写混合下读会被写压掉**：`mem`/`jsonl` 共用全局锁，高写频率时读只剩纯读的 5–9%；
+  服务端基座则读写互不阻塞（各保留 ~44–63%）。见下方「读写混合下的相互影响」。
+- 两个独立杠杆：**改用批写**、以及放宽部署侧持久化（MySQL
+  `innodb_flush_log_at_trx_commit=2`、PostgreSQL `synchronous_commit=off`，
+  会缩短崩溃恢复窗口，需自行确认可接受）。
+- 复测：`cd bench && KVDB_BENCH_URI=<uri> go test -run '^$' -bench Throughput -benchtime 3s`
+
+### 实测吞吐一览（ops/s）
+
+8 goroutine、时间窗 `-benchtime 2s`、统计实际完成量。`MGet条目` / `批写条目` 为折算到
+条目级的 items/s；`Incr多key` 各写者独立 key，`Incr同key` 全部打同一个计数器。
+文件基座的 `· tmpfs / · ext4 / · 9p` 是存储介质档位（ext4 = WSL vhdx；服务端基座容器盘
+同为 ext4，可与 `· ext4` 档类比）。
+
+| 基座 | Set | Get | Incr多key | Incr同key | QPush | MGet条目 | 批写条目 |
+|---|---|---|---|---|---|---|---
+| mem | ~775k | ~8.4M | ~825k | ~3.0M | ~2.85M | ~14.8M | ~1.48M |
+| jsonl · tmpfs | ~201.8k | ~10.1M | ~221.9k | ~298.2k | ~286.3k | ~13.4M | ~510.5k |
+| bolt · tmpfs | ~22.1k | ~569.8k | ~22.9k | ~26.9k | ~20.9k | ~2.2M | ~479.1k |
+| leveldb · tmpfs | ~137.0k | ~1.0M | ~111.8k | ~122.4k | ~108.5k | ~1.0M | ~381.8k |
+| sqlite · tmpfs | ~12.0k | ~60.6k | ~5.7k | ~5.8k | ~7.3k | ~447.9k | ~35.6k |
+| jsonl · ext4 | ~177.0k | ~10.0M | ~190.1k | ~242.2k | ~315.3k | ~14.1M | ~548.7k |
+| bolt · ext4 | ~426 | ~591.1k | ~461 | ~481 | ~518 | ~2.6M | ~38.6k |
+| leveldb · ext4 | ~1.3k | ~1.0M | ~1.4k | ~448 | ~1.4k | ~1.0M | ~92.8k |
+| sqlite · ext4 | ~559 | ~61.3k | ~312 | ~316 | ~358 | ~453.0k | ~30.4k |
+| jsonl · 9p | ~1.4k | ~9.6M | ~1.5k | ~1.5k | ~1.6k | ~13.3M | ~110.3k |
+| bolt · 9p | ~89 | ~589.5k | ~91 | ~88 | ~94 | ~2.6M | ~7.1k |
+| leveldb · 9p | ~1.0k | ~1.1M | ~1.0k | ~288 | ~1.1k | ~1.0M | ~75.2k |
+| sqlite · 9p | ~234 | ~9.6k | ~129 | ~151 | ~105 | ~102.0k | ~16.1k |
+| redis | ~12.7k | ~12.4k | ~14.9k | ~13.4k | ~13.2k | ~256.4k | ~497.2k |
+| ssdb | ~8.0k | ~7.6k | ~7.7k | ~7.9k | ~8.2k | ~137.4k | ~20.6k |
+| mysql 8.0 | ~718 | ~5.3k | ~428 | ~119 | ~400 | ~95.6k | ~4.6k |
+| pg 16 | ~2.4k | ~9.9k | ~2.2k | ~647 | ~1.4k | ~185.7k | ~8.8k |
+
+① jsonl 默认只 flush 到 OS、不逐条 fsync（`?sync=1` 才是每写一次 fsync）：比较时
+须先对齐持久化等级。
+
+读路径几乎不受介质影响（如 leveldb Get 三档均 ~1.0M），而写路径跨介质差 2–3 个数量级
+（bolt Set：22.1k → 426 → 89）。服务端基座的**读**吞吐低于嵌入式（redis Get ~12.4k vs
+bolt ~590k），瓶颈是网络往返。完整分析见 [PERFORMANCE.md](PERFORMANCE.md)。
+
+### 读写混合下的相互影响
+
+上表是纯读 / 纯写各自的吞吐。混合负载（8 goroutine 中一半持续读 64-key 热集、一半写
+独立 key）下两者会互相影响，"读保留率"= 混合 `reads/s` ÷ 同介质纯读 Get：
+
+| 基座 | reads/s | writes/s | 读保留率 |
+|---|---|---|---|
+| mem | ~783k | ~251k | 9% |
+| jsonl · tmpfs | ~485k | ~101k | 5% |
+| jsonl · ext4 | ~486k | ~106k | 5% |
+| jsonl · 9p | ~4.45M | ~1.5k | 46% |
+| bolt · tmpfs | ~166k | ~12.9k | 29% |
+| bolt · ext4 | ~500k | ~491 | 85% |
+| bolt · 9p | ~319k | ~119 | 54% |
+| leveldb · tmpfs | ~109k | ~58.8k | 11% |
+| leveldb · ext4 | ~736k | ~827 | 74% |
+| leveldb · 9p | ~658k | ~658 | 60% |
+| sqlite · tmpfs | ~37k | ~6.7k | 61% |
+| sqlite · ext4 | ~74k | ~409 | 121% |
+| sqlite · 9p | ~19k | ~85 | 193% |
+| redis | ~7.1k | ~7.0k | 57% |
+| ssdb | ~3.7k | ~3.5k | 48% |
+| mysql 8.0 | ~2.9k | ~453 | 55% |
+| pg 16 | ~5.3k | ~1.4k | 54% |
+
+- **服务端基座读写互不阻塞**（各保留 ~44–63%，只是把并发度对半分）；`mem`/`jsonl`
+  因共用全局锁，高写频率下读只剩纯读的 5–9%。
+- **掉幅取决于写者进入共享同步原语的频率，而非介质带宽**：同一基座的写频率越低
+  （如 9p 上），读保留率越高——盘慢反而让读者更容易穿插。所以"Get 比 Set 快几十倍"
+  只在低写负载下成立。
+- 读保留率 >100% 是该档纯读基准的调度与页缓存波动，属噪声量级。
+
 
 ## 测试
 

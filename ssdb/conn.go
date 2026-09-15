@@ -28,7 +28,7 @@ const maxRecordBytes = 1 << 26 // 64 MiB
 // dial 建立到 addr（host:port）的连接；ctx 控制拨号与后续每操作超时。
 // 无 ctx deadline 时拨号默认 10s 超时，避免对黑洞地址阻塞到内核 SYN 超时。
 func dial(ctx context.Context, addr string) (*conn, error) {
-	d := net.Dialer{Timeout: 10 * time.Second}
+	d := net.Dialer{Timeout: DialTimeout}
 	nc, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("ssdb: dial %s: %w", addr, err)

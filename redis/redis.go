@@ -251,7 +251,7 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 	var found []string
 	cur := uint64(0)
 	for {
-		keys, next, err := p.rd.Scan(ctx, cur, p.pfx.kv+"*", 256).Result()
+		keys, next, err := p.rd.Scan(ctx, cur, p.pfx.kv+"*", int64(ScanCount)).Result()
 		if err != nil {
 			return nil, fmt.Errorf("redis: scan: %w", err)
 		}
@@ -530,6 +530,9 @@ func secondsDuration(ttl int64) time.Duration {
 func notInteger(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "not an integer")
 }
+
+// ScanCount 是每轮 Redis SCAN 的 COUNT 提示值（服务端仅按它决定单轮工作量）。
+var ScanCount = 256
 
 // normalizeLimit 保证 limit<=0 时使用 core.DefaultScanLimit（统一常量）。
 func normalizeLimit(limit int) int {

@@ -12,3 +12,7 @@ var Now = time.Now
 
 // NowUnix 是 Now().Unix() 的简写，用于以"秒"为粒度的 TTL/expire_at 计算。
 func NowUnix() int64 { return Now().Unix() }
+
+// SweepInterval 是写路径"顺带回收过期条目"的最小间隔（秒）。设为 0 可让每次写
+// 都触发回收（测试用），过大则过期数据驻留更久。各基座共用此值以保持行为一致。
+var SweepInterval int64 = 60

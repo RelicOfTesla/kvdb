@@ -140,7 +140,7 @@ func (p *Provider) update(fn func(*bolt.Tx) error) error {
 		// 任何写触碰，挂在写事务上保证长期运行进程的磁盘占用有界
 		//（Open 时另有一次全量清理）。清理失败回滚整个事务，可重试。
 		now := core.NowUnix()
-		if now-p.lastSweep.Load() >= sweepInterval {
+		if now-p.lastSweep.Load() >= core.SweepInterval {
 			p.lastSweep.Store(now)
 			if err := cleanupExpired(tx, now); err != nil {
 				return err
@@ -203,9 +203,6 @@ func ttlExpired(tx *bolt.Tx, key []byte, now int64) bool {
 	}
 	return int64(binary.BigEndian.Uint64(v)) <= now
 }
-
-// sweepInterval 是写事务内过期回收的最小间隔（秒）。
-const sweepInterval = 60
 
 func cleanupExpired(tx *bolt.Tx, now int64) error {
 	kvt, kk := tx.Bucket(bTTL), tx.Bucket(bKV)

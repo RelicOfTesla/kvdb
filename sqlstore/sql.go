@@ -754,6 +754,10 @@ func isNotIntegerErr(err error) bool {
 // mgetChunk 分批上限：IN 子句占位符控制在 SQLite/MySQL 变量上限内。
 const mgetChunk = 100
 
+// maxZRangePrealloc 限制按请求条数预分配切片的规模上界：调用方传入超大 limit
+// 时先按此值分配、按需增长，避免一次性 OOM。
+const maxZRangePrealloc = 1024
+
 // maxZRangeLimit 是 ZRange 在不查集合大小时接受的最大请求行数：
 // 超过则先取 zCount 收敛 stop（防溢出/巨型预分配，见 ZRange）。
 const maxZRangeLimit = 1 << 32
@@ -1155,7 +1159,7 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 	// "合法但巨大"的 limit 打爆内存（OOM），行数由 SQL LIMIT 保证。
 	prealloc := limit
 	if prealloc > 1024 {
-		prealloc = 1024
+		prealloc = maxZRangePrealloc
 	}
 	out := make([]core.ZItem, 0, prealloc)
 	for rows.Next() {

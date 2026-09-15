@@ -119,14 +119,11 @@ func (p *Provider) setExLocked(key string, value []byte, ttl int64, now int64) {
 	p.kv[key] = &entry{val: append([]byte(nil), value...), exp: core.AddTTL(now, ttl)}
 }
 
-// sweepInterval 是过期条目回收的最小间隔（秒）。
-const sweepInterval = 60
-
 // sweepLocked 物理删除已过期的 kv 条目并清理空容器，调用方需持有 p.mu。
 // 读路径在 RLock 下不得改写 map（见 lookup 注释），因此回收挂在产生 TTL
 // 的写路径上按间隔节流执行；纯读负载不产生新的过期条目，无需回收。
 func (p *Provider) sweepLocked(now int64) {
-	if now-p.lastSweep < sweepInterval {
+	if now-p.lastSweep < core.SweepInterval {
 		return
 	}
 	p.lastSweep = now

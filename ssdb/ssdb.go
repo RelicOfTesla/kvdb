@@ -70,6 +70,13 @@ type Config struct {
 // DefaultPoolSize 是未显式配置时的连接池大小。
 const DefaultPoolSize = 8
 
+// DialTimeout 是建立 TCP 连接的超时；超时会传导到 Open 与运行期补连。
+var DialTimeout = 10 * time.Second
+
+// connProbeWindow 是 acquire 前存活探测的非阻塞读窗口：足够让内核把已到达的
+// FIN/RST 报出来，又不至于拖慢每次取连接（实测 EOF 约 30µs 返回）。
+var connProbeWindow = 100 * time.Microsecond
+
 // Provider 是 SSDB 基座。连接池并发安全：每次操作借一条连接串行收发，
 // 用毕归还；池空时阻塞等待（受 ctx 约束）。ctx 可携带超时。
 type Provider struct {
@@ -226,7 +233,7 @@ func connAlive(c *conn) bool {
 	// 在读检查前就直接返回 timeout——即使对端已发 FIN 也探测不到断开。
 	// 未来 100µs 的窗口足以让 poll 报告 EOF/重置，健康连接最坏多等 100µs
 	//（相对请求本身可忽略；实测 EOF 探测约 30µs 返回）。
-	c.c.SetReadDeadline(time.Now().Add(100 * time.Microsecond))
+	c.c.SetReadDeadline(time.Now().Add(connProbeWindow))
 	var b [1]byte
 	if _, err := c.c.Read(b[:]); err != nil {
 		if ne, ok := err.(net.Error); ok && ne.Timeout() {

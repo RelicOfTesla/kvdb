@@ -70,7 +70,7 @@ func TestFilePersistence(t *testing.T) {
 func TestOpenURI(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "uri.bolt")
-	u, err := url.Parse("bolt://" + path + "?nosync=1&timeout=3s")
+	u, err := url.Parse("bolt://" + path + "?sync=1&timeout=3s")
 	if err != nil {
 		t.Fatal(err)
 	}

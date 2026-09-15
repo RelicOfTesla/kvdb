@@ -25,8 +25,10 @@ var _ core.FullProvider = (*Provider)(nil)
 type Config struct {
 	// Timeout 是获取文件锁的最长等待时间；0 表示无限等待。
 	Timeout time.Duration
-	// NoSync 关闭每次提交的 fsync（更快；崩溃可能丢最近已提交事务）。
-	NoSync bool
+	// Sync 为 true 时每次提交都 fsync：进程/机器崩溃不丢已确认写入，吞吐显著下降。
+	// 默认 false（不 fsync）：高速模式，进程崩溃或断电可能丢最近已提交事务
+	// —— 与 jsonl/leveldb/badger 基座的 Sync 选项同极性。
+	Sync bool
 }
 
 // 桶布局：KV 与 TTL 分开存放（Set 不改变已有 TTL，对齐 SSDB 语义）；
@@ -52,7 +54,7 @@ type Provider struct {
 // Open 打开（不存在则创建）数据库文件。
 func Open(ctx context.Context, path string, cfg Config) (*Provider, error) {
 	_ = ctx
-	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: cfg.Timeout, NoSync: cfg.NoSync})
+	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: cfg.Timeout, NoSync: !cfg.Sync})
 	if err != nil {
 		return nil, fmt.Errorf("bolt: open %s: %w", path, err)
 	}
@@ -66,15 +68,20 @@ func Open(ctx context.Context, path string, cfg Config) (*Provider, error) {
 	return p, nil
 }
 
-// OpenURI 解析 bolt://<path>?nosync=1&timeout=5s。
+// OpenURI 解析 bolt://<path>?sync=1&timeout=5s。
 func OpenURI(ctx context.Context, u *url.URL) (core.KvProvider, error) {
 	p := u.Path
 	if u.Host != "" {
 		p = strings.TrimPrefix(u.Host+u.Path, "/")
 	}
 	var cfg Config
-	if v := u.Query().Get("nosync"); v == "1" || v == "true" {
-		cfg.NoSync = true
+	if v := u.Query().Get("sync"); v == "1" || v == "true" {
+		cfg.Sync = true
+	}
+	if v, ok := u.Query()["nosync"]; ok {
+		// 旧参数已废弃：本基座默认即不 fsync，nosync=1 已无意义；而它的字面含义
+		// 会让使用者误以为"只有写了 nosync 才高速"，这里直接报错点明。
+		return nil, fmt.Errorf("bolt: nosync 参数已废弃（默认即不 fsync，去掉了 %q）；如需逐提交 fsync 请用 sync=1", v)
 	}
 	if t := u.Query().Get("timeout"); t != "" {
 		// 必须报错而不是静默忽略：Timeout 留 0 意味着 bbolt 获取文件锁

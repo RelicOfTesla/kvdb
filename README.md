@@ -102,7 +102,7 @@ jsonl://./data.jsonl?sync=1        # 默认逐操作 flush 不 fsync；sync=1 �
 jsonl://./data.jsonl?buffered=1    # 攒 32KiB 缓冲，空闲 100ms 自动落盘（约 2× 写吞吐）
 sqlite://./data.db?sync=0          # 缺省 FULL（逐提交 fsync）；sync=0 用 NORMAL（更快，崩溃可能丢最近提交）
 sqlite://./data.db?table_prefix=app_       # 表名前缀（mysql/pg 同名参数）
-bolt://./data.bolt?nosync=1        # nosync=1 关闭 fsync（更快，崩溃可能丢最近提交）
+bolt://./data.bolt?sync=1           # 缺省不 fsync（高速，崩溃可能丢最近提交）；sync=1 逐提交 fsync
 leveldb://./data.dir?sync=1&cache=8&wb=4     # 目录型存储；默认不 fsync，sync=1 逐提交 fsync；cache/wb 单位 MiB
 badger://./data.dir?sync=1&cache=64&memtable=64   # 目录型存储；默认不 fsync，sync=1 逐提交 fsync；cache/memtable 单位 MiB
 mysql://user:pass@host:3306/dbname?parseTime=true&table_prefix=app_
@@ -477,10 +477,14 @@ SQLite 采用纯 Go 驱动（modernc），吞吐与 CGO 驱动相当，不引入
 | leveldb · tmpfs | ~137.0k | ~1.0M | ~111.8k | ~122.4k | ~108.5k | ~1.0M | ~381.8k |
 | badger · tmpfs | ~67.0k | ~274.4k | ~63.5k | ~34.0k | ~53.1k | ~638.4k | ~461.5k |
 | sqlite · tmpfs | ~12.0k | ~60.6k | ~5.7k | ~5.8k | ~7.3k | ~447.9k | ~35.6k |
-| jsonl · ext4 | ~177.0k | ~10.0M | ~190.1k | ~242.2k | ~315.3k | ~14.1M | ~548.7k |
-| bolt · ext4 | ~426 | ~591.1k | ~461 | ~481 | ~518 | ~2.6M | ~38.6k |
-| leveldb · ext4 | ~1.3k | ~1.0M | ~1.4k | ~448 | ~1.4k | ~1.0M | ~92.8k |
-| badger · ext4 | ~757 | ~272.0k | ~741 | ~620 | ~724 | ~608.2k | ~29.4k |
+| jsonl · ext4（缺省） | ~215.5k | ~10.0M | ~190.1k | ~242.2k | ~268.9k | ~14.1M | ~498.7k |
+| jsonl · ext4（`sync=1`） | ~377 | ~10.0M | — | — | ~410 | ~14.1M | — |
+| bolt · ext4（缺省） | ~25.2k | ~591.1k | ~22.9k | ~26.9k | ~20.9k | ~2.6M | ~473.8k |
+| bolt · ext4（`sync=1`） | ~449 | ~591.1k | — | — | ~464 | ~2.6M | — |
+| leveldb · ext4（缺省） | ~164.6k | ~1.0M | ~111.8k | ~122.4k | ~111.8k | ~1.0M | ~354.2k |
+| leveldb · ext4（`sync=1`） | ~1.3k | ~1.0M | — | — | ~1.3k | ~1.0M | — |
+| badger · ext4（缺省） | ~81.8k | ~274.4k | ~63.5k | ~34.0k | ~64.7k | ~608.2k | ~493.8k |
+| badger · ext4（`sync=1`） | ~748 | ~272.0k | — | — | ~736 | ~608.2k | — |
 | sqlite · ext4 | ~559 | ~61.3k | ~312 | ~316 | ~358 | ~453.0k | ~30.4k |
 | jsonl · 9p | ~1.4k | ~9.6M | ~1.5k | ~1.5k | ~1.6k | ~13.3M | ~110.3k |
 | bolt · 9p | ~89 | ~589.5k | ~91 | ~88 | ~94 | ~2.6M | ~7.1k |
@@ -492,12 +496,14 @@ SQLite 采用纯 Go 驱动（modernc），吞吐与 CGO 驱动相当，不引入
 | mysql 8.0 | ~718 | ~5.3k | ~428 | ~119 | ~400 | ~95.6k | ~4.6k |
 | pg 16 | ~2.4k | ~9.9k | ~2.2k | ~647 | ~1.4k | ~185.7k | ~8.8k |
 
-① jsonl 默认只 flush 到 OS、不逐条 fsync（`?sync=1` 才是每写一次 fsync）：比较时
-须先对齐持久化等级。
+① 嵌入式基座缺省档不逐条 fsync，`?sync=1` 才逐提交 fsync（sqlite 例外：缺省即 FULL）；
+比较时须先对齐持久化等级。**缺省档与 `sync=1` 在真实 ext4 上差 56–570×**（见
+[PERFORMANCE.md](PERFORMANCE.md) §1.1）——"要不要 sync=1"比"选哪个基座"影响更大。
+② `sync=1` 行只列 Set/QPush：读路径不受 fsync 影响，与缺省档相同。
 
-读路径几乎不受介质影响（leveldb Get 三档均 ~1.0M、badger ~272–298k），而写路径跨介质差 2–3 个数量级
-（bolt Set：22.1k → 426 → 89）。服务端基座的**读**吞吐低于嵌入式（redis Get ~12.4k vs
-bolt ~590k），瓶颈是网络往返。完整分析见 [PERFORMANCE.md](PERFORMANCE.md)。
+读路径几乎不受介质影响（leveldb Get 三档均 ~1.0M、badger ~272–298k），而写路径跨介质差 2–3 个数量级。
+服务端基座的**读**吞吐低于嵌入式（redis Get ~12.4k vs bolt ~590k），瓶颈是网络往返。
+完整分析见 [PERFORMANCE.md](PERFORMANCE.md)。
 
 ### 读写混合下的相互影响
 
@@ -529,9 +535,10 @@ bolt ~590k），瓶颈是网络往返。完整分析见 [PERFORMANCE.md](PERFORM
 
 - **服务端基座读写互不阻塞**（各保留 ~44–63%，只是把并发度对半分）；`mem`/`jsonl`
   因共用全局锁，高写频率下读只剩纯读的 5–9%。
-- **`badger` 的读保留率由"写提交窗口"决定**：默认逐条 fsync 时，一次提交在 9p/ext4
-  上要 1.3–3 ms，读者排在提交锁之后，读保留率只剩 0.2–0.4%；换成 `?nosync=1` 后同一
-  组负载在 9p 上读回到 92.7k ops/s（保留率 ~33%）。这是它与其他嵌入式基座最不一样的地方。
+- **`badger` 的读保留率由"写提交窗口"决定**：`?sync=1` 逐条 fsync 时，一次提交在
+  9p/ext4 上要 1.3–3 ms，读者排在提交锁之后，读保留率只剩 0.2–0.4%；**缺省档（不 fsync）
+  已消除该现象**——同一组负载在 ext4 上读回到 76.4k ops/s（保留率 ~28%）。这是它与其他
+  嵌入式基座最不一样的地方。
 - **掉幅取决于写者进入共享同步原语的频率，而非介质带宽**：同一基座的写频率越低
   （如 9p 上），读保留率越高——盘慢反而让读者更容易穿插。所以"Get 比 Set 快几十倍"
   只在低写负载下成立。

@@ -102,7 +102,7 @@ jsonl://./data.jsonl?sync=1        # 默认逐操作 flush 不 fsync；sync=1 �
 jsonl://./data.jsonl?buffered=1    # 攒 32KiB 缓冲，空闲 100ms 自动落盘（约 2× 写吞吐）
 sqlite://./data.db?sync=0          # 缺省 FULL（逐提交 fsync）；sync=0 用 NORMAL（更快，崩溃可能丢最近提交）
 sqlite://./data.db?table_prefix=app_       # 表名前缀（mysql/pg 同名参数）
-bolt://./data.bolt?sync=1           # 缺省不 fsync（高速，崩溃可能丢最近提交）；sync=1 逐提交 fsync
+bolt://./data.bolt?sync=1&sync_interval=1s   # 缺省不逐提交 fsync，但按 sync_interval 周期落盘（缺省 1s）；sync=1 逐提交 fsync
 leveldb://./data.dir?sync=1&cache=8&wb=4     # 目录型存储；默认不 fsync，sync=1 逐提交 fsync；cache/wb 单位 MiB
 badger://./data.dir?sync=1&cache=64&memtable=64   # 目录型存储；默认不 fsync，sync=1 逐提交 fsync；cache/memtable 单位 MiB
 mysql://user:pass@host:3306/dbname?parseTime=true&table_prefix=app_

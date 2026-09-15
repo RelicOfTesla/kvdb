@@ -39,10 +39,17 @@ drvfs(9p) 3.8–5.5 ms。**本环境的"常规磁盘"是 WSL vhdx，一次 fsync
 |---|---|---|---|
 | jsonl | 逐操作 flush，不 fsync | 每次写 flush + fsync | 缺省档写失败立刻报错 |
 | jsonl | `?buffered=1`：缓冲 + 空闲 100ms 落盘 | — | 磨合并发写，见 §2.4 |
-| bolt | 不 fsync | 逐提交 fsync | bbolt `NoSync=true` |
+| bolt | 不逐提交 fsync，**周期落盘（缺省 1s）** | 逐提交 fsync | bbolt `NoSync=true` + SDK 自建周期 Sync；`?sync_interval=1s` 可调 |
 | leveldb | 不 fsync | 逐提交 fsync | goleveldb `WriteOptions.Sync=false` |
 | badger | 不 fsync | 逐提交 fsync | `WithSyncWrites(false)` |
 | sqlite | `FULL`（逐提交 fsync） | — | `?sync=0` 用 `NORMAL`（较快，崩溃可能丢最近提交） |
+
+**缺省档不等于"永不落盘"**：各基座都有有界兜底——bolt 按 `SyncInterval`（缺省 1s）
+周期落盘、jsonl 缓冲档按空闲 100ms 落盘，且两者 `Close` 都强制落盘一次（bbolt 自身的
+`Close` **不做** fdatasync，这一层必须由 SDK 补上）。放弃的只是"每次提交都保证落盘"：
+崩溃最多丢最近一个落盘周期内的已确认写入。用 strace 实证（静置 600ms、写入 1 次）：
+`sync_interval=100ms` 时 9 次 fdatasync，调到 5s 时降到 4 次——落盘频率确实由该参数
+控制，而不是"写完最后一批就再也不落盘"。
 
 旧参数 `nosync` 已全部废弃并 **报错**（不静默接受）：缺省即不 fsync，残留的
 "写了 nosync 才高速"的认知会让人误判持久化等级。sqlite 是唯一"缺省即耐久"的本地

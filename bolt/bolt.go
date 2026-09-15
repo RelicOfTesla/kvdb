@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -21,6 +22,10 @@ import (
 
 var _ core.FullProvider = (*Provider)(nil)
 
+// DefaultSyncInterval 是缺省档（Sync=false）下周期落盘的间隔：距上次落盘超过
+// 这么久且期间有写入，就把脏页交给 OS（不再等下一次写、也不等 Close）。
+const DefaultSyncInterval = time.Second
+
 // Config 控制打开行为。
 type Config struct {
 	// Timeout 是获取文件锁的最长等待时间；0 表示无限等待。
@@ -28,7 +33,13 @@ type Config struct {
 	// Sync 为 true 时每次提交都 fsync：进程/机器崩溃不丢已确认写入，吞吐显著下降。
 	// 默认 false（不 fsync）：高速模式，进程崩溃或断电可能丢最近已提交事务
 	// —— 与 jsonl/leveldb/badger 基座的 Sync 选项同极性。
+	//
+	// 注意缺省档**不是"永不落盘"**：由 SyncInterval 兜底周期落盘（见下），
+	// 且 Close 前会强制落盘一次。它放弃的只是"每次提交都保证落盘"。
 	Sync bool
+	// SyncInterval 是缺省档（Sync=false）的周期落盘间隔；<=0 用 DefaultSyncInterval。
+	// 仅在 Sync=false 时生效（Sync=true 时每次提交本来就 fsync）。
+	SyncInterval time.Duration
 }
 
 // 桶布局：KV 与 TTL 分开存放（Set 不改变已有 TTL，对齐 SSDB 语义）；
@@ -49,6 +60,18 @@ type Provider struct {
 	path      string
 	closed    atomic.Bool
 	lastSweep atomic.Int64 // 上次过期回收时刻（unix 秒），节流写事务内的清理
+	// 缺省档（Sync=false）的周期落盘状态。syncOn 为 false 时下面这些不参与。
+	syncOn   bool
+	interval time.Duration // 周期落盘间隔
+	lastSync atomic.Int64  // 上次落盘时刻（unix 纳秒；间隔可配到亚秒级）
+	idle     *time.Timer   // 空闲兜底：长时间无写入也把脏页交出去
+	// syncMu 串行化"落盘/关闭"：db.Sync() 与 db.Close() 都操作底层 fd，
+	// 并发调用是数据竞争（bbolt 只保证事务级并发安全，不覆盖这两个）。
+	// 空闲回调必须与 Close 互斥，否则会出现"一边 fdatasync、一边关 fd"。
+	syncMu sync.Mutex
+	// pending 记录落盘失败的粘性错误：后台回调里失败不能在后台吞掉，
+	// 下一次写或 Close 必须把它报给调用方。
+	pending atomic.Pointer[error]
 }
 
 // Open 打开（不存在则创建）数据库文件。
@@ -59,16 +82,105 @@ func Open(ctx context.Context, path string, cfg Config) (*Provider, error) {
 		return nil, fmt.Errorf("bolt: open %s: %w", path, err)
 	}
 	p := &Provider{db: db, path: path}
+	p.syncOn = !cfg.Sync
+	if p.syncOn {
+		p.interval = cfg.SyncInterval
+		if p.interval <= 0 {
+			p.interval = DefaultSyncInterval
+		}
+	}
 	if err := p.init(); err != nil {
 		db.Close()
 		return nil, err
 	}
+	now := core.Now()
 	// init 已做过一次全量清理，节流起点从现在起算。
-	p.lastSweep.Store(core.NowUnix())
+	p.lastSweep.Store(now.Unix())
+	if p.syncOn {
+		// 落盘起点在 init 之后：init 自己的写入已由这次初始 Sync 覆盖。
+		if err := db.Sync(); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("bolt: initial sync: %w", err)
+		}
+		p.lastSync.Store(now.UnixNano())
+		// 空闲兜底计时器：初值设很大，等第一次写入时 Reset 到 interval，
+		// 这样"没有写入"就不会产生任何唤醒（也就没有空转开销）。
+		p.idle = time.AfterFunc(time.Hour, p.syncIdle)
+	}
 	return p, nil
 }
 
-// OpenURI 解析 bolt://<path>?sync=1&timeout=5s。
+// syncIfDue 在缺省档下按 SyncInterval 节流落盘；由写路径调用，空转时零开销。
+// 顺带把上一次后台落盘的失败报出来，避免它被静默吞掉。
+// 只在写事务**结束之后**取 syncMu，因此不会与 Close 等待事务形成死锁。
+func (p *Provider) syncIfDue() error {
+	if !p.syncOn {
+		return nil
+	}
+	if err := p.takePending(); err != nil {
+		return err
+	}
+	// 先把空闲兜底推到"从现在起 interval 之后"：它的语义是"距最后一次写入
+	// interval 仍无新写入就落盘"。必须在节流判断之前做——否则在周期未到时
+	// 提前返回，计时器会一直停在 Open 时设的初值（等于永不空闲落盘）。
+	if p.idle != nil {
+		p.idle.Reset(p.interval)
+	}
+	now := core.Now()
+	if now.UnixNano()-p.lastSync.Load() < int64(p.interval) {
+		return nil
+	}
+	p.syncMu.Lock()
+	defer p.syncMu.Unlock()
+	// 等锁期间可能已被 Close：此时跳过落盘（Close 自己会做最后一次 Sync）。
+	if p.closed.Load() {
+		return nil
+	}
+	// 先记时间戳再落盘：即便本次落盘失败也不必立刻重试（避免出错时每次写都
+	// 触发一次失败的 fsync 拖慢写路径），失败会由上面/Close 上报。
+	p.lastSync.Store(now.UnixNano())
+	if err := p.db.Sync(); err != nil {
+		return fmt.Errorf("bolt: periodic sync: %w", err)
+	}
+	return nil
+}
+
+// syncIdle 是空闲兜底回调：连续 interval 没有写入也把脏页交给 OS。
+// 失败必须留痕（后台不能吞），由后续写或 Close 上报。
+// 全程持 syncMu：与 Close 的"关 fd"互斥，避免对同一 fd 并发 Sync/Close。
+func (p *Provider) syncIdle() {
+	p.syncMu.Lock()
+	defer p.syncMu.Unlock()
+	if p.closed.Load() {
+		return
+	}
+	if err := p.db.Sync(); err != nil {
+		p.setPending(fmt.Errorf("bolt: idle sync: %w", err))
+		return
+	}
+	p.lastSync.Store(core.Now().UnixNano())
+	p.idle.Reset(p.interval)
+}
+
+// setPending 记录落盘失败的粘性错误（只保留第一个）。
+func (p *Provider) setPending(err error) {
+	if err == nil {
+		return
+	}
+	p.pending.CompareAndSwap(nil, &err)
+}
+
+// takePending 取出并清空粘性错误。
+func (p *Provider) takePending() error {
+	if pe := p.pending.Swap(nil); pe != nil {
+		return *pe
+	}
+	return nil
+}
+
+// OpenURI 解析 bolt://<path>?sync=1&timeout=5s&sync_interval=1s。
+// 缺省档（不写 sync=1）不逐提交 fsync，但按 sync_interval（缺省 1s）周期落盘，
+// 且 Close 前强制落盘一次。
 func OpenURI(ctx context.Context, u *url.URL) (core.KvProvider, error) {
 	p := u.Path
 	if u.Host != "" {
@@ -92,6 +204,18 @@ func OpenURI(ctx context.Context, u *url.URL) (core.KvProvider, error) {
 		}
 		cfg.Timeout = d
 	}
+	if s := u.Query().Get("sync_interval"); s != "" {
+		// 同样必须报错而不是静默忽略：写错单位会让周期落盘退化成默认值，
+		// 而使用者以为自己已经调过（这是"以为安全其实没有"的一类误解）。
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return nil, fmt.Errorf("bolt: bad sync_interval %q: %w", s, err)
+		}
+		if d <= 0 {
+			return nil, fmt.Errorf("bolt: sync_interval must be positive, got %q", s)
+		}
+		cfg.SyncInterval = d
+	}
 	return Open(ctx, p, cfg)
 }
 
@@ -113,12 +237,32 @@ func (p *Provider) init() error {
 	})
 }
 
-// Close 关闭数据库。
+// Close 关闭数据库。缺省档（Sync=false）下 bbolt 的 Close 只 munmap + 关 fd、
+// **不做 fdatasync**，因此这里必须补一次 Sync，否则正常关闭也可能留下未落盘的
+// 已提交事务（进程安全退出却丢数据，是最不该出现的一类丢失）。
 func (p *Provider) Close() error {
+	p.syncMu.Lock()
+	defer p.syncMu.Unlock()
 	if p.closed.Swap(true) {
 		return nil
 	}
-	return p.db.Close()
+	if p.idle != nil {
+		// Stop 返回 false 说明回调已在跑：它会阻塞在 syncMu 上，等我们放开锁后
+		// 看到 closed=true 直接返回，不会碰已关闭的 fd。
+		p.idle.Stop()
+	}
+	var err error
+	if p.syncOn {
+		// 先报后台/周期落盘留下的失败（真实丢数据信号），再补最后一次落盘。
+		err = p.takePending()
+		if serr := p.db.Sync(); serr != nil && err == nil {
+			err = fmt.Errorf("bolt: close sync: %w", serr)
+		}
+	}
+	if cerr := p.db.Close(); cerr != nil && err == nil {
+		err = cerr
+	}
+	return err
 }
 
 func (p *Provider) check() error {
@@ -139,7 +283,7 @@ func (p *Provider) update(fn func(*bolt.Tx) error) error {
 	if err := p.check(); err != nil {
 		return err
 	}
-	return p.db.Update(func(tx *bolt.Tx) error {
+	err := p.db.Update(func(tx *bolt.Tx) error {
 		// 写事务开头按节流回收过期条目：TTL 磨损负载下过期键可能不再被
 		// 任何写触碰，挂在写事务上保证长期运行进程的磁盘占用有界
 		//（Open 时另有一次全量清理）。清理失败回滚整个事务，可重试。
@@ -152,6 +296,12 @@ func (p *Provider) update(fn func(*bolt.Tx) error) error {
 		}
 		return fn(tx)
 	})
+	if err != nil {
+		return err
+	}
+	// 缺省档按 SyncInterval 周期落盘：bbolt 在 NoSync 下提交只写页缓存，
+	// 这里保证"有写入就会在有界时间内落盘"，而不是攒到 Close。
+	return p.syncIfDue()
 }
 
 // ---- 键编码 ----

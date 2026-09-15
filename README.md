@@ -21,6 +21,8 @@ n, err := db.Incr(ctx, "visits", 1)
 - **接口化返回**：`kvdb.Open` 返回接口 `DB`，业务可窄依赖 `KvProvider` 等子接口，便于 mock
 - **批量写**：一批操作映射到各基座原生机制（事务 / MULTI/EXEC / 流水线 / 单次 flush）
 - **字节 ↔ 泛型辅助**：`B` / `P` / `D` / `DMust` 支持标量与结构体（默认 JSON，编解码可替换），标量编码与 `Incr` 互操作
+- **本地变远程（c/s）**：`rpc` 把任一基座暴露成服务端，客户端用同一组接口访问；
+  客户端**不感知服务端底座**，自带 c/s 认证（明文 / 挑战-响应）与可选 TLS，协议编解码可替换
 - **Go 1.27.1+ 可选薄壳**：`kvdb.Typed(db)` 提供 `db.Get[T](...)` 泛型方法（构建约束隔离）
 - 纯 Go 依赖，无 CGO
 
@@ -35,7 +37,9 @@ n, err := db.Incr(ctx, "visits", 1)
 | `kvdb/ssdb`、`kvdb/leveldb` | 1.19 | 用到 `atomic.Bool` / `atomic.Pointer[T]` |
 | `kvdb/badger` | 1.24 | Badger v4 自身声明 `go 1.24.0` |
 | `kvdb/bolt`、`kvdb/sqlite`、`kvdb/mysql`、`kvdb/pg`、`kvdb/redis` | 1.25 | 由驱动及其传递依赖决定（如 `golang.org/x/sys` 要求 1.25） |
+| `kvdb/rpc` | 1.19 | 仅标准库 + 根包：**零第三方依赖**（客户端尤其重要） |
 | `kvdb/all`、`kvdb/bench`、`kvdb/example` | 1.25 | 聚合了上述模块 |
+| `kvdb/rpcserver` | 1.25 | 可直接运行的 RPC 服务端命令（import `all` 接入全部底座） |
 
 版本按各模块**依赖图里最大的 `go` 指令**取（`go list -m -f '{{.GoVersion}}' all`），
 不是照抄直接依赖的声明值。
@@ -94,16 +98,17 @@ URI 一览（各包也提供等价的直接构造函数，如 `sqlite.Open`）�
 
 ```
 mem://
-jsonl://./data.jsonl?sync=1        # sync=1 每次写 fsync
+jsonl://./data.jsonl?sync=1        # 默认不 fsync；sync=1 每次写 fsync
 sqlite://./data.db?table_prefix=app_       # 表名前缀（mysql/pg 同名参数）
 bolt://./data.bolt?nosync=1        # nosync=1 关闭 fsync（更快，崩溃可能丢最近提交）
-leveldb://./data.dir?nosync=1&cache=8&wb=4   # 目录型存储；cache/wb 单位 MiB
-badger://./data.dir?nosync=1&cache=64&memtable=64   # 目录型存储；cache/memtable 单位 MiB
+leveldb://./data.dir?sync=1&cache=8&wb=4     # 目录型存储；默认不 fsync，sync=1 逐提交 fsync；cache/wb 单位 MiB
+badger://./data.dir?sync=1&cache=64&memtable=64   # 目录型存储；默认不 fsync，sync=1 逐提交 fsync；cache/memtable 单位 MiB
 mysql://user:pass@host:3306/dbname?parseTime=true&table_prefix=app_
 pg://user:pass@host:5432/dbname?sslmode=disable&table_prefix=app_
 redis://:password@host:6379/0?key_prefix=app:   # 键命名空间前缀
 ssdb://host:8888?key_prefix=app:              # SSDB 无 namespace，用逻辑前缀隔离
 ssdb://:password@host:8888         # 服务端启用 server.auth 时
+rpc://host:7788?auth=challenge&password=s3cret   # 连 RPC 服务端（详见「本地变远程」）
 ```
 
 **与其他应用共用一套存储时用前缀隔离**：`sqlite/mysql/pg` 的 `Config.TablePrefix`
@@ -127,6 +132,7 @@ ssdb://:password@host:8888         # 服务端启用 server.auth 时
 | PostgreSQL | `pg` | ✅ | ✅ | ✅ | 共享 `sqlstore` |
 | Redis | `redis` | ✅ | ✅ | ✅ | String / List / Sorted Set 原生映射 |
 | SSDB | `ssdb` | ✅ | ✅ | ✅ | 原生文本协议客户端，连接池 + 认证 |
+| RPC | `rpc` | ✅ | ✅ | ✅ | 连远端 kvdb 服务端；能力随服务端底座，客户端不感知底座 |
 
 导入路径为 `github.com/RelicOfTesla/kvdb/<子包>`，另有聚合包 `.../all`。
 
@@ -318,6 +324,110 @@ func init() {
 `kvdb.Register` 返回重复/空 scheme 错误；`kvdb.Schemes()` 列出已注册 scheme。
 `FullProvider` 用于整体声明"KV + Queue + ZSet + Batch + Close"全部能力。
 
+## 本地变远程（RPC / c-s）
+
+把任一基座放到服务端，客户端经网络用**同一组接口**访问它——用于跨进程/跨机隔离、
+把嵌入式基座（jsonl/bolt/sqlite…）变成可供多个消费者共享的服务。
+
+```go
+// 服务端：选一个底座即可（server 侧 import 对应基座包或 .../all）
+srv, err := rpc.NewServer(ctx, rpc.ServerConfig{
+    Addr:     ":7788",
+    Backend:  "jsonl://./data.jsonl",   // 换成 bolt/sqlite/mysql/ssdb… 客户端都不用改
+    Auth:     rpc.AuthChallenge,
+    Password: "s3cret",
+})
+go srv.Serve(ctx)
+
+// 客户端：不 import 任何基座，也无需知道对端是什么
+db, err := kvdb.Open(ctx, "rpc://127.0.0.1:7788?auth=challenge&password=s3cret")
+defer db.Close()
+db.Set(ctx, "k", []byte("v"))           // KV / Queue / ZSet / Batch 全部可用
+```
+
+也可直接跑现成的服务端命令：
+
+```bash
+go run ./rpcserver -addr :7788 -backend jsonl://./data.jsonl -auth challenge -password s3cret
+```
+
+要点：
+
+- **客户端不感知底座**：`rpc` 实现的是 `core.FullProvider`，与本地基座同一组接口。
+  连的是 jsonl 还是 mysql，客户端代码完全一致；换底座只改服务端一个参数。
+- **`rpc` 模块零第三方依赖**（仅标准库 + 根包），客户端侧只引入 `kvdb` + `kvdb/rpc`。
+- **能力如实透传**：`db.Capabilities()` 报告的正是**服务端底座**的能力，含
+  `BatchComposed`——底层是 leveldb 就报 `false`，不会因为套了一层 RPC 而"变强"。
+- **哨兵错误原样过线**：`ErrUnsupported` / `ErrClosed` / `ErrNotInteger` /
+  `ErrInvalidTTL` / `ErrNotFound` 在客户端可用 `errors.Is` 正常判等。
+- **批写一次往返**：`db.Batch(...)` 整批发给服务端，由底座一次提交；批内可见性
+  取决于底座本身（与本地直连一致）。
+- **生命周期边界**：客户端 `Close()` 只关自己的连接，不会关掉服务端基座。
+
+### 认证（c/s 协议自己的认证，与底座 auth 无关）
+
+| 模式 | URI 参数 | 说明 |
+|---|---|---|
+| 无认证 | `auth=none`（默认） | 本机/内网裸奔 |
+| 明文 | `auth=plain&password=…` | 口令直接发送；**默认不打开**，仅在已有 TLS/unix socket 时用 |
+| 挑战-响应 | `auth=challenge&password=…` | 服务端下发一次性 nonce，客户端回 `HMAC-SHA256(password, nonce)`；**口令不上线**，且重放无效。需要认证时选它 |
+
+口令也可写在 userinfo 里：`rpc://:s3cret@host:7788?auth=challenge`。
+给了口令却没写 `auth=` 会直接报错，避免"以为加密了其实没开"。
+
+> 这里是**传输层**的认证。底座自身的认证（如 mysql 用户口令、ssdb `server.auth`）
+> 由服务端在连接底座时处理，客户端不承担也不应感知。
+
+### TLS
+
+标准 `crypto/tls`，**同一端口按服务端配置切换**（给证书即 TLS，不给即明文）：
+
+```bash
+rpc://host:7788?tls=1&ca=./ca.pem                                  # 校验服务端
+rpc://host:7788?tls=1&ca=./ca.pem&cert=./c.pem&key=./c.key         # 双向 TLS
+rpc://host:7788?tls=1&server_name=kvdb.internal
+rpc://host:7788?tls=1&insecure=1                                   # 跳过校验，仅测试
+```
+
+给了 TLS 参数却没写 `tls=1` 会报错；用明文连 TLS 端口会失败，**不会静默降级**。
+
+### 协议与 codec
+
+默认使用一套**仿 Redis（RESP2）**的报文格式，因此抓包可读、也能用 `nc` 手测：
+
+```
+$ nc 127.0.0.1 7788
+$3
+SET
+*2
+$1
+k
+$1
+v
+
+:1
++ok
+
+```
+
+编解码抽象成 `rpc/codec.Codec`，可整体替换；内置 `resp`（默认）与 `binary`
+（uvarint 长度前缀，省掉文本转义）。两端必须装配同一个：
+
+```go
+rpc.ServerConfig{Codec: rpc.CodecBinary}
+rpc.Config{Codec: rpc.CodecBinary}          // 或 URI 加 ?codec=binary
+```
+
+连接建立时双方会交换 codec 名称，不一致立即报错（而不是互等到超时）。
+
+### 其他可用参数
+
+| 参数 | 说明 |
+|---|---|
+| `pool=N` | 客户端连接池大小（默认 8）。单连接一次只跑一条命令，并发靠多连接 |
+| `codec=resp\|binary` | 报文编解码 |
+| `max-conns`（服务端） | 最大并发连接数 |
+
 ## 兼容性
 
 | 依赖 | 已验证版本 |
@@ -442,6 +552,7 @@ done
 ```bash
 cd mem    && go test ./...     # 本地基座 + 进程内替身（miniredis、假 SSDB）
 cd sqlite && go test ./...
+cd rpc    && go test ./...     # RPC：合同用例跨 RPC、三种认证、TLS、codec、多种真实底座
 ```
 
 真实基座用例默认跳过，设置对应环境变量后启用（端口按需调整，避免与本地服务冲突）：
@@ -489,6 +600,9 @@ registry.go            Register / MustRegister / Schemes
 kvdbtest/              跨基座共享合同用例（公开包，供各基座模块测试引用）
 all/                   聚合注册包：import _ 即接入全部内置基座
 mem/ jsonl/ bolt/ leveldb/ badger/ sqlite/ mysql/ pg/ redis/ ssdb/   各基座实现（各自独立模块）
+rpc/                   RPC 客户端与服务端（独立模块，零第三方依赖）
+rpc/codec/             报文编解码抽象 + RESP（默认）/ binary 两套实现
+rpcserver/             可运行的 RPC 服务端命令（独立模块，import .../all）
 sqlstore/              MySQL / SQLite / PG 共享的 database/sql 实现（方言参数化）
 bench/                 基准测试（独立模块，import .../all）
 example/               可运行演示

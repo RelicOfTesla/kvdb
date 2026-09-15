@@ -17,6 +17,7 @@ require (
 	github.com/RelicOfTesla/kvdb/mysql v0.0.0 // indirect
 	github.com/RelicOfTesla/kvdb/pg v0.0.0 // indirect
 	github.com/RelicOfTesla/kvdb/redis v0.0.0 // indirect
+	github.com/RelicOfTesla/kvdb/rpc v0.0.0 // indirect
 	github.com/RelicOfTesla/kvdb/sqlite v0.0.0 // indirect
 	github.com/RelicOfTesla/kvdb/sqlstore v0.0.0 // indirect
 	github.com/RelicOfTesla/kvdb/ssdb v0.0.0 // indirect
@@ -67,6 +68,7 @@ replace (
 	github.com/RelicOfTesla/kvdb/mysql => ../mysql
 	github.com/RelicOfTesla/kvdb/pg => ../pg
 	github.com/RelicOfTesla/kvdb/redis => ../redis
+	github.com/RelicOfTesla/kvdb/rpc => ../rpc
 	github.com/RelicOfTesla/kvdb/sqlite => ../sqlite
 	github.com/RelicOfTesla/kvdb/sqlstore => ../sqlstore
 	github.com/RelicOfTesla/kvdb/ssdb => ../ssdb

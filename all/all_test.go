@@ -13,7 +13,7 @@ import (
 )
 
 func TestAllSchemesRegistered(t *testing.T) {
-	want := []string{"badger", "bolt", "jsonl", "leveldb", "mem", "mysql", "pg", "redis", "sqlite", "ssdb"}
+	want := []string{"badger", "bolt", "jsonl", "leveldb", "mem", "mysql", "pg", "redis", "rpc", "sqlite", "ssdb"}
 	got := kvdb.Schemes()
 	set := make(map[string]bool, len(got))
 	for _, s := range got {

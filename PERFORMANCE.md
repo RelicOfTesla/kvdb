@@ -132,10 +132,10 @@ drvfs(9p) 3.8–5.5 ms。**本环境的"常规磁盘"是 WSL vhdx，一次 fsync
 | bolt | ext4 | ~500k | ~491 | 85% | 115% |
 | bolt | 9p | ~319k | ~119 | 54% | 134% |
 | leveldb | tmpfs | ~109k | ~58.8k | 11% | 43% |
-| badger | tmpfs | ~74.6k | ~40.3k | 27% | 60% |
 | leveldb | ext4 | ~736k | ~827 | 74% | 64% |
-| badger | ext4 | ~1.0k | ~689 | 0.4% | 91% |
 | leveldb | 9p | ~658k | ~658 | 60% | 66% |
+| badger | tmpfs | ~74.6k | ~40.3k | 27% | 60% |
+| badger | ext4 | ~1.0k | ~689 | 0.4% | 91% |
 | badger | 9p | ~497 | ~314 | 0.2% | 98% |
 | sqlite | tmpfs | ~37k | ~6.7k | 61% | 56% |
 | sqlite | ext4 | ~74k | ~409 | 121% | 73% |

@@ -1,15 +1,15 @@
-module github.com/RelicOfTesla/kvdb/example
+module github.com/RelicOfTesla/kvdb/rpcserver
 
 go 1.25.0
 
 require (
-	github.com/RelicOfTesla/kvdb v0.0.0
 	github.com/RelicOfTesla/kvdb/all v0.0.0
 	github.com/RelicOfTesla/kvdb/rpc v0.0.0
 )
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
+	github.com/RelicOfTesla/kvdb v0.0.0 // indirect
 	github.com/RelicOfTesla/kvdb/badger v0.0.0 // indirect
 	github.com/RelicOfTesla/kvdb/bolt v0.0.0 // indirect
 	github.com/RelicOfTesla/kvdb/jsonl v0.0.0 // indirect

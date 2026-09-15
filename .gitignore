@@ -21,5 +21,11 @@ go.work.sum
 # `go build ./...` 在 example/ 下会产出同名可执行文件
 example/example
 
+# `go build ./...` 在 rpcserver/ 下会产出同名可执行文件
+rpcserver/rpcserver
+
 # 基准测试的落盘目录：`cd bench` 后按 PERFORMANCE.md §7 用 ./tmp 跑 drvfs(9p) 档
 bench/tmp/
+
+# 示例程序的落盘目录（example/rpcdemo 用 ./tmp 作为演示底座路径）
+example/tmp/

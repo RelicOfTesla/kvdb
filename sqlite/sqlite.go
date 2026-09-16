@@ -25,9 +25,11 @@ type Config struct {
 	TablePrefix string
 	// Sync 控制提交时的落盘强度（映射 PRAGMA synchronous）：
 	//
-	//	SyncFull（缺省）FULL：每个提交都 fsync WAL，断电不丢已确认写入（最慢）。
-	//	SyncNormal      NORMAL：只在 checkpoint 时 fsync；WAL 模式下崩溃可能丢
-	//	                 最近的若干已提交事务，但库文件不会被写坏（更快）。
+	//	SyncNormal（缺省）NORMAL：只在 checkpoint 时 fsync；WAL 模式下进程崩溃不丢
+	//	                    （数据已在 OS 页缓存，WAL 有全部记录），机器掉电可能丢
+	//	                    最近若干已提交事务，但库文件不会被写坏。与其他本地基座
+	//	                    （jsonl/bolt/leveldb/badger）缺省"不逐提交 fsync"一致。
+	//	SyncFull        FULL：每个提交都 fsync WAL，掉电也不丢已确认写入（最慢）。
 	//
 	// 这里刻意不提供 synchronous=OFF：OFF 在崩溃时可能损坏数据库文件，
 	// 而本选项的契约是"最多丢尾部已确认写入"，不是"可能丢整个库"。
@@ -38,15 +40,17 @@ type Config struct {
 type SyncMode int
 
 const (
-	// SyncFull 是缺省档：PRAGMA synchronous=FULL，逐提交 fsync。
-	SyncFull SyncMode = iota
-	// SyncNormal 是高速档：PRAGMA synchronous=NORMAL，崩溃可能丢最近提交但不损坏库。
-	SyncNormal
+	// SyncNormal 是缺省档：PRAGMA synchronous=NORMAL，高速。
+	// 注意这是**零值**：不填 Sync 或 URI 不写 sync 参数即为此档。
+	SyncNormal SyncMode = iota
+	// SyncFull 是耐久档：PRAGMA synchronous=FULL，逐提交 fsync。
+	SyncFull
 )
 
 // OpenURI 解析 sqlite://<path>[?table_prefix=pfx_][&sync=0|1]；
-// Host 为空表示绝对路径 sqlite:///abs/x。sync 缺省＝FULL（与 SQLite 自身默认
-// 一致），sync=1 显式 FULL，sync=0 用 NORMAL（更快）。
+// Host 为空表示绝对路径 sqlite:///abs/x。
+// sync 缺省与 sync=0 都是 NORMAL（高速，与其他本地基座缺省一致），
+// sync=1 用 FULL（掉电也不丢已确认写入）。
 func OpenURI(ctx context.Context, u *url.URL) (core.KvProvider, error) {
 	p := u.Path
 	if u.Host != "" {
@@ -54,10 +58,10 @@ func OpenURI(ctx context.Context, u *url.URL) (core.KvProvider, error) {
 	}
 	cfg := Config{Path: p, TablePrefix: u.Query().Get("table_prefix")}
 	switch v := u.Query().Get("sync"); v {
-	case "", "1":
-		cfg.Sync = SyncFull
-	case "0":
+	case "", "0":
 		cfg.Sync = SyncNormal
+	case "1":
+		cfg.Sync = SyncFull
 	default:
 		return nil, fmt.Errorf("sqlite: invalid sync %q (want 0 or 1)", v)
 	}
@@ -126,9 +130,10 @@ func sqliteDSN(path string, sync SyncMode) string {
 	// 避免"读事务升级写锁"在并发下直接返回 SQLITE_BUSY（不等待 busy_timeout）。
 	// 用驱动的 _synchronous 简写而非 _pragma：它会校验取值，写错直接报错，
 	// 不会静默降级耐久性；且每条连接都生效（synchronous 是连接级 pragma）。
-	syncName := "FULL"
-	if sync == SyncNormal {
-		syncName = "NORMAL"
+	// 显式列出两档，避免以后加档位时这里的"默认分支"悄悄把新档当成某一档。
+	syncName := "NORMAL"
+	if sync == SyncFull {
+		syncName = "FULL"
 	}
 	return path + sep + "_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_txlock=immediate&_synchronous=" + syncName
 }

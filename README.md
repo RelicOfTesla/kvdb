@@ -100,7 +100,7 @@ URI 一览（各包也提供等价的直接构造函数，如 `sqlite.Open`）�
 mem://
 jsonl://./data.jsonl?sync=1        # 默认逐操作 flush 不 fsync；sync=1 每次写 flush+fsync
 jsonl://./data.jsonl?buffered=1    # 攒 32KiB 缓冲，空闲 100ms 自动落盘（约 2× 写吞吐）
-sqlite://./data.db?sync=0          # 缺省 FULL（逐提交 fsync）；sync=0 用 NORMAL（更快，崩溃可能丢最近提交）
+sqlite://./data.db?sync=1          # 缺省 NORMAL（不逐提交 fsync，与其他本地基座一致）；sync=1 用 FULL（掉电不丢）
 sqlite://./data.db?table_prefix=app_       # 表名前缀（mysql/pg 同名参数）
 bolt://./data.bolt?sync=1&sync_interval=1s   # 缺省不逐提交 fsync，但按 sync_interval 周期落盘（缺省 1s）；sync=1 逐提交 fsync
 leveldb://./data.dir?sync=1&cache=8&wb=4     # 目录型存储；默认不 fsync，sync=1 逐提交 fsync；cache/wb 单位 MiB
@@ -485,7 +485,8 @@ SQLite 采用纯 Go 驱动（modernc），吞吐与 CGO 驱动相当，不引入
 | leveldb · ext4（`sync=1`） | ~1.3k | ~1.0M | — | — | ~1.3k | ~1.0M | — |
 | badger · ext4（缺省） | ~81.8k | ~274.4k | ~63.5k | ~34.0k | ~64.7k | ~608.2k | ~493.8k |
 | badger · ext4（`sync=1`） | ~748 | ~272.0k | — | — | ~736 | ~608.2k | — |
-| sqlite · ext4 | ~559 | ~61.3k | ~312 | ~316 | ~358 | ~453.0k | ~30.4k |
+| sqlite · ext4（缺省） | ~12.6k | ~62.9k | ~5.0k | ~5.8k | ~5.5k | ~450.9k | ~37.6k |
+| sqlite · ext4（`sync=1`） | ~440 | ~61.3k | — | — | — | ~453.0k | ~31.0k |
 | jsonl · 9p | ~1.4k | ~9.6M | ~1.5k | ~1.5k | ~1.6k | ~13.3M | ~110.3k |
 | bolt · 9p | ~89 | ~589.5k | ~91 | ~88 | ~94 | ~2.6M | ~7.1k |
 | leveldb · 9p | ~1.0k | ~1.1M | ~1.0k | ~288 | ~1.1k | ~1.0M | ~75.2k |
@@ -496,10 +497,11 @@ SQLite 采用纯 Go 驱动（modernc），吞吐与 CGO 驱动相当，不引入
 | mysql 8.0 | ~718 | ~5.3k | ~428 | ~119 | ~400 | ~95.6k | ~4.6k |
 | pg 16 | ~2.4k | ~9.9k | ~2.2k | ~647 | ~1.4k | ~185.7k | ~8.8k |
 
-① 嵌入式基座缺省档不逐条 fsync，`?sync=1` 才逐提交 fsync（sqlite 例外：缺省即 FULL）；
-比较时须先对齐持久化等级。**缺省档与 `sync=1` 在真实 ext4 上差 56–570×**（见
-[PERFORMANCE.md](PERFORMANCE.md) §1.1）——"要不要 sync=1"比"选哪个基座"影响更大。
-② `sync=1` 行只列 Set/QPush：读路径不受 fsync 影响，与缺省档相同。
+① **五个本地基座的缺省档已统一为"不逐提交 fsync"**，`?sync=1` 才要断电安全
+（sqlite 缺省由 FULL 改为 NORMAL）。比较时须先对齐持久化等级。**缺省档与 `sync=1`
+在真实 ext4 上差 29–570×**（见 [PERFORMANCE.md](PERFORMANCE.md) §1.1）——"要不要
+sync=1"比"选哪个基座"影响更大。sqlite 的历史数字（Set ~559）对应今天的 `sync=1`。
+② `sync=1` 行只列受 fsync 影响的写路径：读不受影响，与缺省档相同。
 
 读路径几乎不受介质影响（leveldb Get 三档均 ~1.0M、badger ~272–298k），而写路径跨介质差 2–3 个数量级。
 服务端基座的**读**吞吐低于嵌入式（redis Get ~12.4k vs bolt ~590k），瓶颈是网络往返。
@@ -526,7 +528,8 @@ SQLite 采用纯 Go 驱动（modernc），吞吐与 CGO 驱动相当，不引入
 | leveldb · 9p | ~658k | ~658 | 60% |
 | badger · 9p | ~497 | ~314 | 0.2% |
 | sqlite · tmpfs | ~37k | ~6.7k | 61% |
-| sqlite · ext4 | ~74k | ~409 | 121% |
+| sqlite · ext4（缺省） | ~40.1k | ~5.8k | 64% |
+| sqlite · ext4（`sync=1`） | ~74k | ~409 | 121% |
 | sqlite · 9p | ~19k | ~85 | 193% |
 | redis | ~7.1k | ~7.0k | 57% |
 | ssdb | ~3.7k | ~3.5k | 48% |

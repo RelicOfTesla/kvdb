@@ -84,7 +84,7 @@ already means no fsync, and accepting it would mislead people about the durabili
 
 **This is the only table you need to look at when choosing a backend**: a real block device
 (ext4/WSL vhdx) with each backend in its default mode (no fsync per commit). Other media and
-the `?sync=1` modes are covered by the matrix in §2.5.
+the `?sync=1` modes are covered by the matrix in §2.3.
 
 Units are ops/s; the `MGet items` and `Batch items` columns are items/s converted to the
 **per-item** level. All use 8 goroutines, a `-benchtime 2s` time window, and count what
@@ -120,7 +120,7 @@ keys); `Read retention` = mixed read ÷ that backend's pure-read Get.
   because reads hit the page cache; only the write path is dominated by the medium.
 - **"Whether to use `sync=1`" matters more than "which backend to pick"**: once the default
   mode removes fsync from the write hot path, embedded write throughput is 1–2 orders of
-  magnitude higher than with `sync=1` (§2.5). When choosing, decide the durability mode
+  magnitude higher than with `sync=1` (§2.3). When choosing, decide the durability mode
   first, then pick the backend.
 - **Server backends have lower read throughput than embedded ones**: redis Get ~12.4k vs bolt
   Get ~590k — the bottleneck is the network round trip, not the disk; but server backends are
@@ -133,9 +133,9 @@ keys); `Read retention` = mixed read ÷ that backend's pure-read Get.
 - **mem is the only backend "constrained by no IO at all for either reads or writes"**
   (Set ~775k, Get ~8.4M, batch writes ~1.5M).
 - **The embedded backend with the highest write throughput is jsonl** (Set ~353.6k), but its
-  lead over leveldb (~164.6k) comes mainly from "flush having a 500ms periodic buffer" rather
-  than from an engine difference, and read latency and durability semantics must be weighed
-  alongside it (§2.4).
+  lead over leveldb (~164.6k) comes mainly from its 500ms periodic flush buffer rather than
+  from an engine difference, so read latency and durability semantics must be weighed
+  alongside it.
 
 ### 2.2 Batch-write benefit (batch items throughput ÷ Set throughput, main-table mode)
 
@@ -151,7 +151,7 @@ The benefit depends on how much commit cost in a single write can be amortized:
 
 - **The batch-write benefit is proportional to "how much commit cost a single write
   contains"**: with `sync=1`, one commit includes one fsync, so batch writes can collapse N
-  fsyncs into 1, giving multipliers as high as 39–86× (§2.5); the default mode has no fsync
+  fsyncs into 1, giving multipliers as high as 39–86× (§2.3); the default mode has no fsync
   left, so the multiplier falls back to 2.2–6.0×, and the remaining amortizable cost is the
   fixed overhead of the transaction/Batch itself.
 - **bolt still shows 18.8× in the default mode**: it opens a bbolt transaction on every
@@ -161,75 +161,7 @@ The benefit depends on how much commit cost in a single write can be amortized:
   executed one by one inside the batch and only the commit is shared; Redis's 39× comes from
   a single MULTI/EXEC round trip plus server-side merging.
 
-### 2.3 Mixed read/write: are readers blocked by writers?
-
-The `Mixed read/Mixed write/Read retention` columns of the main table are the source of this
-conclusion; the cross-mode comparison is in §2.5.
-
-- **Server backends barely block each other**: reads and writes each retain ~44–63%,
-  equivalent to splitting concurrency in half. The connection pool isolates requests, so
-  reads do not queue behind writes.
-- **mem / jsonl reads drop to ~5–9% of pure-read under high write frequency**. jsonl's read
-  path takes no lock of its own yet still only reaches 5%, showing that the bottleneck is the
-  granularity of the global lock in mem that both share: every write entering that lock makes
-  subsequent readers queue.
-- **The size of the drop is determined by how often writers enter the shared synchronization
-  primitive, not by medium bandwidth**: the lower the write frequency (e.g. a few hundred
-  ops/s on 9p), the higher the read retention — a slower disk actually lets readers interleave
-  more easily.
-- **"Get is dozens of times faster than Set" holds only under no or low write load**. Under
-  mixed load you should look at read retention, and the levers that improve read blocking are
-  the same ones that cut write latency: batch writes (merging N acquisitions of a lock or
-  transaction into 1) and sharding.
-- **badger's mixed read is governed by the "write commit window", not by write frequency**:
-  with `sync=1`, one commit on ext4/9p takes 1.3–3 ms, readers queue behind the commit lock,
-  and read retention falls to only 0.2–0.4% (yet its retention for writes is as high as
-  91–98%, showing that writes themselves are not slowed). The default mode (no fsync) has
-  eliminated this phenomenon: reads return to ~76.4k and retention to ~28%, on par with the
-  other embedded backends.
-- **Raising write frequency does not make read retention worse**: bolt/leveldb/badger in the
-  default mode have write frequencies 1–2 orders of magnitude higher than with `sync=1`, yet
-  read retention remains at 11–28%. This shows that read blocking in these backends comes
-  mainly from the **duration** for which a writer occupies the synchronization primitive, not
-  from the number of times.
-- Read retention >100% (some sqlite modes) is scheduling and page-cache jitter in that mode's
-  own pure-read baseline, at the noise level.
-
-### 2.4 jsonl's two flush-to-disk knobs
-
-jsonl's flushing to disk is split into two **independent** knobs, each with its own period and
-no interference between them:
-
-| Knob | Default | What it does | What it determines |
-|---|---|---|---|
-| **flush** | every 500ms | hands the process buffer (bufio) to the OS | how much a process crash loses (already-flushed data is in the OS page cache, so a process crash loses nothing) |
-| **fsync** | every 1s | makes the OS write the data to the medium | how much a machine power loss loses |
-
-| Mode | Behavior | Loss boundary | Write-failure visibility |
-|---|---|---|---|
-| default | flush every 500ms, fsync every 1s | process crash loses ≤500ms; power loss loses ≤1s | deferred to the periodic tick or Close |
-| `?each_flush=1` | flush per operation, fsync still periodic | process crash loses nothing; power loss loses ≤1s | returned immediately by that operation |
-| `?sync=1` | flush + fsync per operation | loses nothing either way | returned immediately by that operation |
-
-**Both periods are "true periods"** (they start at Open and reschedule themselves from the
-callback), not "triggered only when idle": otherwise sustained writes would keep pushing the
-due time back, amounting to never flushing to disk. `?flush_interval` / `?sync_interval` are
-tunable.
-
-**fsync implies flush**: `Sync` only acts on bytes already "written out" on the fd; while the
-data is still in the bufio buffer it cannot reach them — so when a periodic fsync comes due it
-flushes first and then syncs, otherwise that data would neither have been handed to the OS nor
-persisted (making the fsync a no-op, with a subtle symptom: the fsync happens as usual, it
-just syncs nothing).
-
-**Fail-stop**: errors from `bufio.Writer` are sticky (Go has no public API to clear `b.err`),
-so once Flush/Write fails, the bytes left in the buffer will never be written out again. Any
-flush-to-disk failure therefore marks the Provider as unwritable, all subsequent write
-operations return errors without touching memory, and `Close` is bound to report that error —
-rather than "every Set reports success yet nothing ever gets written out". To have write
-failures reported on the spot, use `each_flush=1`.
-
-### 2.5 Medium × durability-mode matrix
+### 2.3 Medium × durability-mode matrix
 
 The main table covers only "ext4 + default mode". The remaining combinations follow and
 **must not be compared directly to the main table** (changing the medium or the mode changes
@@ -294,6 +226,40 @@ combinations are filled in here)
 - **The 9p mode generally has a larger benefit** (batch writes 68–84×): even flush has to go
   through a protocol round trip, so a single write is dominated by round-trip cost.
 
+### 2.4 Mixed read/write: are readers blocked by writers?
+
+The `Mixed read/Mixed write/Read retention` columns of the main table are the source of this
+conclusion; the cross-mode comparison is in §2.3.
+
+- **Server backends barely block each other**: reads and writes each retain ~44–63%,
+  equivalent to splitting concurrency in half. The connection pool isolates requests, so
+  reads do not queue behind writes.
+- **mem / jsonl reads drop to ~5–9% of pure-read under high write frequency**. jsonl's read
+  path takes no lock of its own yet still only reaches 5%, showing that the bottleneck is the
+  granularity of the global lock in mem that both share: every write entering that lock makes
+  subsequent readers queue.
+- **The size of the drop is determined by how often writers enter the shared synchronization
+  primitive, not by medium bandwidth**: the lower the write frequency (e.g. a few hundred
+  ops/s on 9p), the higher the read retention — a slower disk actually lets readers interleave
+  more easily.
+- **"Get is dozens of times faster than Set" holds only under no or low write load**. Under
+  mixed load you should look at read retention, and the levers that improve read blocking are
+  the same ones that cut write latency: batch writes (merging N acquisitions of a lock or
+  transaction into 1) and sharding.
+- **badger's mixed read is governed by the "write commit window", not by write frequency**:
+  with `sync=1`, one commit on ext4/9p takes 1.3–3 ms, readers queue behind the commit lock,
+  and read retention falls to only 0.2–0.4% (yet its retention for writes is as high as
+  91–98%, showing that writes themselves are not slowed). The default mode (no fsync) has
+  eliminated this phenomenon: reads return to ~76.4k and retention to ~28%, on par with the
+  other embedded backends.
+- **Raising write frequency does not make read retention worse**: bolt/leveldb/badger in the
+  default mode have write frequencies 1–2 orders of magnitude higher than with `sync=1`, yet
+  read retention remains at 11–28%. This shows that read blocking in these backends comes
+  mainly from the **duration** for which a writer occupies the synchronization primitive, not
+  from the number of times.
+- Read retention >100% (some sqlite modes) is scheduling and page-cache jitter in that mode's
+  own pure-read baseline, at the noise level.
+
 ## 3. Write cost model (what each operation does)
 
 | Operation | mem | jsonl | bolt | leveldb | badger | sqlite / pg | mysql | redis | ssdb |
@@ -341,7 +307,7 @@ implementation), so a CGO dependency is not introduced.
   decent on both tmpfs and 9p).
 - **Need transactions / in-batch dependent composition**: `badger` (the only embedded backend
   offering MVCC transactions and in-batch visibility); the cost is that with synchronous
-  writes by default, reads and writes are coupled to the commit window (§2.3), and write
+  writes by default, reads and writes are coupled to the commit window (§2.4), and write
   throughput is lower than leveldb.
 - **Need SQL capability / multi-process sharing**: `sqlite` / `mysql` / `pg`; watch out for
   same-key hotspot degradation.
@@ -352,7 +318,7 @@ implementation), so a CGO dependency is not introduced.
 - **General principle**: on WSL/virtualized disks, **first turn writes into batch writes**,
   then talk about picking a backend; wanting "every record persisted and high throughput"
   requires real local NVMe or a server-side group-commit strategy.
-- **Mixed read/write scenarios** (§2.3): `mem`/`jsonl` share a global lock, so under high write
+- **Mixed read/write scenarios** (§2.4): `mem`/`jsonl` share a global lock, so under high write
   frequency reads drop to only 5–9% of pure reads; `bolt`/`leveldb`/`sqlite` take no lock in
   the SDK-level read path, yet read retention still declines with write frequency (11–61% on
   tmpfs, 54–193% on 9p); server backends do not block reads and writes against each other

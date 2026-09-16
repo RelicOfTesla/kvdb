@@ -3,7 +3,7 @@
 `mem` 目前用一把全局 `sync.RWMutex` 保护三张 map（`kv`/`queue`/`zset`）。这在纯读、
 纯写下都够用，但在**读写混合**负载下代价很大：写者持写锁期间会让后续读者排队，
 实测 mem 的混合读只剩纯读的 ~7.5%，`jsonl`（状态层就是 `mem`）只剩 ~5%
-（详见 [../PERFORMANCE_CN.md](../PERFORMANCE_CN.md) §2.3）。
+（详见 [../PERFORMANCE_CN.md](../PERFORMANCE_CN.md) §2.4）。
 
 本文记录"把 `kv` 换成分片锁"这一方案的一次性原型实测结论。**原型已删除，未进入主干。**
 

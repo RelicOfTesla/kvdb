@@ -277,6 +277,7 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 
 - **写**：`Set[T]` / `SetEx[T]` / `QPush[T]` / `QPushFront[T]`，编码 `Enc[T]`；
 - **读**：`Get[T]` / `MGet[T]` / `QPop[T]` / `QPopBack[T]` / `QFront[T]` / `QBack[T]`，
+  以及非泛型的 `QRange`（队列元素本身就是原始字节）；
   解码 `Dec[T]`/`D[T]`，空/缺失折算为 `ErrNotFound`。它们各有一个 `…OK` 变体
   （`GetOK` / `QPopOK` / `QPopBackOK` / `QFrontOK` / `QBackOK`），**保留 `ok` 原值**：
   `ok=false` 且 `err=nil`；
@@ -301,7 +302,9 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
     `SetEx(ttl)` 的到期时刻是按"当前"算出来的。
   - `Incr` 缺失按 0 起算；值非十进制整数返回 `ErrNotInteger`。
   - `TTL` 返回 `(剩余秒数, ok)`，`ok=false` 表示 key 不存在 / 无 TTL / 已过期。
-- **Queue**：`QPush / QPushFront / QPop / QPopBack / QSize / QFront / QBack`，先进先出。
+- **Queue**：`QPush / QPushFront / QPop / QPopBack / QSize / QFront / QBack / QRange`，
+  先进先出。`QRange(name, start, stop)` 按位置读取且**不改动队列**（0 起闭区间、负索引从末尾数、
+  越界裁剪，与 `ZRange` 同一套规矩）——这正是"只读遍历队列"（如迁移）得以实现的前提。
 - **ZSet**：`ZSet / ZGet / ZDel / ZSize / ZRank / ZRange / ZIncr`，排序
   `(score 升序, key 升序)`，排名 0 起；`ZRange(start, stop)` 为 0 起闭区间索引，
   负索引从末尾数。**分数类型为 int64**（对齐 SSDB）；Redis 基座经 float64 换算，

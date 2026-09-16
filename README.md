@@ -290,6 +290,7 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 
 - **Writes**: `Set[T]` / `SetEx[T]` / `QPush[T]` / `QPushFront[T]`, encoded with `Enc[T]`;
 - **Reads**: `Get[T]` / `MGet[T]` / `QPop[T]` / `QPopBack[T]` / `QFront[T]` / `QBack[T]`,
+  and the non-generic `QRange` (queue elements are raw bytes);
   decoded with `Dec[T]`/`D[T]`; empty/missing is folded into `ErrNotFound`. Each of them has an
   `…OK` variant (`GetOK` / `QPopOK` / `QPopBackOK` / `QFrontOK` / `QBackOK`) that **preserves the
   `ok` value** instead: `ok=false` with `err=nil`;
@@ -315,7 +316,10 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
   - A missing `Incr` key counts from 0; a value that is not a decimal integer returns `ErrNotInteger`.
   - `TTL` returns `(remaining seconds, ok)`, where `ok=false` means the key does not exist /
     has no TTL / has expired.
-- **Queue**: `QPush / QPushFront / QPop / QPopBack / QSize / QFront / QBack`, first in first out.
+- **Queue**: `QPush / QPushFront / QPop / QPopBack / QSize / QFront / QBack / QRange`,
+  first in first out. `QRange(name, start, stop)` reads a positional slice **without modifying the
+  queue** (0-based inclusive, negative indices from the end, out-of-range clamped — the same
+  convention as `ZRange`); this is what makes read-only queue traversal (e.g. migration) possible.
 - **ZSet**: `ZSet / ZGet / ZDel / ZSize / ZRank / ZRange / ZIncr`, ordered by
   `(score ascending, key ascending)`, ranks starting at 0; `ZRange(start, stop)` uses
   0-based inclusive indices, and negative indices count from the end. **The score type is int64**

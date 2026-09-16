@@ -532,6 +532,12 @@ func (p *Provider) check() error {
 	return nil
 }
 
+// IncrWraps 能力声明：sqlstore 的 Incr 有显式溢出检查（事务与单语句路径都返回
+// ErrNotInteger，不回绕），见 core.IncrWrapsProvider 与 Caps.IncrWraps。
+func (p *Provider) IncrWraps() bool { return false }
+
+var _ core.IncrWrapsProvider = (*Provider)(nil)
+
 // Close 幂等：closed 为原子标志，Swap 保证只有一个调用者真正关闭底层连接池。
 func (p *Provider) Close() error {
 	if p.closed.Swap(true) {

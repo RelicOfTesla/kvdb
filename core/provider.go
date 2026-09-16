@@ -136,8 +136,13 @@ type Caps struct {
 	// BatchComposed 在 Batch 为 true 的前提下进一步表示：批内后续操作**能看到**
 	// 本批前序操作的效果（同批覆盖同一 key、队列按声明顺序入队、ZSet+ZIncr 累加）。
 	// 契约不要求该性质，取决于基座机制：在同一事务/同一把锁内逐条应用的为 true；
-	// LevelDB / Redis / SSDB 这类"提交前读不到未提交内容"的为 false。
+	// Redis / SSDB 这类则不承诺，可经 BatchComposedProvider 探测。
 	BatchComposed bool
+	// IncrWraps 声明 Incr 的溢出语义：true = 按 int64 回绕（内存型基座
+	// mem/jsonl/bolt/leveldb/badger 的自然行为）；false = 溢出按 ErrNotInteger
+	// 报错（sqlstore/Redis/SSDB 有显式溢出检查）。两种语义均符合契约，
+	// 业务在跨基座迁移"大计数器"场景时可据此分支；可经 IncrWrapsProvider 探测。
+	IncrWraps bool
 }
 
 // BatchProvider 是可选的批量写能力：把一批操作以一次提交发出，降低往返与
@@ -175,6 +180,15 @@ type BatchProvider interface {
 type BatchComposedProvider interface {
 	// BatchComposed 恒为 true，仅作能力标记：存在即代表批内可见。
 	BatchComposed() bool
+}
+
+// IncrWrapsProvider 是可选的能力声明：实现它表示该基座的 Incr 在 int64 溢出时
+// 按**回绕**处理（wrap-around，内存型基座的自然行为）；未实现（或 Caps 未置位）
+// 表示溢出按 ErrNotInteger 报错（SQL/Redis/SSDB 有显式溢出检查）。
+// 同一契约允许两种语义（见 KvProvider.Incr 注释），这里是把差异显式化。
+type IncrWrapsProvider interface {
+	// IncrWraps 恒为 true，仅作能力标记。
+	IncrWraps() bool
 }
 
 // StoreProvider 是三种数据结构的聚合能力接口（KV + Queue + ZSet），

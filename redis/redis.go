@@ -114,6 +114,12 @@ func (p *Provider) check() error {
 	return nil
 }
 
+// IncrWraps 能力声明：Redis INCRBY 溢出由服务端报错（映射 ErrNotInteger，不回绕），
+// 见 core.IncrWrapsProvider 与 Caps.IncrWraps。
+func (p *Provider) IncrWraps() bool { return false }
+
+var _ core.IncrWrapsProvider = (*Provider)(nil)
+
 // Close 幂等：用 sync.Once 保证底层连接池只关闭一次，重复调用安全。
 func (p *Provider) Close() error {
 	var err error

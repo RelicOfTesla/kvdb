@@ -388,6 +388,12 @@ func (p *Provider) check() error {
 	}
 }
 
+// IncrWraps 能力声明：SSDB incr 溢出由服务端报错（映射 ErrNotInteger，不回绕），
+// 见 core.IncrWrapsProvider 与 Caps.IncrWraps。
+func (p *Provider) IncrWraps() bool { return false }
+
+var _ core.IncrWrapsProvider = (*Provider)(nil)
+
 // errFrom 将服务端错误状态转换为错误。SSDB incr/zincr 失败固定回复
 // "value is not an integer or out of range"，据此映射为 ErrNotInteger；
 // 未认证时服务端返回 noauth（net/server.cpp 的 AUTH 前置检查），映射为 ErrAuth。

@@ -63,6 +63,9 @@ func (a *adapter) Capabilities() core.Caps {
 	if _, ok := a.p.(core.BatchComposedProvider); ok {
 		c.BatchComposed = true
 	}
+	if w, ok := a.p.(core.IncrWrapsProvider); ok {
+		c.IncrWraps = w.IncrWraps()
+	}
 	return c
 }
 

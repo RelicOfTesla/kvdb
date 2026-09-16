@@ -272,6 +272,12 @@ func (p *Provider) check() error {
 	return nil
 }
 
+// IncrWraps 能力声明：bolt 的 Incr 按 int64 回绕（kvIncrTx 不做溢出检查），
+// 见 core.IncrWrapsProvider 与 Caps.IncrWraps。
+func (p *Provider) IncrWraps() bool { return true }
+
+var _ core.IncrWrapsProvider = (*Provider)(nil)
+
 func (p *Provider) view(fn func(*bolt.Tx) error) error {
 	if err := p.check(); err != nil {
 		return err

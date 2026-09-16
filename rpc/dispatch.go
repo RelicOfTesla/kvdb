@@ -495,6 +495,7 @@ func decBool(b []byte) (bool, error) {
 
 // encCaps 把能力位编码成一个十进制数：跨进程传结构体不值当，
 // 位图足够且不随字段增删破坏兼容（新位只在新增能力时追加）。
+// 位分配：0=Queue 1=ZSet 2=Batch 3=BatchComposed 4=IncrWraps。
 func encCaps(c core.Caps) []byte {
 	var v int64
 	if c.Queue {
@@ -509,6 +510,9 @@ func encCaps(c core.Caps) []byte {
 	if c.BatchComposed {
 		v |= 1 << 3
 	}
+	if c.IncrWraps {
+		v |= 1 << 4
+	}
 	return encInt(v)
 }
 
@@ -522,5 +526,6 @@ func decCaps(b []byte) (core.Caps, error) {
 		ZSet:          v&(1<<1) != 0,
 		Batch:         v&(1<<2) != 0,
 		BatchComposed: v&(1<<3) != 0,
+		IncrWraps:     v&(1<<4) != 0,
 	}, nil
 }

@@ -70,6 +70,9 @@ func capabilitiesOf(p core.KvProvider) core.Caps {
 	if _, ok := p.(core.BatchComposedProvider); ok {
 		c.BatchComposed = true
 	}
+	if w, ok := p.(core.IncrWrapsProvider); ok {
+		c.IncrWraps = w.IncrWraps()
+	}
 	return c
 }
 

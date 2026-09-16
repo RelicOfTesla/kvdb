@@ -48,8 +48,7 @@ n, err := db.Incr(ctx, "visits", 1)
 | `kvdb/bolt`、`kvdb/sqlite`、`kvdb/mysql`、`kvdb/pg`、`kvdb/redis` | 1.25 | 由驱动及其传递依赖决定（如 `golang.org/x/sys` 要求 1.25） |
 | `kvdb/mssql` | 1.18 | `go-mssqldb` v1.8.2（更新的驱动线 v1.9+ 要求 `go 1.25`；本模块保持 1.18 基线与根包对齐） |
 | `kvdb/rpc` | 1.19 | 仅标准库 + 根包：**零第三方依赖**（客户端尤其重要） |
-| `kvdb/all`、`kvdb/bench`、`kvdb/example` | 1.25 | 聚合了上述模块 |
-| `kvdb/rpcserver` | 1.25 | 可直接运行的 RPC 服务端命令（import `all` 接入全部底座） |
+| `kvdb/all`、`kvdb/example` | 1.25 | 聚合了上述模块（`example` 内含 `rpcdemo`、`cmd/cli`、`cmd/migration`，以及独立的 `bench` 模块） |
 
 版本按各模块**依赖图里最大的 `go` 指令**取（`go list -m -f '{{.GoVersion}}' all`），
 不是照抄直接依赖的声明值。
@@ -314,8 +313,11 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
     `min <= max`，不同于 Redis `ZREVRANGEBYSCORE` 要求把 `max, min` 对调。同分成员在两个
     方向下都保持**按成员升序**（与 Redis 一致）。`limit > 0` 按方向取前若干条
     （故 `desc` 取到的是**最高分**那端）；`limit <= 0` 不限。`min > max` 视为空区间而非错误。
+- **空 key / 空队列名 / 空 zset 名（含空成员）在所有路径上都被拒绝**——读与写一致，返回
+  `ErrInvalidKey`，从而不会出现"写不进去却读得到"的自相矛盾。校验位于**各基座实现**而非
+  `DB` 适配层，因此绕过适配层直接用 `Provider` 时同样成立。
 - 三类数据的命名空间相互独立。哨兵错误：`ErrUnsupported` / `ErrClosed` /
-  `ErrNotInteger` / `ErrInvalidTTL` / `ErrNotFound`。
+  `ErrNotInteger` / `ErrInvalidTTL` / `ErrNotFound` / `ErrInvalidKey`。
 
 ### 与 Redis 的差异
 
@@ -411,7 +413,7 @@ db.Set(ctx, "k", []byte("v"))           // KV / Queue / ZSet / Batch 全部可�
 也可直接跑现成的服务端命令：
 
 ```bash
-go run ./rpcserver -addr :7788 -backend jsonl://./data.jsonl -auth challenge -password s3cret
+go run ./example/rpcdemo -addr :7788 -backend jsonl://./data.jsonl -auth challenge -password s3cret
 ```
 
 要点：
@@ -422,7 +424,8 @@ go run ./rpcserver -addr :7788 -backend jsonl://./data.jsonl -auth challenge -pa
 - **能力如实透传**：`db.Capabilities()` 报告的正是**服务端底座**的能力，含
   `BatchComposed`——不会因为套了一层 RPC 而"变强"。
 - **哨兵错误原样过线**：`ErrUnsupported` / `ErrClosed` / `ErrNotInteger` /
-  `ErrInvalidTTL` / `ErrNotFound` 在客户端可用 `errors.Is` 正常判等。
+  `ErrInvalidTTL` / `ErrNotFound` / `ErrInvalidKey` 在客户端可用 `errors.Is` 正常判等
+  （各有独立 wire 状态，故哨兵身份不会丢失）。
 - **批写一次往返**：`db.Batch(...)` 整批发给服务端，由底座一次提交；批内可见性
   取决于底座本身（与本地直连一致）。
 - **生命周期边界**：客户端 `Close()` 只关自己的连接，不会关掉服务端基座。
@@ -631,9 +634,11 @@ KVDB_TEST_REDIS_ADDR=127.0.0.1:6379 \
 | `KVDB_TEST_SSDB_ADDR` | SSDB 地址（用例前 flushdb） |
 | `KVDB_TEST_SSDB_AUTH_ADDR` / `KVDB_TEST_SSDB_AUTH_PASS` | 启用 `server.auth` 的 SSDB 实例 |
 
-所有基座共用根模块内 `kvdbtest` 的合同用例（KV / Queue / ZSet / Batch /
-过期写语义 / 返回值所有权 / 命名空间，含并发原子性）；SSDB 另用进程内假服务器
-交叉验证线协议编码。
+所有基座共用根模块内 `kvdbtest` 的合同用例（一文件一主题：harness / kv / queue / zset /
+batch / ttl / scan / ownership / namespace / lifecycle / incr）。该套件断言**各基座行为
+一致**，仅当 `Capabilities()` 显式声明差异时才分支（`Queue` / `ZSet` / `Batch` /
+`BatchComposed` / `IncrWraps`）——因此任何**未声明**的分歧都会表现为用例失败。
+SSDB 另用进程内假服务器交叉验证线协议编码。
 
 根模块的注册表/编解码用例用一个**测试桩**（`stub_test.go` 注册的 `stub://`）验证
 "注册表默认空 + 显式接入"语义，因此根模块自身零第三方依赖；真实基座的"import 即
@@ -646,20 +651,28 @@ KVDB_TEST_REDIS_ADDR=127.0.0.1:6379 \
 
 ```
 core/                  契约：KvProvider / Queue- / ZSet- / BatchProvider / Closer / FullProvider
+  provider.go            接口、哨兵错误、能力声明
+  helper.go              各基座显式调用的共享辅助（CheckKey、AddTTL…）
+  clock.go               可注入的时钟（core.Now）
 provider.go            Open 与契约再导出
 db.go                  DB 接口与默认适配器（adapter）
 batch.go               Batch 收集器与 DB.Batch 分发
 bytes.go               Enc / Dec / D / DMust 字节编解码
 registry.go            Register / MustRegister / Schemes
-kvdbtest/              跨基座共享合同用例（公开包，供各基座模块测试引用）
+kvdbtest/              跨基座共享合同用例，**一文件一主题**（harness / kv / queue / zset /
+                       batch / ttl / scan / ownership / namespace / lifecycle / incr）；
+                       供各基座模块测试引用
 all/                   聚合注册包：import _ 即接入全部内置基座
-mem/ jsonl/ bolt/ leveldb/ badger/ sqlite/ mysql/ pg/ redis/ ssdb/   各基座实现（各自独立模块）
+mem/ jsonl/ bolt/ leveldb/ badger/ sqlite/ mysql/ pg/ mssql/ redis/ ssdb/
+                       各基座实现（各自独立模块）
 rpc/                   RPC 客户端与服务端（独立模块，零第三方依赖）
-rpc/codec/             报文编解码抽象 + RESP（默认）/ binary 两套实现
-rpcserver/             可运行的 RPC 服务端命令（独立模块，import .../all）
-sqlstore/              MySQL / SQLite / PG 共享的 database/sql 实现（方言参数化）
-bench/                 基准测试（独立模块，import .../all）
-example/               可运行演示
+rpc/codec/             报文编解码抽象 + RESP（默认）/ binary / textproto
+sqlstore/              MySQL / SQLite / PG / MSSQL 共享的 database/sql 实现（方言参数化）
+example/               可运行的演示与工具
+  rpcdemo/               RPC 服务端命令（import .../all）
+  cmd/cli/               类 redis-cli 的命令行客户端
+  cmd/migration/         跨基座数据迁移
+  bench/                 基准测试（独立模块，import .../all）
 ```
 
 ## License

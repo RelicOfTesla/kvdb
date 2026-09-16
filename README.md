@@ -50,8 +50,7 @@ by the SQL / Redis drivers:
 | `kvdb/bolt`, `kvdb/sqlite`, `kvdb/mysql`, `kvdb/pg`, `kvdb/redis` | 1.25 | Determined by the driver and its transitive dependencies (e.g. `golang.org/x/sys` requires 1.25) |
 | `kvdb/mssql` | 1.18 | `go-mssqldb` v1.8.2 (newer driver lines v1.9+ require `go 1.25`; this module keeps the 1.18 baseline to align with the root package) |
 | `kvdb/rpc` | 1.19 | Standard library + root package only: **zero third-party dependencies** (especially important for the client) |
-| `kvdb/all`, `kvdb/bench`, `kvdb/example` | 1.25 | Aggregates the modules above |
-| `kvdb/rpcserver` | 1.25 | A directly runnable RPC server command (imports `all` to wire in every backend) |
+| `kvdb/all`, `kvdb/example` | 1.25 | Aggregates the modules above (`example` also carries `rpcdemo`, `cmd/cli`, `cmd/migration`, and the standalone `bench` module) |
 
 Versions are taken as the **largest `go` directive in each module's dependency graph**
 (`go list -m -f '{{.GoVersion}}' all`), not copied from the declared value of a direct
@@ -333,8 +332,12 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
     `limit > 0` caps the result at that many entries taken from the direction-appropriate end
     (so `desc` yields the *highest* scores); `limit <= 0` means unlimited. `min > max` is an
     empty range, not an error.
+- **An empty key / queue name / zset name (or member) is rejected** on every path — reads as well
+  as writes — with `ErrInvalidKey`, so "written but unreadable" cannot happen. This is enforced in
+  each backend, not in the `DB` adapter, so it also holds when a `Provider` is used directly.
 - The namespaces of the three data types are independent of each other. Sentinel errors:
-  `ErrUnsupported` / `ErrClosed` / `ErrNotInteger` / `ErrInvalidTTL` / `ErrNotFound`.
+  `ErrUnsupported` / `ErrClosed` / `ErrNotInteger` / `ErrInvalidTTL` / `ErrNotFound` /
+  `ErrInvalidKey`.
 
 ### Differences from Redis
 
@@ -436,7 +439,7 @@ db.Set(ctx,            "k", []byte("v"))           // KV / Queue / ZSet / Batch 
 You can also just run the ready-made server command:
 
 ```bash
-go                     run ./rpcserver -addr :7788 -backend jsonl://./data.jsonl -auth challenge -password s3cret
+go                     run ./example/rpcdemo -addr :7788 -backend jsonl://./data.jsonl -auth challenge -password s3cret
 ```
 
 Key points:
@@ -450,7 +453,8 @@ Key points:
   capability of the **server-side backend**, including `BatchComposed` — and it does not
   "become stronger" just because an RPC layer was wrapped around it.
 - **Sentinel errors cross the wire as-is**: on the client, `ErrUnsupported` / `ErrClosed` /
-  `ErrNotInteger` / `ErrInvalidTTL` / `ErrNotFound` can be compared normally with `errors.Is`.
+  `ErrNotInteger` / `ErrInvalidTTL` / `ErrNotFound` / `ErrInvalidKey` can be compared normally
+  with `errors.Is` (each has its own wire status, so the sentinel identity survives).
 - **A batch write is one round trip**: `db.Batch(...)` sends the whole batch to the server, and the
   backend commits it once; visibility within the batch depends on the backend itself (the same as
   a local direct connection).
@@ -687,9 +691,12 @@ KVDB_TEST_REDIS_ADDR=127.0.0.1:6379 \
 | `KVDB_TEST_SSDB_ADDR` | SSDB address (flushdb before the cases) |
 | `KVDB_TEST_SSDB_AUTH_ADDR` / `KVDB_TEST_SSDB_AUTH_PASS` | An SSDB instance with `server.auth` enabled |
 
-All backends share the contract cases in `kvdbtest` in the root module (KV / Queue / ZSet / Batch /
-expired-write semantics / return-value ownership / namespaces, including concurrent atomicity);
-SSDB additionally uses an in-process fake server to cross-validate the wire-protocol encoding.
+All backends share the contract cases in `kvdbtest` (root module, one file per topic: harness /
+kv / queue / zset / batch / ttl / scan / ownership / namespace / lifecycle / incr). The suite
+asserts **identical behaviour across backends** except where `Capabilities()` declares a
+difference (`Queue` / `ZSet` / `Batch` / `BatchComposed` / `IncrWraps`), so an undeclared
+divergence shows up as a failure. SSDB additionally uses an in-process fake server to
+cross-validate the wire-protocol encoding.
 
 The root module's registry/codec cases use a **test stub** (the `stub://` registered in
 `stub_test.go`) to verify the "empty registry by default + explicit opt-in" semantics, so the root
@@ -704,20 +711,28 @@ built / tested / tidied on its own):
 
 ```
 core/                  Contract: KvProvider / Queue- / ZSet- / BatchProvider / Closer / FullProvider
+  provider.go            Interfaces, sentinel errors, capability declaration
+  helper.go              Shared helpers that backends call explicitly (CheckKey, AddTTL…)
+  clock.go               Injectable time source (core.Now)
 provider.go            Open and contract re-exports
 db.go                  DB interface and the default adapter
 batch.go               Batch collector and DB.Batch dispatch
 bytes.go               Enc / Dec / D / DMust byte encoding and decoding
 registry.go            Register / MustRegister / Schemes
-kvdbtest/              Contract cases shared across backends (public package, referenced by backend module tests)
+kvdbtest/              Contract cases shared across backends, one file per topic
+                       (harness / kv / queue / zset / batch / ttl / scan / ownership /
+                        namespace / lifecycle / incr); referenced by backend module tests
 all/                   Aggregating registration package: import _ to pull in all built-in backends
-mem/                   jsonl/ bolt/ leveldb/ badger/ sqlite/ mysql/ pg/ redis/ ssdb/   Backend implementations (each an independent module)
+mem/ jsonl/ bolt/ leveldb/ badger/ sqlite/ mysql/ pg/ mssql/ redis/ ssdb/
+                       Backend implementations (each an independent module)
 rpc/                   RPC client and server (independent module, zero third-party dependencies)
-rpc/codec/             Message codec abstraction + RESP (default) / binary implementations
-rpcserver/             Runnable RPC server command (independent module, imports .../all)
-sqlstore/              The database/sql implementation shared by MySQL / SQLite / PG (dialect-parameterized)
-bench/                 Benchmarks (independent module, imports .../all)
-example/               Runnable demos
+rpc/codec/             Message codec abstraction + RESP (default) / binary / textproto
+sqlstore/              The database/sql implementation shared by MySQL / SQLite / PG / MSSQL
+example/               Runnable demos and tools
+  rpcdemo/               RPC server command (imports .../all)
+  cmd/cli/               redis-cli-style command-line client
+  cmd/migration/         Cross-backend data migration
+  bench/                 Benchmarks (independent module, imports .../all)
 ```
 
 ## License

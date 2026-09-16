@@ -333,7 +333,7 @@ implementation), so a CGO dependency is not introduced.
 | Redis in-batch visibility | Not guaranteed (see README "Batch writes" and `Capabilities().BatchComposed`) |
 | Badger reads coupled to the commit window | With `?sync=1` a commit takes 1.3–3 ms and mixed-read retention is only 0.2–0.4%; **the default mode (no fsync) has eliminated this phenomenon** (read retention back to ~28%) |
 | Durability cost of the default mode | Embedded backends do not fsync per operation by default: a process crash or power loss may lose the most recent acknowledged writes. Power-loss safety requires an explicit `?sync=1` (cost in the `sync=1` table in §2: 56–570× slower) |
-| Medium annotation | `kvdb/tmp` in this repository belongs to `G:\`'s drvfs (9p) and is **not** an ordinary disk; testing ext4 requires a WSL root disk (e.g. `~/test/tmp`) |
+| Medium annotation | This repository lives on a drvfs (9p) mount of `G:\`, which is **not** an ordinary disk; testing ext4 requires a WSL root disk (e.g. `~/test/tmp`) |
 | tmpfs data must not be used for fsync conclusions | fsync on tmpfs is a no-op, so the cost of `sync=1` is completely flattened (measured only 13% slower, versus 570× slower on real ext4) |
 
 ## 7. Reproducing
@@ -378,7 +378,7 @@ There are also **sequential-call** benchmarks such as `BenchmarkSet`/`Get`/`Incr
 used only to investigate the inherent cost of a single call and for regression comparison;
 all throughput conclusions are based on the measured data in this section.
 
-Note: `kvdb/tmp` in this repository is a drvfs (9p) mount of `G:\`, not an ordinary disk;
+Note: this repository lives on a drvfs (9p) mount of `G:\`, which is not an ordinary disk;
 testing ext4 requires a WSL root disk (e.g. `~/test/tmp`, i.e. `/dev/sdd`). Docker container
 data disks are on ext4 (vhdx), so the server-backend numbers can be read as analogous to the
 "file backends @ ext4" tier.

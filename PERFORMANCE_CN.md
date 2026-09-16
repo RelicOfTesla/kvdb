@@ -271,7 +271,7 @@ drvfs(9p) 3.8–5.5 ms。**本环境的"常规磁盘"是 WSL vhdx，一次 fsync
 | Redis 批内可见性 | 不保证（见 README「批量写」与 `Capabilities().BatchComposed`） |
 | Badger 读被提交窗口耦合 | `?sync=1` 时一次提交 1.3–3 ms，混合读保留率仅 0.2–0.4%；**缺省档（不 fsync）已消除该现象**（读保留率回到 ~28%） |
 | 缺省档的持久化代价 | 嵌入式基座缺省不逐条 fsync：进程崩溃/断电可能丢最近的已确认写入。要断电安全必须显式 `?sync=1`（代价见 §2 的 `sync=1` 表：慢 56–570×） |
-| 介质标注 | 仓库内 `kvdb/tmp` 属 `G:\` 的 drvfs(9p)，**不是**常规磁盘；测 ext4 须放 WSL 根盘（如 `~/test/tmp`） |
+| 介质标注 | 本仓库所在盘属 `G:\` 的 drvfs(9p)，**不是**常规磁盘；测 ext4 须放 WSL 根盘（如 `~/test/tmp`） |
 | tmpfs 数据不可用于 fsync 结论 | tmpfs 上 fsync 是空操作，`sync=1` 的代价会被完全抹平（实测仅慢 13%，真实 ext4 上慢 570×） |
 
 ## 7. 复现
@@ -314,6 +314,6 @@ KVDB_BENCH_URI='pg://postgres:pw@127.0.0.1:5432/db?sslmode=disable' \
 另有 `BenchmarkSet`/`Get`/`IncrSequential` 等**顺序调用**基准，仅用于排查单次调用的
 固有开销与回归对比；吞吐结论一律以本节实测数据为准。
 
-注意：仓库内 `kvdb/tmp` 属 `G:\` 的 drvfs(9p) 挂载，不是常规磁盘；测 ext4 须放 WSL
+注意：本仓库所在盘属 `G:\` 的 drvfs(9p) 挂载，不是常规磁盘；测 ext4 须放 WSL
 根盘（如 `~/test/tmp`，即 `/dev/sdd`）。Docker 容器数据盘在 ext4(vhdx) 上，因此
 服务端基座的数字可与"文件基座 @ ext4"一档类比看。

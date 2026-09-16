@@ -23,6 +23,8 @@
 // LevelDB 没有事务，但 `Write(batch)` 是原子的（一次 WAL 追加 + memtable 应用）。
 // 本基座把**所有多键写**（含 Set/SetEx 的"值+TTL"两步、批写、zset 的双侧索引维护）
 // 都收进一个 Batch，因此对外语义与 bolt 的事务实现一致：要么全生效，要么全不生效。
+// 批内的"读本批前序"由 collections.go 的 batchState 在批内合成队列计数与成员
+// 分数补齐（BatchComposed=true），批内.op 之间无需额外锁。
 //
 // # 过期语义
 //

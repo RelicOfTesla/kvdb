@@ -239,7 +239,7 @@ drvfs(9p) 3.8–5.5 ms。**本环境的"常规磁盘"是 WSL vhdx，一次 fsync
 | MySQL 键列用 `VARBINARY(255)` | 兼容 5.6 默认索引前缀限制 |
 | SQLite 进程内写串行化 + WAL | 写排队而非 `SQLITE_BUSY`，读仍可并行 |
 | SSDB 连接池 | 单连接是串行请求-应答，池化后并发才真正并行 |
-| LevelDB 所有多键写收进单个 `Write(batch)` | 值+TTL、zset 双侧索引、队列元素+计数器各自原子 |
+| LevelDB 所有多键写收进单个 `Write(batch)` | 值+TTL、zset 双侧索引、队列元素+计数器各自原子；批内计数/成员分数经批内 pending 状态合成，read-your-writes（`BatchComposed=true`） |
 | Badger 多键写收进单个 `db.Update` 事务 | 同上，且批内 read-your-writes（`BatchComposed=true`） |
 | Badger 同键读-改-写用分片锁先行串行化 | 避免 SSI 冲突重试风暴；冲突重试仅作兜底 |
 

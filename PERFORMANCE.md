@@ -291,7 +291,7 @@ PostgreSQL behaves the same way (490 → 1280 op/s with `synchronous_commit=off`
 | MySQL key column uses `VARBINARY(255)` | Compatible with the 5.6 default index prefix limit |
 | SQLite in-process write serialization + WAL | Writes queue instead of `SQLITE_BUSY`, and reads can still run in parallel |
 | SSDB connection pool | A single connection is serial request-response; only with pooling does concurrency become truly parallel |
-| LevelDB routes all multi-key writes into a single `Write(batch)` | Value+TTL, zset two-sided index, and queue element+counter are each atomic |
+| LevelDB routes all multi-key writes into a single `Write(batch)` | Value+TTL, zset two-sided index, and queue element+counter are each atomic; in-batch counters/scores are composed via per-batch pending state, giving read-your-writes (`BatchComposed=true`) |
 | Badger routes multi-key writes into a single `db.Update` transaction | Same as above, plus in-batch read-your-writes (`BatchComposed=true`) |
 | Badger same-key read-modify-write is serialized up front with a shard lock | Avoids an SSI conflict retry storm; conflict retry is only a fallback |
 

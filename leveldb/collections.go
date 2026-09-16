@@ -452,8 +452,123 @@ func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (in
 
 // ---- Batch ----
 
+// BatchComposed 声明批内可见性：整批事件收进一个 LevelDB Batch，队列/zset 的
+// 计数与成员分数在批内由 batchState 本地合成——后续操作读到的是本批前序效果
+// （read-your-writes），同批覆盖、同队列按序入队、ZSet+ZIncr 累加都成立。
+// 见 core.BatchComposedProvider 与 batchState 注释。
+// 批内 op 之间经 batchState 合成可见；批与并发写之间由名称分片锁串行。
+func (p *Provider) BatchComposed() bool { return true }
+
+var _ core.BatchComposedProvider = (*Provider)(nil)
+
+// batchState 是一次批写内的"当前状态"缓存：LevelDB 的 Batch 只是写缓冲，
+// 提交前读不到未提交内容，而批内计数器（队列 seq/count、zset 成员数）依赖
+// "读当前状态 → 计算 → 写回"。若每条 op 都直接读库，同批对同一队列/zset 的
+// 第二条 op 会与第一条拿到相同基数，写入同一排序键互相覆盖、计数少加——
+// 静默丢元素。把整个批涉及的队列/zset 状态拉进 pending，逐条 op 在缓存上
+// 合成（Incr/Pop自家的下一跳都基于上一条的结果），批写一次提交时把最终
+// 状态一次性写进同一个 batch，语义与"逐条应用到同一事务"等价。
+//
+// 缓存只覆盖三种复合结构：
+//   - 队列计数器（per 队列名）：qCounters
+//   - zset 成员当前分数（per (zset, member)）与存在性
+//   - zset 成员数（per zset 名）
+type batchState struct {
+	p   *Provider
+	qc  map[string]qCounters // 队列名 -> 最新计数器（出现过才存）
+	qt  map[string]bool      // 批内被修改过的队列名（末尾统一写回）
+	zm  map[string]int64     // "名\x00成员" -> 最新分数
+	zex map[string]bool      // "名\x00成员" -> 是否存在（批内视角）
+	zc  map[string]int64     // zset 名 -> 最新成员数
+	zct map[string]bool      // 批内被修改过的 zset 名
+}
+
+func (p *Provider) newBatchState() *batchState {
+	return &batchState{
+		p:   p,
+		qc:  map[string]qCounters{},
+		qt:  map[string]bool{},
+		zm:  map[string]int64{},
+		zex: map[string]bool{},
+		zc:  map[string]int64{},
+		zct: map[string]bool{},
+	}
+}
+
+// qGet 返回 name 的最新队列计数器：批内已修改过则用批内值，否则读库（并缓存）。
+func (st *batchState) q(name string) (qCounters, error) {
+	if c, ok := st.qc[name]; ok {
+		return c, nil
+	}
+	c, err := st.p.qCountersGet(name)
+	if err != nil {
+		return qCounters{}, err
+	}
+	st.qc[name] = c
+	return c, nil
+}
+
+// qFinalize 把批内修改过的队列计数器写进整批（每个涉及名只写一次，取最终值）。
+func (st *batchState) qFinalize(b *gldb.Batch) {
+	for name := range st.qt {
+		putQCounters(b, name, st.qc[name])
+	}
+}
+
+// zCacheKey 以 "名\x00成员" 作为成员级缓存键；\x00 不会出现在正常名字里，即便
+// 出现也只是把两个不同字符串并到同一键上——多付一次读库，末值仍正确。
+func zCacheKey(name, member string) string { return name + "\x00" + member }
+
+// zMemberScore 返回成员的最新分数与存在性（批内值优先，未命中读库）。
+func (st *batchState) zMemberScore(name, member string) (int64, bool, error) {
+	ck := zCacheKey(name, member)
+	if v, ok := st.zex[ck]; ok {
+		// 存在性已缓存：分数用批内最新值（不存在时返回值无意义，直接置零）。
+		if v {
+			return st.zm[ck], true, nil
+		}
+		return 0, false, nil
+	}
+	old, existed, err := st.p.zScoreGet(name, member)
+	if err != nil {
+		return 0, false, err
+	}
+	st.zex[ck] = existed
+	if existed {
+		st.zm[ck] = old
+	}
+	return old, existed, nil
+}
+
+// zSetCount 把 name 的成员数按批内合成逻辑增减：首次触碰先读库初始化，
+// 之后在该批内值上累加；批末经 zCountFinalize 统一写回终值。
+func (st *batchState) zSetCount(name string, d int64) error {
+	if !st.zct[name] {
+		n, err := st.p.zCountGet(name)
+		if err != nil {
+			return err
+		}
+		st.zc[name] = n
+		st.zct[name] = true
+	}
+	st.zc[name] += d
+	return nil
+}
+
+// zCountFinalize 把批内修改过的 zset 成员数写进整批。
+func (st *batchState) zCountFinalize(b *gldb.Batch) {
+	for name := range st.zct {
+		b.Put(zCountKey(name), be64(uint64(st.zc[name])))
+	}
+}
+
 // ApplyBatch 把整批操作收进**一个** LevelDB Batch 提交：Write 原子，因此
 // 要么全部生效、要么全部不生效。now 在批内采样一次，避免批内 TTL 语义漂移。
+//
+// 批内可见性（BatchComposed=true 的一半）：队列/zset 计数与成员分数经
+// batchState 在批内本地合成，后续 op 读到本批前序效果；批末把最终计数
+// 一次性写进同一个 batch。队列/zset 涉及名仍按分片锁串行（与单条写路径
+// 共用同一把锁，防并发批/单条互踩计数）；批内 op 之间不额外加锁。
 func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 	_ = ctx
 	if err := p.check(); err != nil {
@@ -476,8 +591,9 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 	}
 	now := core.NowUnix()
 	var b gldb.Batch
-	// 队列/zset 的计数与双侧索引需要读当前状态：按涉及的名称加锁，
-	// 与单条写路径共用同一把分片锁，避免并发批互相覆盖计数。
+	// 队列/zset 计数与单条写路径共用同一把名称分片锁：
+	// 批内合成解决的是"批内 op 之间读不到前序"，这把锁解决的是
+	// "批与批 / 批与单条之间的并发覆盖"，二者互补、缺一不可。
 	names := map[string]bool{}
 	for _, op := range ops {
 		switch op.Kind {
@@ -490,6 +606,7 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 	unlock := p.lockKeys(sortedKeys(names))
 	defer unlock()
 
+	st := p.newBatchState()
 	for _, op := range ops {
 		var err error
 		switch op.Kind {
@@ -509,35 +626,31 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 		case core.BatchExpire:
 			b.Put(ttlKey(op.Key), be64(uint64(core.AddTTL(now, op.TTL))))
 		case core.BatchQPush:
-			if err = p.batchQPush(&b, op.Key, op.Value, false); err != nil {
-				return err
-			}
+			err = st.batchQPush(&b, op.Key, op.Value, false)
 		case core.BatchQPushFront:
-			if err = p.batchQPush(&b, op.Key, op.Value, true); err != nil {
-				return err
-			}
+			err = st.batchQPush(&b, op.Key, op.Value, true)
 		case core.BatchZSet:
-			if err = p.batchZSet(&b, op.Key, op.Member, op.Score); err != nil {
-				return err
-			}
+			err = st.batchZSet(&b, op.Key, op.Member, op.Score)
 		case core.BatchZDel:
-			if err = p.batchZDel(&b, op.Key, op.Member); err != nil {
-				return err
-			}
+			err = st.batchZDel(&b, op.Key, op.Member)
 		case core.BatchZIncr:
-			if err = p.batchZIncr(&b, op.Key, op.Member, op.Delta); err != nil {
-				return err
-			}
+			err = st.batchZIncr(&b, op.Key, op.Member, op.Delta)
 		}
 		if err != nil {
 			return err
 		}
 	}
+	// 批内涉及到的计数器在批末统一写终值：同一队列被批内反复入队时，
+	// 元素记录（各自不同 seq）在循环内逐条 Put，计数器只取最终值一份。
+	st.qFinalize(&b)
+	st.zCountFinalize(&b)
 	return p.write(&b, "batch")
 }
 
-func (p *Provider) batchQPush(b *gldb.Batch, name string, value []byte, front bool) error {
-	c, err := p.qCountersGet(name)
+// batchQPush 在批内合成一次入队：seq/count 全部经 batchState 取最新值，
+// 同一批对同一队列的第二条 op 绝不会撞上第一条的序号。
+func (st *batchState) batchQPush(b *gldb.Batch, name string, value []byte, front bool) error {
+	c, err := st.q(name)
 	if err != nil {
 		return err
 	}
@@ -551,63 +664,67 @@ func (p *Provider) batchQPush(b *gldb.Batch, name string, value []byte, front bo
 	}
 	c.count++
 	b.Put(qItemKey(name, seq), value)
-	putQCounters(b, name, c)
+	st.qc[name] = c
+	st.qt[name] = true
 	return nil
 }
 
-func (p *Provider) batchZSet(b *gldb.Batch, name, member string, score int64) error {
-	old, existed, err := p.zScoreGet(name, member)
+// batchZSet 在批内合成一次分数写入：存在性与旧分数经 batchState 取最新值，
+// ZSet+ZIncr 同批可正确累加、Set 后 Del 再 Set 不漏计数。
+func (st *batchState) batchZSet(b *gldb.Batch, name, member string, score int64) error {
+	old, existed, err := st.zMemberScore(name, member)
 	if err != nil {
 		return err
 	}
-	b.Put(zScoreKey(name, score, member), nil)
-	b.Put(zMemberKey(name, member), be64(ordered(score)))
 	if !existed {
-		n, err := p.zCountGet(name)
-		if err != nil {
+		if err := st.zSetCount(name, 1); err != nil {
 			return err
 		}
-		b.Put(zCountKey(name), be64(uint64(n+1)))
 	} else if old != score {
-		b.Delete(zScoreKey(name, old, member))
+		b.Delete(zScoreKey(name, old, member)) // 分数变化：清掉旧排序键，避免残留
 	}
+	ck := zCacheKey(name, member)
+	st.zex[ck] = true
+	st.zm[ck] = score
+	b.Put(zScoreKey(name, score, member), nil)
+	b.Put(zMemberKey(name, member), be64(ordered(score)))
 	return nil
 }
 
-func (p *Provider) batchZDel(b *gldb.Batch, name, member string) error {
-	score, existed, err := p.zScoreGet(name, member)
+func (st *batchState) batchZDel(b *gldb.Batch, name, member string) error {
+	score, existed, err := st.zMemberScore(name, member)
 	if err != nil || !existed {
 		return err
 	}
-	n, err := p.zCountGet(name)
-	if err != nil {
+	if err := st.zSetCount(name, -1); err != nil {
 		return err
 	}
+	ck := zCacheKey(name, member)
+	st.zex[ck] = false
+	st.zm[ck] = 0
 	b.Delete(zScoreKey(name, score, member))
 	b.Delete(zMemberKey(name, member))
-	if n > 0 {
-		b.Put(zCountKey(name), be64(uint64(n-1)))
-	}
 	return nil
 }
 
-func (p *Provider) batchZIncr(b *gldb.Batch, name, member string, delta int64) error {
-	old, existed, err := p.zScoreGet(name, member)
+func (st *batchState) batchZIncr(b *gldb.Batch, name, member string, delta int64) error {
+	old, existed, err := st.zMemberScore(name, member)
 	if err != nil {
 		return err
 	}
 	next := old + delta
-	b.Put(zScoreKey(name, next, member), nil)
-	b.Put(zMemberKey(name, member), be64(ordered(next)))
 	if !existed {
-		n, err := p.zCountGet(name)
-		if err != nil {
+		if err := st.zSetCount(name, 1); err != nil {
 			return err
 		}
-		b.Put(zCountKey(name), be64(uint64(n+1)))
 	} else if old != next {
 		b.Delete(zScoreKey(name, old, member))
 	}
+	ck := zCacheKey(name, member)
+	st.zex[ck] = true
+	st.zm[ck] = next
+	b.Put(zScoreKey(name, next, member), nil)
+	b.Put(zMemberKey(name, member), be64(ordered(next)))
 	return nil
 }
 

@@ -329,7 +329,7 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 | SQL 过期行 | 读取路径过滤，开库时清理一次 |
 | SQLite 并发写 | 进程内写串行化（单写者），WAL 保留读并行 |
 | BoltDB 并发写 | 单写者、多读者（MVCC）；写操作按 bbolt 事务串行提交 |
-| LevelDB 无 bucket / 无事务 | 单一有序键空间，三类数据用首字节命名空间标签隔离；`Write(batch)` 本身原子，所有多键写（含值+TTL、zset 双侧索引）都收进一个 Batch。**Batch 是写缓冲、读不到未提交内容**，故 `Capabilities().BatchComposed=false`：同批内针对同一队列/zset 成员的多条操作可能互相覆盖，需确定性组合请拆批 |
+| LevelDB 无 bucket / 无事务 | 单一有序键空间，三类数据用首字节命名空间标签隔离；`Write(batch)` 本身原子，所有多键写（含值+TTL、zset 双侧索引）都收进一个 Batch。批内队列/zset 计数与成员分数经批内 pending 状态本地合成，批为 read-your-writes（`BatchComposed=true`） |
 | LevelDB 并发 Incr | LevelDB 无 CAS 原语，同 key 的读-改-写由分片锁串行化（不同 key 仍并行） |
 | Badger 有事务 | 多键写用 `db.Update` 事务提交，批内 read-your-writes（`BatchComposed=true`）。同 key 的读-改-写仍先用分片锁串行化：仅靠事务的 SSI 冲突重试也能保证正确，但同键热点会退化成重试风暴 |
 | Badger 的 TTL | 不用原生 `WithTTL`（走真实时间），改为独立 TTL 记录 + 可注入时钟判定，与 leveldb 一致 |
@@ -401,7 +401,7 @@ go run ./rpcserver -addr :7788 -backend jsonl://./data.jsonl -auth challenge -pa
   连的是 jsonl 还是 mysql，客户端代码完全一致；换底座只改服务端一个参数。
 - **`rpc` 模块零第三方依赖**（仅标准库 + 根包），客户端侧只引入 `kvdb` + `kvdb/rpc`。
 - **能力如实透传**：`db.Capabilities()` 报告的正是**服务端底座**的能力，含
-  `BatchComposed`——底层是 leveldb 就报 `false`，不会因为套了一层 RPC 而"变强"。
+  `BatchComposed`——不会因为套了一层 RPC 而"变强"。
 - **哨兵错误原样过线**：`ErrUnsupported` / `ErrClosed` / `ErrNotInteger` /
   `ErrInvalidTTL` / `ErrNotFound` 在客户端可用 `errors.Is` 正常判等。
 - **批写一次往返**：`db.Batch(...)` 整批发给服务端，由底座一次提交；批内可见性

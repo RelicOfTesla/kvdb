@@ -345,7 +345,7 @@ know them before porting Redis code:
 | SQL expired rows | Filtered on the read path, and cleaned up once when the database is opened |
 | SQLite concurrent writes | In-process write serialization (single writer), WAL keeps reads parallel |
 | BoltDB concurrent writes | Single writer, multiple readers (MVCC); writes are committed serially as bbolt transactions |
-| LevelDB has no buckets / no transactions | A single ordered keyspace, with the three data types isolated by first-byte namespace tags; `Write(batch)` is itself atomic, and all multi-key writes (including value+TTL and the zset two-sided index) are collected into one Batch. **A Batch is a write buffer and cannot read uncommitted content**, so `Capabilities().BatchComposed=false`: multiple operations against the same queue/zset member within a batch may overwrite each other, so split batches if you need deterministic composition |
+| LevelDB has no buckets / no transactions | A single ordered keyspace, with the three data types isolated by first-byte namespace tags; `Write(batch)` is itself atomic, and all multi-key writes (including value+TTL and the zset two-sided index) are collected into one Batch. Queue/zset counters and member scores are composed in-batch via a per-batch pending state, so a batch is read-your-writes (`BatchComposed=true`) |
 | LevelDB concurrent Incr | LevelDB has no CAS primitive, so read-modify-write on the same key is serialized by a sharded lock (different keys still run in parallel) |
 | Badger has transactions | Multi-key writes are committed with a `db.Update` transaction, giving read-your-writes within the batch (`BatchComposed=true`). Read-modify-write on the same key is still first serialized by a sharded lock: the SSI conflict retry of transactions alone also guarantees correctness, but hot spots on the same key degenerate into a retry storm |
 | Badger TTL | Native `WithTTL` is not used (it follows real time); instead a separate TTL record plus an injectable clock is used for the decision, consistent with leveldb |
@@ -423,9 +423,8 @@ Key points:
 - **The `rpc` module has zero third-party dependencies** (only the standard library + the root
   package), and the client side pulls in only `kvdb` + `kvdb/rpc`.
 - **Capabilities pass through faithfully**: what `db.Capabilities()` reports is exactly the
-  capability of the **server-side backend**, including `BatchComposed` — if the underlying store is
-  leveldb it reports `false`, and it does not "become stronger" just because an RPC layer was
-  wrapped around it.
+  capability of the **server-side backend**, including `BatchComposed` — and it does not
+  "become stronger" just because an RPC layer was wrapped around it.
 - **Sentinel errors cross the wire as-is**: on the client, `ErrUnsupported` / `ErrClosed` /
   `ErrNotInteger` / `ErrInvalidTTL` / `ErrNotFound` can be compared normally with `errors.Is`.
 - **A batch write is one round trip**: `db.Batch(...)` sends the whole batch to the server, and the

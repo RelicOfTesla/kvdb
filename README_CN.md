@@ -84,50 +84,37 @@ top, _ := db.ZRange(ctx, "rank", 0, -1)
 同一套 API 覆盖 11 个基座；URI 列即 scheme 参考。SQL 系用 `?table_prefix=` 加前缀，
 `redis`/`ssdb` 用 `?key_prefix=`（逻辑前缀，读回时剥除，`Scan` 也限定其中）；不配置即当前布局。
 
-| 基座 | 包 | KV/Queue/ZSet | URI 与要点 |
-|---|---|---|---|
-| 内存 | `mem` | ✅✅✅ | `mem://` — 不持久化，测试/缓存用 |
-| JSONL 日志 | `jsonl` | ✅✅✅ | `jsonl://./d.jsonl` — 追加写 WAL，打开时回放，可 `Compact()`；缺省 flush 500ms + fsync 1s，`?sync=1` 逐操作，`?each_flush=1` 逐操作 flush |
-| BoltDB | `bolt` | ✅✅✅ | `bolt://./d.bolt` — 单文件 B+tree；缺省不逐提交 fsync、按 `?sync_interval=1s` 周期落盘，`?sync=1` 逐提交 |
-| LevelDB | `leveldb` | ✅✅✅ | `leveldb://./d.dir` — LSM；`?sync=1` 逐提交，`?cache`/`?wb` 单位 MiB |
-| Badger | `badger` | ✅✅✅ | `badger://./d.dir` — 带 MVCC 的 LSM；`?sync=1` 逐提交，`?cache`/`?memtable` 单位 MiB |
-| SQLite | `sqlite` | ✅✅✅ | `sqlite://./d.db` — 纯 Go 驱动（无 CGO）；缺省 NORMAL，`?sync=1` 即 FULL |
-| MySQL | `mysql` | ✅✅✅ | `mysql://user:pass@h:3306/db?parseTime=true` |
-| PostgreSQL | `pg` | ✅✅✅ | `pg://user:pass@h:5432/db?sslmode=disable` |
-| SQL Server | `mssql` | ✅✅✅ | `mssql://sa:pass@h:1433?database=db&encrypt=disable` |
-| Redis | `redis` | ✅✅✅ | `redis://:pass@h:6379/0` — 原生 String/List/Sorted Set |
-| SSDB | `ssdb` | ✅✅✅ | `ssdb://[user:pass@]h:8888` — 原生文本协议客户端，带连接池 |
-| RPC | `rpc` | ✅✅✅ | `rpc://h:7788?auth=challenge&password=…` — 客户端不感知底座 |
+| 基座 | 包 | URI 与要点 |
+|---|---|---|
+| 内存 | `mem` | `mem://` — 不持久化，测试/缓存用 |
+| JSONL 日志 | `jsonl` | `jsonl://./d.jsonl` — 追加写 WAL，打开时回放，可 `Compact()`；缺省 flush 500ms + fsync 1s，`?sync=1` 逐操作，`?each_flush=1` 逐操作 flush |
+| BoltDB | `bolt` | `bolt://./d.bolt` — 单文件 B+tree；缺省不逐提交 fsync、按 `?sync_interval=1s` 周期落盘，`?sync=1` 逐提交 |
+| LevelDB | `leveldb` | `leveldb://./d.dir` — LSM；`?sync=1` 逐提交，`?cache`/`?wb` 单位 MiB |
+| Badger | `badger` | `badger://./d.dir` — 带 MVCC 的 LSM；`?sync=1` 逐提交，`?cache`/`?memtable` 单位 MiB |
+| SQLite | `sqlite` | `sqlite://./d.db` — 纯 Go 驱动（无 CGO）；缺省 NORMAL，`?sync=1` 即 FULL |
+| MySQL | `mysql` | `mysql://user:pass@h:3306/db?parseTime=true` |
+| PostgreSQL | `pg` | `pg://user:pass@h:5432/db?sslmode=disable` |
+| SQL Server | `mssql` | `mssql://sa:pass@h:1433?database=db&encrypt=disable` |
+| Redis | `redis` | `redis://:pass@h:6379/0` — 原生 String/List/Sorted Set |
+| SSDB | `ssdb` | `ssdb://[user:pass@]h:8888` — 原生文本协议客户端，带连接池 |
+| RPC | `rpc` | `rpc://h:7788?auth=challenge&password=…` — 客户端不感知底座 |
 
 四个 SQL 基座共用 `sqlstore`；导入路径为 `github.com/RelicOfTesla/kvdb/<pkg>`
 （另有聚合包 `.../all`）。
 
 ## 能力模型
 
-`kvdb.Open` / `kvdb.Wrap` 返回接口 `DB`，它内嵌各能力接口（`KvProvider` 必选，另有
-`QueueProvider` / `ZSetProvider` / `Batcher` / `Closer`）与 `Capabilities() core.Caps`。
-具体适配器不导出。
-
-未实现的能力调用返回 `ErrUnsupported`，因此先探测：
+`kvdb.Open` 返回接口 `DB`，内嵌各能力接口（`KvProvider` 必选；`QueueProvider` /
+`ZSetProvider` / `Batcher` / `Closer` 可选）与 `Capabilities() core.Caps`。未实现的能力调用
+返回 `ErrUnsupported`，故先探测：
 
 ```go
-c := db.Capabilities()     // c.Queue / c.ZSet / c.Batch / c.BatchComposed
+c := db.Capabilities()   // c.Queue / c.ZSet / c.Batch / c.BatchComposed
 ```
 
-`Caps` 是结构体，新增能力不改签名。`BatchComposed` 是真实的、非强制的能力差异：在同一
-事务/同一把锁内逐条应用者为 `true`（`mem`/`jsonl`/`bolt`/`badger`/`sqlite`/`mysql`/`pg`），
-而 LevelDB 的 Batch、Redis 的 MULTI/EXEC、SSDB 的流水线在提交前读不到未提交内容，为
-`false`——据此分支，或把互相依赖的操作拆到不同批次。
-
-只依赖用到的接口（测试桩便只需实现对应方法）：
-
-```go
-func touch(ctx context.Context, store kvdb.KvProvider, key string) (int64, error) {
-    return store.Incr(ctx, key, 1)
-}
-```
-
-`kvdb.Unwrap(db)` 取出适配器背后的基座（非适配器返回 nil）。
+只依赖用到的接口即可（测试桩只需实现对应方法）。`BatchComposed` 表示同一批内后续操作能否
+看到前序效果（LevelDB Batch / Redis MULTI-EXEC / SSDB 流水线为 `false`）；据此分支，或把
+互相依赖的操作拆到不同批次。
 
 ## 批量写
 
@@ -196,78 +183,36 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 
 ## 扩展：自定义基座
 
-实现 `core.KvProvider`（必选）与所需可选能力接口，注册后即可经 `kvdb.Open` 使用：
-
-```go
-type myStore struct{ /* ... */ }
-
-func (m *myStore) Set(ctx context.Context, key string, value []byte) error { /* ... */ }
-// ... 其余 KV 方法；可选实现 core.QueueProvider / core.ZSetProvider / core.BatchProvider
-
-func init() {
-    kvdb.MustRegister("mybase", func(ctx context.Context, u *url.URL) (core.KvProvider, error) {
-        return &myStore{}, nil
-    })
-}
-// 使用方：import _ "your/module/mybase"，随后 kvdb.Open(ctx, "mybase://...")
-```
-
-`kvdb.Register` 在 scheme 重复或为空时报错；`kvdb.Schemes()` 列出已注册项；
-`FullProvider` 一次性声明"KV + Queue + ZSet + Batch + Close"整套能力。
+实现 `core.KvProvider`（及所需可选能力接口），用 `kvdb.MustRegister(scheme, factory)` 注册，
+即可经 `kvdb.Open` 使用。接口细节见 `core` 包文档与 [`example/`](example)。
 
 ## 本地变远程（RPC / c-s）
 
 任一基座放在服务端，客户端经**同一套接口**通过网络访问——用于跨进程/跨机隔离，或把
-嵌入式基座变成多消费方共享的服务。
+嵌入式基座变成共享服务。
 
 ```go
-// 服务端：选一个底座（import 对应基座包，或 .../all）
 srv, err := rpc.NewServer(ctx, rpc.ServerConfig{
-    Addr: ":7788", Backend: "jsonl://./data.jsonl",   // 换成 bolt/sqlite/mysql/ssdb…
+    Addr: ":7788", Backend: "jsonl://./data.jsonl",   // bolt/sqlite/mysql/ssdb…
     Auth: rpc.AuthChallenge, Password: "s3cret",
 })
 go srv.Serve(ctx)
 
-// 客户端：不 import 任何基座，也不需要知道对端是什么
 db, err := kvdb.Open(ctx, "rpc://127.0.0.1:7788?auth=challenge&password=s3cret")
-defer db.Close()
-db.Set(ctx, "k", []byte("v"))           // KV / Queue / ZSet / Batch 都可用
+db.Set(ctx, "k", []byte("v"))   // KV / Queue / ZSet / Batch 都可用
 ```
 
-也可直接跑现成的服务端命令：`go run ./example/rpcdemo -addr :7788 -backend jsonl://./data.jsonl -auth challenge -password s3cret`
+现成服务端：`go run ./example/rpcdemo -addr :7788 -backend jsonl://./data.jsonl -auth challenge -password s3cret`
 
-- **客户端不感知底座**：`rpc` 实现 `core.FullProvider`，无论对端是 jsonl 还是 mysql，客户端
-  代码完全相同；换底座只改服务端一个参数。`rpc` 模块（尤其客户端）**零第三方依赖**。
-- **能力与错误如实透传**：`Capabilities()` 报告的正是**服务端底座**的能力（不会因为套了
-  一层 RPC 而"变强"）；哨兵错误各有独立 wire 状态，故客户端仍可用 `errors.Is` 判等
-  （完整清单见 `core` 包文档）。
-- **批写一次往返**；批内可见性取决于底座本身。客户端 `Close()` 只关自己的连接，不会关掉
-  服务端基座。
+客户端**不感知底座**（`rpc` 实现 `core.FullProvider`，且零第三方依赖），`Capabilities()`
+报告的是**服务端底座**的能力。哨兵错误过线后仍可用 `errors.Is` 判等；批写一次往返；
+客户端 `Close()` 只关自己的连接。
 
-### 认证、TLS、codec
-
-认证是 **c/s 协议自己的**（mysql 密码这类底座凭据由服务端负责，客户端不感知）：
-
-| 模式 | URI | 说明 |
-|---|---|---|
-| 无认证（缺省） | `auth=none` | 本机/内网裸奔 |
-| 明文 | `auth=plain&password=…` | 口令上线；默认关闭，仅限已套 TLS 时使用 |
-| 挑战 | `auth=challenge&password=…` | 服务端下发一次性 nonce，客户端回 `HMAC-SHA256(password, nonce)`；口令不上线 |
-
-TLS 为标准 `crypto/tls`，由服务端配置决定同一端口是否启用（给了证书即 TLS）：
-
-```bash
-rpc://h:7788?tls=1&ca=./ca.pem                            # 校验服务端
-rpc://h:7788?tls=1&ca=./ca.pem&cert=./c.pem&key=./c.key   # 双向 TLS
-rpc://h:7788?tls=1&insecure=1                             # 仅测试
-```
-
-配置错误一律明确失败：写了 password 却没写 `auth=`、写了 TLS 参数却没写 `tls=1`、
-明文连 TLS 端口，都会立刻报错——**不会静默降级**。
-
-codec 抽象在 `rpc/codec.Codec`：`resp`（默认，仿 RESP2，可用 `nc` 手测）、`binary`
-（uvarint 长度前缀）、`textproto`（SSDB 风格记录，**不与 SSDB 互通**）。两端必须一致，
-不一致在握手即失败。其他参数：`pool=N`（客户端连接池，缺省 8）、`max-conns`（服务端）。
+认证是 **c/s 协议自己的**（底座凭据由服务端负责）：`auth=none`（缺省）/ `auth=plain`
+（口令上线）/ `auth=challenge`（nonce + `HMAC-SHA256`，口令不上线）。TLS 为标准
+`crypto/tls`，由服务端配置在同一端口启用（`?tls=1&ca=./ca.pem`，双向再加 `cert=`/`key=`）。
+codec 为 `resp`（缺省）/ `binary` / `textproto`，经 `?codec=` 选择，两端必须一致。
+配置错误一律报错，不会静默降级。
 
 ## 兼容性
 
@@ -282,18 +227,20 @@ codec 抽象在 `rpc/codec.Codec`：`resp`（默认，仿 RESP2，可用 `nc` �
 
 ## 性能
 
-完整实测数据、成本模型与选型建议见 **[PERFORMANCE_CN.md](PERFORMANCE_CN.md)**。
-口径：固定时间窗内压满并发负载，统计实际完成量（ops/s）。决定选型的五条：
+真实块设备（ext4）、各基座缺省档、8 goroutine、2s 窗口统计实际完成量（ops/s；`MGet条目`/
+`批写条目` 为条目级 items/s）。完整数据、其余介质与 `?sync=1` 矩阵见
+**[PERFORMANCE_CN.md](PERFORMANCE_CN.md)**。
 
-- **先定持久化档位，再挑基座**：缺省档不逐提交 fsync；真实 ext4 上 `?sync=1` 慢
-  **29–940×**。同一介质同一基座，这个杠杆的作用大于"选哪个基座"。
-- **写瓶颈通常就是"每提交一次 fsync"**，而非语句条数，因此**批写收益随提交成本放大**：
-  缺省档 2.2–6.0×（bolt 达 18.8×，因为它每次写都开事务），`?sync=1` 档 39–86×。
-- **同 key 热点对 SQL 系伤害明显**（mysql 多 key 428 vs 同 key 119；pg 2.2k vs 647）：
-  把计数器打散到多个 key，或改用批写。
-- **混合读写时 `mem`/`jsonl` 的读被压到纯读的 5–9%**（共用全局锁）；服务端基座的读写
-  互不阻塞（各自保留 ~44–63%）。
-- 复测：`cd example/bench && KVDB_BENCH_URI=<uri> go test -run '^$' -bench Throughput -benchtime 3s`
+| 基座 | Set | Get | Incr多key | Incr同key | QPush | MGet条目 | 批写条目 | 混合读 | 混合写 | 读保留率 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| jsonl | ~353.6k | ~10.0M | ~190.1k | ~242.2k | ~639.3k | ~14.1M | ~454.7k | ~474k | ~105k | 5% |
+| bolt | ~25.2k | ~591.1k | ~22.9k | ~26.9k | ~20.9k | ~2.6M | ~473.8k | ~170k | ~13.5k | 27% |
+| leveldb | ~164.6k | ~1.0M | ~111.8k | ~122.4k | ~111.8k | ~1.0M | ~354.2k | ~98.7k | ~52.4k | 11% |
+| badger | ~81.8k | ~274.4k | ~63.5k | ~34.0k | ~64.7k | ~608.2k | ~493.8k | ~76.4k | ~49.7k | 28% |
+| sqlite | ~12.6k | ~62.9k | ~5.0k | ~5.8k | ~5.5k | ~450.9k | ~37.6k | ~40.1k | ~5.8k | 64% |
+
+由此表可得两点：**先定持久化档位再挑基座**（缺省档不逐提交 fsync；同一介质上 `?sync=1`
+代价 29–940×）；**批写是写侧主要杠杆**（缺省档 2.2–6.0×，`?sync=1` 档 39–86×）。
 
 ## 测试
 

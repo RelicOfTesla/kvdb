@@ -90,51 +90,37 @@ One API over 11 backends; the URI column doubles as the scheme reference. For th
 `?table_prefix=` prefixes the tables and indexes; `redis`/`ssdb` take `?key_prefix=` (a logical
 prefix, stripped on read-back, with `Scan` confined to it). Unconfigured means the current layout.
 
-| Backend | Package | KV/Queue/ZSet | URI and notes |
-|---|---|---|---|
-| In-memory | `mem` | ✅✅✅ | `mem://` — no persistence, for tests/caching |
-| JSONL log | `jsonl` | ✅✅✅ | `jsonl://./d.jsonl` — append-only WAL replayed on open, `Compact()`; flush 500ms + fsync 1s by default, `?sync=1` per-op, `?each_flush=1` per-op flush |
-| BoltDB | `bolt` | ✅✅✅ | `bolt://./d.bolt` — single-file B+tree; no per-commit fsync, periodic flush (`?sync_interval=1s`), `?sync=1` per-commit |
-| LevelDB | `leveldb` | ✅✅✅ | `leveldb://./d.dir` — LSM; `?sync=1` per-commit, `?cache`/`?wb` in MiB |
-| Badger | `badger` | ✅✅✅ | `badger://./d.dir` — LSM with MVCC; `?sync=1` per-commit, `?cache`/`?memtable` in MiB |
-| SQLite | `sqlite` | ✅✅✅ | `sqlite://./d.db` — pure Go driver (no CGO); NORMAL by default, `?sync=1` = FULL |
-| MySQL | `mysql` | ✅✅✅ | `mysql://user:pass@h:3306/db?parseTime=true` |
-| PostgreSQL | `pg` | ✅✅✅ | `pg://user:pass@h:5432/db?sslmode=disable` |
-| SQL Server | `mssql` | ✅✅✅ | `mssql://sa:pass@h:1433?database=db&encrypt=disable` |
-| Redis | `redis` | ✅✅✅ | `redis://:pass@h:6379/0` — native String/List/Sorted Set |
-| SSDB | `ssdb` | ✅✅✅ | `ssdb://[user:pass@]h:8888` — native text protocol client with pooling |
-| RPC | `rpc` | ✅✅✅ | `rpc://h:7788?auth=challenge&password=…` — client is backend-unaware |
+| Backend | Package | URI and notes |
+|---|---|---|
+| In-memory | `mem` | `mem://` — no persistence, for tests/caching |
+| JSONL log | `jsonl` | `jsonl://./d.jsonl` — append-only WAL replayed on open, `Compact()`; flush 500ms + fsync 1s by default, `?sync=1` per-op, `?each_flush=1` per-op flush |
+| BoltDB | `bolt` | `bolt://./d.bolt` — single-file B+tree; no per-commit fsync, periodic flush (`?sync_interval=1s`), `?sync=1` per-commit |
+| LevelDB | `leveldb` | `leveldb://./d.dir` — LSM; `?sync=1` per-commit, `?cache`/`?wb` in MiB |
+| Badger | `badger` | `badger://./d.dir` — LSM with MVCC; `?sync=1` per-commit, `?cache`/`?memtable` in MiB |
+| SQLite | `sqlite` | `sqlite://./d.db` — pure Go driver (no CGO); NORMAL by default, `?sync=1` = FULL |
+| MySQL | `mysql` | `mysql://user:pass@h:3306/db?parseTime=true` |
+| PostgreSQL | `pg` | `pg://user:pass@h:5432/db?sslmode=disable` |
+| SQL Server | `mssql` | `mssql://sa:pass@h:1433?database=db&encrypt=disable` |
+| Redis | `redis` | `redis://:pass@h:6379/0` — native String/List/Sorted Set |
+| SSDB | `ssdb` | `ssdb://[user:pass@]h:8888` — native text protocol client with pooling |
+| RPC | `rpc` | `rpc://h:7788?auth=challenge&password=…` — client is backend-unaware |
 
 All four SQL backends share `sqlstore`; import path is `github.com/RelicOfTesla/kvdb/<package>`
 (plus the aggregate `.../all`).
 
 ## Capability model
 
-`kvdb.Open` / `kvdb.Wrap` return the interface `DB`, which embeds the capability interfaces
-(`KvProvider` mandatory, plus `QueueProvider` / `ZSetProvider` / `Batcher` / `Closer`) and
-`Capabilities() core.Caps`. The concrete adapter is unexported.
-
-An unimplemented capability returns `ErrUnsupported`, so probe first:
+`kvdb.Open` returns the interface `DB`, embedding the capability interfaces (`KvProvider` is
+mandatory; `QueueProvider` / `ZSetProvider` / `Batcher` / `Closer` are optional) plus
+`Capabilities() core.Caps`. An absent capability returns `ErrUnsupported`, so probe first:
 
 ```go
-c := db.Capabilities()     // c.Queue / c.ZSet / c.Batch / c.BatchComposed
+c := db.Capabilities()   // c.Queue / c.ZSet / c.Batch / c.BatchComposed
 ```
 
-`Caps` is a struct, so adding a capability never changes signatures. `BatchComposed` is a real,
-non-mandatory difference: backends applying ops one by one inside one transaction or lock
-(`mem`/`jsonl`/`bolt`/`badger`/`sqlite`/`mysql`/`pg`) are `true`, while LevelDB's Batch, Redis's
-MULTI/EXEC and SSDB's pipeline cannot read uncommitted content, so they are `false` — probe it,
-or split interdependent operations into separate batches.
-
-Depend only on the interfaces you use (a mock then implements just those methods):
-
-```go
-func touch(ctx context.Context, store kvdb.KvProvider, key string) (int64, error) {
-    return store.Incr(ctx, key, 1)
-}
-```
-
-`kvdb.Unwrap(db)` returns the backend behind an adapter (nil if it is not an adapter).
+Depend only on the interfaces you use — a mock then implements just those methods. `BatchComposed`
+says whether later ops in one batch see earlier ones (`false` for LevelDB Batch / Redis MULTI-EXEC
+/ SSDB pipeline); probe it, or split interdependent ops into separate batches.
 
 ## Batched writes
 
@@ -204,83 +190,39 @@ time and **one batch may mix types**; `Del`/`Expire`/`ZSet` remain available via
 
 ## Extending: custom backends
 
-Implement `core.KvProvider` (mandatory) plus any optional capability interfaces, register it, and
-`kvdb.Open` can use it:
-
-```go
-type myStore struct{ /* ... */ }
-
-func (m *myStore) Set(ctx context.Context, key string, value []byte) error { /* ... */ }
-// ... remaining KV methods; optionally core.QueueProvider / core.ZSetProvider / core.BatchProvider
-
-func init() {
-    kvdb.MustRegister("mybase", func(ctx context.Context, u *url.URL) (core.KvProvider, error) {
-        return &myStore{}, nil
-    })
-}
-// consumer: import _ "your/module/mybase", then kvdb.Open(ctx, "mybase://...")
-```
-
-`kvdb.Register` errors on a duplicate or empty scheme; `kvdb.Schemes()` lists what is registered;
-`FullProvider` declares the whole "KV + Queue + ZSet + Batch + Close" set at once.
+Implement `core.KvProvider` (plus any optional capability interfaces) and register it with
+`kvdb.MustRegister(scheme, factory)`; it is then reachable through `kvdb.Open`. See
+[`example/`](example) and the `core` package docs for the interfaces.
 
 ## Local to remote (RPC client/server)
 
-Put any backend on the server side and the client reaches it over the network through **the same
-interfaces** — for cross-process/machine isolation, or to turn an embedded backend into a shared
-service.
+Put any backend on the server side; the client reaches it over the network through **the same
+interfaces**. Useful for cross-process/machine isolation, or to share an embedded backend.
 
 ```go
-// Server: pick a backend (imports that backend package, or .../all)
 srv, err := rpc.NewServer(ctx, rpc.ServerConfig{
-    Addr: ":7788", Backend: "jsonl://./data.jsonl",   // change to bolt/sqlite/mysql/ssdb…
+    Addr: ":7788", Backend: "jsonl://./data.jsonl",   // bolt/sqlite/mysql/ssdb…
     Auth: rpc.AuthChallenge, Password: "s3cret",
 })
 go srv.Serve(ctx)
 
-// Client: imports no backend and needs no knowledge of the peer
 db, err := kvdb.Open(ctx, "rpc://127.0.0.1:7788?auth=challenge&password=s3cret")
-defer db.Close()
-db.Set(ctx, "k", []byte("v"))           // KV / Queue / ZSet / Batch all available
+db.Set(ctx, "k", []byte("v"))   // KV / Queue / ZSet / Batch all available
 ```
 
-Or run the ready-made server: `go run ./example/rpcdemo -addr :7788 -backend jsonl://./data.jsonl -auth challenge -password s3cret`
+Ready-made server: `go run ./example/rpcdemo -addr :7788 -backend jsonl://./data.jsonl -auth challenge -password s3cret`
 
-- **Client is backend-unaware**: `rpc` implements `core.FullProvider`, so client code is identical
-  whatever the peer runs; switching backends changes one server-side parameter. The `rpc` module
-  (and the client in particular) has **zero third-party dependencies**.
-- **Capabilities and errors pass through faithfully**: `Capabilities()` reports the *server*
-  backend's set (never "stronger" for having an RPC layer), and sentinel errors keep their identity
-  so `errors.Is` still works (see the `core` package docs for the list).
-- **One batch = one round trip**; in-batch visibility is the backend's own semantics. The client's
-  `Close()` closes only its connection, not the server's backend.
+The client is **backend-unaware** (`rpc` implements `core.FullProvider`, and has zero third-party
+dependencies), and `Capabilities()` reports the *server* backend's set. Errors keep their identity
+over the wire, so `errors.Is` works; one batch is one round trip, and the client's `Close()` closes
+only its own connection.
 
-### Authentication, TLS, codec
-
-Authentication is the **c/s protocol's own** (backend credentials such as a mysql password are the
-server's business, invisible to the client):
-
-| Mode | URI | Notes |
-|---|---|---|
-| none (default) | `auth=none` | Bare on localhost/intranet |
-| plaintext | `auth=plain&password=…` | Password on the wire; off by default, use only behind TLS |
-| challenge | `auth=challenge&password=…` | Server nonce + `HMAC-SHA256(password, nonce)`; the password never goes on the wire |
-
-TLS is standard `crypto/tls`, switched on the same port by server config (certificate ⇒ TLS):
-
-```bash
-rpc://h:7788?tls=1&ca=./ca.pem                            # verify the server
-rpc://h:7788?tls=1&ca=./ca.pem&cert=./c.pem&key=./c.key   # mutual TLS
-rpc://h:7788?tls=1&insecure=1                             # testing only
-```
-
-Wrong configuration fails loudly: a password without `auth=`, TLS params without `tls=1`, or
-plaintext against a TLS port are all immediate errors — **there is no silent downgrade**.
-
-Codecs live behind `rpc/codec.Codec`: `resp` (default, RESP2-like and hand-testable with `nc`),
-`binary` (uvarint length prefix), `textproto` (SSDB-style records, not SSDB-interoperable). Both
-ends must match; a mismatch fails at handshake. Other parameters: `pool=N` (client connection
-pool, default 8), `max-conns` (server side).
+Authentication is the **c/s protocol's own** (backend credentials are the server's business):
+`auth=none` (default) / `auth=plain` (password on the wire) / `auth=challenge` (nonce +
+`HMAC-SHA256`; the password never goes on the wire). TLS is standard `crypto/tls`, enabled by the
+server config on the same port (`?tls=1&ca=./ca.pem`, plus `cert=`/`key=` for mutual TLS). Codecs
+are `resp` (default) / `binary` / `textproto`, selected via `?codec=`; both ends must match.
+Misconfiguration never degrades silently — it errors.
 
 ## Compatibility
 
@@ -295,21 +237,21 @@ pool, default 8), `max-conns` (server side).
 
 ## Performance
 
-Full measured data, cost model and selection advice: **[PERFORMANCE.md](PERFORMANCE.md)**.
-Method: saturate a fixed time window with concurrent load and count what actually completes
-(ops/s). The five points that drive most decisions:
+Real block device (ext4), default mode, 8 goroutines, 2s window counting completed volume
+(ops/s; `MGet items`/`Batch items` are items/s at entry level). Full data, other media and the
+`?sync=1` matrix: **[PERFORMANCE.md](PERFORMANCE.md)**.
 
-- **Decide the durability mode before the backend**: the default mode does not fsync per commit;
-  on real ext4, `?sync=1` is **29–940× slower**. Same medium, same backend — this lever dominates
-  backend choice. (How to pick: `?sync=1` only when a power loss must not lose acknowledged writes.)
-- **The write bottleneck is normally one fsync per commit**, not the statement count, so
-  **batch writes scale with commit cost**: 2.2–6.0× in the default mode (bolt 18.8×, as it opens a
-  transaction per write) and 39–86× with `?sync=1`.
-- **Same-key hot spots hurt the SQL family** (mysql 428 multi-key vs 119 same-key; pg 2.2k vs 647):
-  spread counters across keys, or batch.
-- **Under mixed read/write, `mem`/`jsonl` reads are squeezed to 5–9% of pure reads** (shared global
-  lock); server backends do not block the two directions against each other (~44–63% each).
-- Re-measure: `cd example/bench && KVDB_BENCH_URI=<uri> go test -run '^$' -bench Throughput -benchtime 3s`
+| Backend | Set | Get | Incr multi-key | Incr same-key | QPush | MGet items | Batch items | Mixed read | Mixed write | Read retention |
+|---|---|---|---|---|---|---|---|---|---|---|
+| jsonl | ~353.6k | ~10.0M | ~190.1k | ~242.2k | ~639.3k | ~14.1M | ~454.7k | ~474k | ~105k | 5% |
+| bolt | ~25.2k | ~591.1k | ~22.9k | ~26.9k | ~20.9k | ~2.6M | ~473.8k | ~170k | ~13.5k | 27% |
+| leveldb | ~164.6k | ~1.0M | ~111.8k | ~122.4k | ~111.8k | ~1.0M | ~354.2k | ~98.7k | ~52.4k | 11% |
+| badger | ~81.8k | ~274.4k | ~63.5k | ~34.0k | ~64.7k | ~608.2k | ~493.8k | ~76.4k | ~49.7k | 28% |
+| sqlite | ~12.6k | ~62.9k | ~5.0k | ~5.8k | ~5.5k | ~450.9k | ~37.6k | ~40.1k | ~5.8k | 64% |
+
+Two things follow from this table: **decide the durability mode before the backend** (the default
+mode does not fsync per commit; `?sync=1` costs 29–940× on the same medium), and **batch writes**
+are the main write-side lever (2.2–6.0× by default, 39–86× with `?sync=1`).
 
 ## Testing
 

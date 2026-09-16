@@ -388,9 +388,11 @@ func (p *Provider) check() error {
 	}
 }
 
-// IncrWraps 能力声明：SSDB incr 溢出由服务端报错（映射 ErrNotInteger，不回绕），
-// 见 core.IncrWrapsProvider 与 Caps.IncrWraps。
-func (p *Provider) IncrWraps() bool { return false }
+// IncrWraps 能力声明：SSDB 服务端对 incr 溢出不做检查，按 int64 静默回绕
+// （真实实例实测：对 MaxInt64 上的值再加正数返回回绕后的负值而非错误；
+// 可用 KVDB_TEST_SSDB_ADDR 指向真实实例经 kvdbtest 复验）。仅"值为非整数"
+// 时服务端才报错并映射 ErrNotInteger。见 core.IncrWrapsProvider 与 Caps.IncrWraps。
+func (p *Provider) IncrWraps() bool { return true }
 
 var _ core.IncrWrapsProvider = (*Provider)(nil)
 

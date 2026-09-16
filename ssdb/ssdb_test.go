@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"net/url"
 	"sort"
@@ -226,12 +225,9 @@ func (f *fakeSSDB) dispatch(req [][]byte) [][]byte {
 			}
 			cur = n
 		}
-		// 溢出报错：与 SDK 契约 / 能力声明 Caps.IncrWraps=false、README「Incr 溢出：
-		// SSDB 报错」对齐。测试替身是契约的另一方，必须同样守约，否则
-		// kvdbtest 里"能力即承诺"的断言无法区分真坏与替身不守约。
-		if (delta > 0 && cur > math.MaxInt64-delta) || (delta < 0 && cur < math.MinInt64-delta) {
-			return [][]byte{[]byte("error"), []byte("value is not an integer or out of range")}
-		}
+		// 溢出不做检查、按 int64 回绕——与真实 SSDB 服务端行为一致（经
+		// TestRealSSDB 对真实实例实测确认），与 SDK 能力声明
+		// Caps.IncrWraps=true 对齐。
 		cur += delta
 		f.kv[arg(1)] = []byte(strconv.FormatInt(cur, 10))
 		return [][]byte{[]byte("ok"), []byte(strconv.FormatInt(cur, 10))}

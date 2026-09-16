@@ -315,7 +315,7 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 | `TTL` | `-2` 表示 key 不存在、`-1` 表示存在但无 TTL | 两者都收敛为 `ok=false`，无法区分 |
 | `Del` / `Expire` | 返回受影响 key 数 | 只返回 `error` |
 | `Exists` | 可传多 key，返回计数 | 单 key，返回 `bool` |
-| `Incr` 溢出 | 始终报错 | SQL/Redis/SSDB 报错；mem/bolt/jsonl **静默回绕**（契约不统一承诺） |
+| `Incr` 溢出 | 始终报错 | SQL/Redis 报错；mem/bolt/jsonl/leveldb/badger/SSDB **静默回绕**（经 `Caps.IncrWraps` 显式探测） |
 | ZSet 分数 | IEEE-754 double（可有小数） | `int64`；Redis 基座在 `\|score\| ≤ 2^53` 内无损 |
 | 列表命令 | `LPUSH`/`RPUSH`/`LPOP`/`RPOP`/`LLEN`/`LINDEX` | `QPush`/`QPushFront`/`QPop`/`QPopBack`/`QSize`/`QFront`/`QBack` |
 | 有序集命令 | `ZADD`/`ZSCORE`/`ZREM`/`ZCARD`/`ZINCRBY` | `ZSet`/`ZGet`/`ZDel`/`ZSize`/`ZIncr`（仅 `ZRank`/`ZRange` 沿用 Redis 名） |

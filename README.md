@@ -330,7 +330,7 @@ know them before porting Redis code:
 | `TTL` | `-2` = key missing, `-1` = exists without TTL | both collapse into `ok=false`; the two cases cannot be told apart |
 | `Del` / `Expire` | return how many keys were affected | return only `error` |
 | `Exists` | accepts multiple keys, returns a count | single key, returns `bool` |
-| `Incr` overflow | always errors | errors on SQL/Redis/SSDB; **wraps around silently** on mem/bolt/jsonl (no unified promise) |
+| `Incr` overflow | always errors | errors on SQL/Redis; **wraps around silently** on mem/bolt/jsonl/leveldb/badger/SSDB (probe via `Caps.IncrWraps`) |
 | ZSet score | IEEE-754 double (fractional values allowed) | `int64`; the Redis backend is lossless only within `\|score\| ≤ 2^53` |
 | List commands | `LPUSH`/`RPUSH`/`LPOP`/`RPOP`/`LLEN`/`LINDEX` | `QPush`/`QPushFront`/`QPop`/`QPopBack`/`QSize`/`QFront`/`QBack` |
 | Sorted-set commands | `ZADD`/`ZSCORE`/`ZREM`/`ZCARD`/`ZINCRBY` | `ZSet`/`ZGet`/`ZDel`/`ZSize`/`ZIncr` (only `ZRank`/`ZRange` keep the Redis names) |

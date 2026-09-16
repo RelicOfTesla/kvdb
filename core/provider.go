@@ -72,9 +72,9 @@ type KvProvider interface {
 	// Exists 判断 key 是否存在（已过期视为不存在）。
 	Exists(ctx context.Context, key string) (bool, error)
 	// Incr 原子地对 key 存储的十进制整数加 delta（key 不存在按 0 起算）；
-	// 已有值非整数返回 ErrNotInteger。溢出行为按基座分歧：SQL/Redis/SSDB
-	// 返回错误（SSDB/PG 统一映射为 ErrNotInteger），内存型基座（mem/bolt/jsonl）
-	// 按 int64 回绕——契约不对溢出语义做统一承诺。
+	// 已有值非整数返回 ErrNotInteger。溢出行为按基座分歧：SQL/Redis 返回错误，
+	// 内存型基座（mem/bolt/jsonl/leveldb/badger）与 SSDB（服务端对溢出不做检查）
+	// 按 int64 回绕——契约不对溢出语义做统一承诺，经 Caps.IncrWraps 显式探测。
 	Incr(ctx context.Context, key string, delta int64) (int64, error)
 	// MGet 批量读取；结果只含存在的 key，不保证顺序。
 	MGet(ctx context.Context, keys ...string) (map[string][]byte, error)
@@ -150,8 +150,8 @@ type Caps struct {
 	// Redis / SSDB 这类则不承诺，可经 BatchComposedProvider 探测。
 	BatchComposed bool
 	// IncrWraps 声明 Incr 的溢出语义：true = 按 int64 回绕（内存型基座
-	// mem/jsonl/bolt/leveldb/badger 的自然行为）；false = 溢出按 ErrNotInteger
-	// 报错（sqlstore/Redis/SSDB 有显式溢出检查）。两种语义均符合契约，
+	// mem/jsonl/bolt/leveldb/badger 与 SSDB 的自然行为）；false = 溢出按
+	// ErrNotInteger 报错（sqlstore/Redis 有显式溢出检查）。两种语义均符合契约，
 	// 业务在跨基座迁移"大计数器"场景时可据此分支；可经 IncrWrapsProvider 探测。
 	IncrWraps bool
 }
@@ -194,8 +194,8 @@ type BatchComposedProvider interface {
 }
 
 // IncrWrapsProvider 是可选的能力声明：实现它表示该基座的 Incr 在 int64 溢出时
-// 按**回绕**处理（wrap-around，内存型基座的自然行为）；未实现（或 Caps 未置位）
-// 表示溢出按 ErrNotInteger 报错（SQL/Redis/SSDB 有显式溢出检查）。
+// 按**回绕**处理（wrap-around，内存型基座与 SSDB 的自然行为）；未实现（或 Caps
+// 未置位）表示溢出按 ErrNotInteger 报错（SQL/Redis 有显式溢出检查）。
 // 同一契约允许两种语义（见 KvProvider.Incr 注释），这里是把差异显式化。
 type IncrWrapsProvider interface {
 	// IncrWraps 恒为 true，仅作能力标记。

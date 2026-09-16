@@ -23,7 +23,7 @@ n, err := db.Incr(ctx, "visits", 1)
 - **字节 ↔ 泛型辅助**：`B` / `P` / `D` / `DMust` 支持标量与结构体（默认 JSON，编解码可替换），标量编码与 `Incr` 互操作
 - **本地变远程（c/s）**：`rpc` 把任一基座暴露成服务端，客户端用同一组接口访问；
   客户端**不感知服务端底座**，自带 c/s 认证（明文 / 挑战-响应）与可选 TLS，协议编解码可替换
-- **Go 1.27.1+ 可选薄壳**：`kvdb.Typed(db)` 提供 `db.Get[T](...)` 泛型方法（构建约束隔离）
+- **Go 1.27.1+ 可选薄壳**：`kvdb.Typed(store)` 提供 `db.Get[T](...)`/`db.Set(ctx, k, v)` 读写泛型方法（构建约束隔离）
 - 纯 Go 依赖，无 CGO
 
 **每个基座是独立模块**，各自声明所需的最低 Go 版本——只用 `mem` / `jsonl` / `ssdb`
@@ -242,21 +242,32 @@ func init() {
 
 注意 `B` 对编码失败会 panic（不返回 error）；需要错误处理时直接调用 `Marshal`。
 
-### Go 1.27.1+：`TypedDB` 薄壳（`db.Get[T](...)`）
+### Go 1.27.1+：`TypedStore` 薄壳（读写都走类型参数）
+
+`TypedStore` 与 `StoreProvider`（`KvProvider + QueueProvider + ZSetProvider`）
+一一对照——泛型壳只依赖这一个接口，不要求 `Batch`/`Close`：
 
 ```go
-tdb := kvdb.Typed(db)
-u, err := tdb.Get[User](ctx, "user:1")    // = kvdb.D[User](db.Get(ctx, "user:1"))
-n, err := tdb.Get[int64](ctx, "visits")   // 标量走文本编码，与 Incr 互操作
-job, err := tdb.QPop[string](ctx, "jobs")
+tdb := kvdb.Typed(db)                      // db 满足 kvdb.StoreProvider 即可
+u, err := tdb.Get[User](ctx, "user:1")     // = kvdb.D[User](db.Get(ctx, "user:1"))
+err = tdb.Set(ctx, "user:1", u)            // = db.Set(ctx, "user:1", kvdb.B(u))
+err = tdb.SetEx(ctx, "sess", s, 3600)
+n, err := tdb.Get[int64](ctx, "visits")    // 标量走文本编码，与 Incr 互操作
+job, err := tdb.QPush(ctx, "jobs", j)      // 队列写也是泛型
 ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 ```
 
-- 提供 `Get` / `GetOK` / `MGet` / `QPop` / `QPopBack` / `QFront` / `QBack`，
-  缺失的 key 返回 `ErrNotFound`（`GetOK` 保留 `ok` 语义）；编码复用 `B`/`P`
-  与可替换的 `Marshal`/`Unmarshal`；
-- 其余方法经内嵌 `DB` 透传；泛型方法会遮蔽同名方法，**`TypedDB` 不满足 `DB`
-  接口**，需要 DB 语义时用 `tdb.DB` 或保留原始 `db`；
+- **写**：`Set[T]` / `SetEx[T]` / `QPush[T]` / `QPushFront[T]`，编码 `B[T]`；
+- **读**：`Get[T]` / `GetOK[T]` / `MGet[T]` / `QPop[T]` / `QPopBack[T]` /
+  `QFront[T]` / `QBack[T]`，解码 `P[T]`/`D[T]`，缺失 key 返回 `ErrNotFound`
+  （`GetOK` 保留 `ok` 语义）；
+- `T = []byte` 时与直接调用基座方法**完全等价**（`B` 对 `[]byte` 恒等透传）；
+- **批写**：`tdb.BatchT(ctx, func(b kvdb.TypedBatch) error {...})`——收集时即编码，
+  **同一批可混装多种类型**（`b.Set("cnt", 42)` 与 `b.Set("u:1", u)` 并存）；
+  `Del`/`Expire`/`ZSet` 等经内嵌 `*Batch` 直接可用；
+- 泛型方法会遮蔽同名方法，**`TypedStore` 不满足 `StoreProvider`**（签名不同），
+  需要原始接口时用 `tdb.StoreProvider`；参数是 `StoreProvider`（不含 Batch/Close），
+  因此 `kvdb.Typed(db)` 对 `kvdb.Open` 的返回值同样可用；
 - 版本与门禁：方法级类型参数自 Go 1.27 起支持，实现在带 `//go:build go1.27` 的文件中
 
 ## 语义要点
@@ -497,11 +508,11 @@ SQLite 采用纯 Go 驱动（modernc），吞吐与 CGO 驱动相当，不引入
 | mysql 8.0 | ~718 | ~5.3k | ~428 | ~119 | ~400 | ~95.6k | ~4.6k |
 | pg 16 | ~2.4k | ~9.9k | ~2.2k | ~647 | ~1.4k | ~185.7k | ~8.8k |
 
-① **五个本地基座的缺省档已统一为"不逐提交 fsync"**，`?sync=1` 才要断电安全
-（sqlite 缺省由 FULL 改为 NORMAL；jsonl 缺省为 flush 500ms + fsync 1s 两个周期，
+① **五个本地基座的缺省档都是"不逐提交 fsync"**，`?sync=1` 才要断电安全
+（sqlite 缺省为 `NORMAL`；jsonl 缺省为 flush 500ms + fsync 1s 两个周期，
 可用 `?each_flush=1` 改逐操作 flush）。比较时须先对齐持久化等级。**缺省档与 `sync=1`
 在真实 ext4 上差 29–940×**（见 [PERFORMANCE.md](PERFORMANCE.md) §1.1）——"要不要
-sync=1"比"选哪个基座"影响更大。sqlite 的历史数字（Set ~559）对应今天的 `sync=1`。
+sync=1"比"选哪个基座"影响更大。
 ② `sync=1` 行只列受 fsync 影响的写路径：读不受影响，与缺省档相同。
 
 读路径几乎不受介质影响（leveldb Get 三档均 ~1.0M、badger ~272–298k），而写路径跨介质差 2–3 个数量级。

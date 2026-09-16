@@ -419,15 +419,15 @@ func (p *Provider) notify() {
 
 // call 是客户端所有命令的统一入口：借连接 → 调用 → 归还。
 //
-// 连接失效（ErrProtocol）时**自动重试一次**（换一条新连接）：RPC 层最常见的
-// 失败就是服务端重启或空闲连接被中间设备掐断，这一层不重试就会把瞬时故障
-// 直接抛给业务。
+// 失败**不做任何重试**，错误原样抛给业务层：非幂等命令（QPush/ZIncr/批内的
+// 同类操作）在"服务端已执行、应答未收到"的场景下重试会重复生效（重复入队、
+// 重复加分），静默重试把 at-least-once 语义藏进 SDK 是不能接受的。需要重试
+// 的业务方自行加工幂等键或改用可幂等的命令组合。
+//
+// 出错的连接只会被丢弃（见 callOnce 里的 release）：流里可能残留半个报文，
+// 复用会串味；下一次调用自然走 get() 拉新连接继续。
 func (p *Provider) call(ctx context.Context, args ...[]byte) (codec.Status, [][]byte, error) {
-	st, payload, err := p.callOnce(ctx, args)
-	if err != nil && errors.Is(err, ErrProtocol) && ctx.Err() == nil && !p.closed.Load() {
-		return p.callOnce(ctx, args)
-	}
-	return st, payload, err
+	return p.callOnce(ctx, args)
 }
 
 func (p *Provider) callOnce(ctx context.Context, args [][]byte) (codec.Status, [][]byte, error) {

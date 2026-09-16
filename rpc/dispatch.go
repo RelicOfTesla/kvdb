@@ -287,7 +287,7 @@ func (s *Server) routeKV(ctx context.Context, cmd string, args [][]byte) reply {
 // dispatchQueue 处理队列命令；handled=false 表示该命令不属于队列。
 func (s *Server) dispatchQueue(ctx context.Context, cmd string, args [][]byte) reply {
 	switch cmd {
-	case mQPush, mQPushFr, mQPop, mQPopBk, mQSize, mQFront, mQBack:
+	case mQPush, mQPushFr, mQPop, mQPopBk, mQSize, mQFront, mQBack, mQRange:
 	default:
 		return unhandled()
 	}
@@ -331,6 +331,23 @@ func (s *Server) dispatchQueue(ctx context.Context, cmd string, args [][]byte) r
 			return argErrReply(mQSize, "name")
 		}
 		return intReply(func() (int64, error) { return q.QSize(ctx, string(args[0])) })
+	case mQRange:
+		if len(args) != 3 {
+			return argErrReply(mQRange, "name", "start", "stop")
+		}
+		start, err := decInt(args[1])
+		if err != nil {
+			return fail(err)
+		}
+		stop, err := decInt(args[2])
+		if err != nil {
+			return fail(err)
+		}
+		items, err := q.QRange(ctx, string(args[0]), start, stop)
+		if err != nil {
+			return fail(err)
+		}
+		return ok(items...)
 	}
 	return unhandled()
 }

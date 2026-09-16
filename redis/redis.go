@@ -434,6 +434,23 @@ func (p *Provider) QBack(ctx context.Context, name string) ([]byte, bool, error)
 	return p.lindex(ctx, name, -1)
 }
 
+// QRange 只读返回 [start, stop] 索引区间内的元素，方向为队头 → 队尾。
+//
+// 直接用 Redis LRANGE：其语义（0 起闭区间、负索引从末尾数、越界按可用范围裁剪、
+// 队列不存在视为空、返回顺序恰好是队头 → 队尾）与本契约完全一致，无需客户端换算。
+// 队列为空（或 key 不存在）时 LRANGE 返回空数组而非 nil 错误，故直接映射为空切片。
+func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) ([][]byte, error) {
+	if err := p.check(); err != nil {
+		return nil, err
+	}
+	name = p.pfx.q + name
+	vals, err := p.rd.LRange(ctx, name, start, stop).Result()
+	if err != nil {
+		return nil, fmt.Errorf("redis: qrange: %w", err)
+	}
+	return stringsToBytes(vals), nil
+}
+
 func (p *Provider) lindex(ctx context.Context, name string, idx int64) ([]byte, bool, error) {
 	if err := p.check(); err != nil {
 		return nil, false, err
@@ -555,6 +572,20 @@ func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (in
 // f64/i64 在 int64 与 float64 间换算。|v|<=2^53 时精确；超出部分 README 已说明。
 func f64(v int64) float64 { return float64(v) }
 func i64(f float64) int64 { return int64(f) }
+
+// stringsToBytes 把 go-redis 返回的 []string 转为 [][]byte。
+// []byte(s) 是逐字节复制（不是 UTF-8 重新编码），任意二进制值原样往返。
+// nil 入参返回 nil，与"空队列返回空切片"的契约一致。
+func stringsToBytes(ss []string) [][]byte {
+	if ss == nil {
+		return nil
+	}
+	out := make([][]byte, len(ss))
+	for i, s := range ss {
+		out[i] = []byte(s)
+	}
+	return out
+}
 
 // secondsDuration 把秒数换算为 time.Duration。time.Duration 是 int64 纳秒，
 // ttl > MaxInt64/1e9（约 292 年）时直接换算会回绕成负数：EXPIRE 收到负值会

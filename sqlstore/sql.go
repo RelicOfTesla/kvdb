@@ -108,6 +108,9 @@ const (
 	zUpsertKey       = "zUpsert"
 	zIncrUpsertKey   = "zIncrUpsert"
 	zRangeKey        = "zRange"
+	// qRangeKey 与 zRangeKey 同理：LIMIT 后置方言无法用"同一模板 + 后缀"表达，
+	// 故也允许整句覆盖（占位符序同为 {1}=name、{2}=limit、{3}=offset）。
+	qRangeKey = "qRange"
 )
 
 // MySQLDialect / SQLiteDialect / PostgresDialect 是三个内置方言，
@@ -245,6 +248,11 @@ var (
 				"ORDER BY seq DESC OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY",
 			qItemPeekKey:     "SELECT v FROM q_items WHERE q = {1} ORDER BY seq ASC OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY",
 			qItemPeekBackKey: "SELECT v FROM q_items WHERE q = {1} ORDER BY seq DESC OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY",
+			// 与 zRangeKey 同形：MSSQL 2012+ 无 LIMIT，占位符序同样是
+			// {1}=name、{2}=limit、{3}=offset（模板里 OFFSET 先出现），
+			// 参数则由调用方按 (name, limit, offset) 传，build 已固化其序号。
+			qRangeKey: "SELECT v FROM q_items WHERE q = {1} ORDER BY seq ASC " +
+				"OFFSET {3} ROWS FETCH NEXT {2} ROWS ONLY",
 			zUpsertKey: "MERGE z_items WITH (HOLDLOCK) AS t " +
 				"USING (VALUES ({1}, {2}, {3})) AS src(z, k, sc) ON t.z = src.z AND t.k = src.k " +
 				"WHEN MATCHED THEN UPDATE SET s = src.sc " +
@@ -301,6 +309,7 @@ type stmts struct {
 	qItemDelete   string
 	qItemCount    string
 	qItemPeek     func(desc bool) string
+	qRange        string
 
 	zUpsert     func(incr bool) string
 	zGet        string
@@ -556,6 +565,9 @@ func makeStmts(d Dialect) stmts {
 			}
 			return ovr(key, build(d, "SELECT v FROM q_items WHERE q = {1} ORDER BY seq "+ord+" LIMIT 1"))
 		},
+		// 与 zRange 同一形状：seq ASC 即队头 → 队尾，LIMIT/OFFSET 表达闭区间
+		// [start, stop]（两条语句的占位符序都固定为 {1}=name、{2}=limit、{3}=offset）。
+		qRange: ovr(qRangeKey, build(d, "SELECT v FROM q_items WHERE q = {1} ORDER BY seq ASC LIMIT {2} OFFSET {3}")),
 
 		zUpsert: func(incr bool) string {
 			tail := d.ZSetUpsertTail
@@ -1202,6 +1214,76 @@ func (p *Provider) qpeek(ctx context.Context, name string, back bool) ([]byte, b
 		return nil, false, fmt.Errorf("sqlstore: qpeek: %w", err)
 	}
 	return v, true, nil
+}
+
+// QRange 只读返回 [start, stop] 索引区间内的元素，方向为队头 → 队尾。
+//
+// 索引归一化与 ZRange 同规矩：0 起闭区间、负索引从末尾数、越界按可用范围裁剪
+// 且不报错，空队列返回空。区别只在排序键——z_items 按 (s, k) 排，q_items 按
+// seq ASC 排，而 seq 在 push 时单调分配（back 取 next 自增，front 取 prev 自减，
+// 见 qpush），故 seq ASC 恰好是队头 → 队尾。出队是直接 DELETE q_items 行，
+// 没有"待弹出"列，无需额外过滤。
+func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) ([][]byte, error) {
+	if err := p.check(); err != nil {
+		return nil, err
+	}
+	// 越界/负索引裁剪都要知道队列长度，而 QRange 是读路径：只有能确定
+	// "区间落在 [0, n)" 内时才省掉这次 COUNT，否则与 ZRange 一样先取大小。
+	// 不做这一步的话，start 越界时 SQL 只会返回更少的行（结果仍正确），
+	// 但 stop 越界会让 LIMIT 按 stop 预分配（见下）。
+	var prealloc int64
+	if start >= 0 && stop >= start {
+		prealloc = stop - start + 1
+	}
+	if start < 0 || stop < 0 || prealloc <= 0 || prealloc > maxZRangeLimit {
+		// 负索引需先归一化；prealloc 溢出为负（如 stop=MaxInt64）或大到不可信
+		// 时也必须先真实取 n——maxZRangeLimit 与 ZRange 同一口径，防巨型预分配。
+		var n int64
+		if err := p.db.QueryRowContext(ctx, p.st.qItemCount, bs(name)).Scan(&n); err != nil {
+			return nil, fmt.Errorf("sqlstore: qrange size: %w", err)
+		}
+		// 裁剪规矩与 mem 基座的 indexRange 一致：start 负则加 n 并夹到 0，
+		// stop 负则加 n（再加一次也不会回正，故同时覆盖"负数过小"的情形）。
+		if start < 0 {
+			start = n + start
+			if start < 0 {
+				start = 0
+			}
+		}
+		if stop < 0 {
+			stop = n + stop
+		}
+		// n == 0（空队列）、start 越过队尾、stop 落在 start 之前都返回空：
+		// 既与 indexRange 的 ok=false 对应，也避免给 SQL 传负 OFFSET。
+		if n == 0 || stop < start || start >= n {
+			return nil, nil
+		}
+		if stop >= n {
+			stop = n - 1
+		}
+		prealloc = stop - start + 1
+	}
+	// 预分配按 1024 封顶，理由与 ZRange 相同：prealloc 源自调用方入参，
+	// 按"合法但巨大"的值直接分配会被打爆内存（行数由 SQL LIMIT 保证）。
+	if prealloc > maxZRangePrealloc {
+		prealloc = maxZRangePrealloc
+	}
+	rows, err := p.db.QueryContext(ctx, p.st.qRange, bs(name), prealloc, start)
+	if err != nil {
+		return nil, fmt.Errorf("sqlstore: qrange: %w", err)
+	}
+	defer rows.Close()
+	// 不预分配 out（只给个 0 容量起手）：元素是 []byte，append 会自动扩容，
+	// 比照 prealloc 预留 limit 个切片头更省内存（ZRange 的元素是值类型才值得预分配）。
+	var out [][]byte
+	for rows.Next() {
+		var v []byte
+		if err := rows.Scan(&v); err != nil {
+			return nil, fmt.Errorf("sqlstore: qrange row: %w", err)
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
 }
 
 // ---- ZSet ----

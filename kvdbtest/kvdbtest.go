@@ -639,6 +639,67 @@ func TestQueue(t *testing.T, db kvdb.DB) {
 	if v, ok, _ := db.QPop(ctx, "q3"); !ok || string(v) != string(bin) {
 		t.Fatalf("QPop binary = %q,%v", v, ok)
 	}
+
+	// QRange：按位置只读读取（0 起闭区间，负索引从末尾数，越界裁剪）。
+	// 语义与 ZRange 对称，且**不得改动队列**。
+	rq := "qr"
+	for _, v := range []string{"a", "b", "c", "d", "e"} {
+		if err := db.QPush(ctx, rq, []byte(v)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 逐项断言，顺带确认方向是队头 → 队尾
+	for _, tc := range []struct {
+		name        string
+		start, stop int64
+		want        []string
+	}{
+		{"首三个", 0, 2, []string{"a", "b", "c"}},
+		{"末尾两个(负索引)", -2, -1, []string{"d", "e"}},
+		{"全部(0,-1)", 0, -1, []string{"a", "b", "c", "d", "e"}},
+		{"单个首元素", 0, 0, []string{"a"}},
+		{"单个末元素", -1, -1, []string{"e"}},
+		{"stop 越界被裁剪", 0, 100, []string{"a", "b", "c", "d", "e"}},
+		{"start 越界(负到超头)", -100, 1, []string{"a", "b"}},
+		{"覆盖全长的负区间", -100, -1, []string{"a", "b", "c", "d", "e"}},
+		{"空区间(start>stop)", 3, 1, nil},
+		{"start 超出长度", 10, 20, nil},
+	} {
+		got, err := db.QRange(ctx, rq, tc.start, tc.stop)
+		if err != nil {
+			t.Fatalf("QRange(%s, %d, %d): %v", tc.name, tc.start, tc.stop, err)
+		}
+		if len(got) != len(tc.want) {
+			t.Fatalf("QRange(%s, %d, %d) = %q, want %q", tc.name, tc.start, tc.stop, got, tc.want)
+		}
+		for i := range got {
+			if string(got[i]) != tc.want[i] {
+				t.Fatalf("QRange(%s)[%d] = %q, want %q", tc.name, i, got[i], tc.want[i])
+			}
+		}
+	}
+	// QRange 是只读的：长度与两端都不应变化
+	if n, _ := db.QSize(ctx, rq); n != 5 {
+		t.Fatalf("QRange 后 QSize 变了: %d", n)
+	}
+	if v, ok, _ := db.QFront(ctx, rq); !ok || string(v) != "a" {
+		t.Fatalf("QRange 后 QFront = %q,%v", v, ok)
+	}
+	if v, ok, _ := db.QBack(ctx, rq); !ok || string(v) != "e" {
+		t.Fatalf("QRange 后 QBack = %q,%v", v, ok)
+	}
+	// 二进制值经 QRange 必须原样往返
+	bin2 := []byte{0x00, 0xff, '\n', 0x80, '\r'}
+	if err := db.QPush(ctx, "qrbin", bin2); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := db.QRange(ctx, "qrbin", 0, -1); err != nil || len(got) != 1 || string(got[0]) != string(bin2) {
+		t.Fatalf("QRange 二进制往返 = %q,%v", got, err)
+	}
+	// 空队列：返回空且无错（而不是 ErrNotFound 之类）
+	if got, err := db.QRange(ctx, "qr-empty", 0, -1); err != nil || len(got) != 0 {
+		t.Fatalf("空队列 QRange 应为空且无错, got %q,%v", got, err)
+	}
 }
 
 func TestZSet(t *testing.T, db kvdb.DB) {

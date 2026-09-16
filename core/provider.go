@@ -240,6 +240,13 @@ type QueueProvider interface {
 	QFront(ctx context.Context, name string) (value []byte, ok bool, err error)
 	// QBack 只读查看队尾；ok=false 表示队列为空。
 	QBack(ctx context.Context, name string) (value []byte, ok bool, err error)
+	// QRange 只读返回 [start, stop] 索引区间内的元素，方向为**队头 → 队尾**，
+	// 索引 0 起、闭区间；负索引从末尾数（-1 为最后一个），与 ZRange 完全对称。
+	//
+	// 它补上了队列"按位置读"的能力：此前只能看两端（QFront/QBack）或破坏性地
+	// 取出（QPop/QPopBack），于是"要读全队列但不能改源"的场景（如迁移）无从下手。
+	// 区间越界按可用范围裁剪（与 ZRange 同规矩），不报错；空队列返回空切片。
+	QRange(ctx context.Context, name string, start, stop int64) ([][]byte, error)
 }
 
 // ZItem 是 ZRange 返回的一个成员及其分数。

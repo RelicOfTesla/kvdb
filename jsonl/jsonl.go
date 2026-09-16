@@ -872,6 +872,15 @@ func (p *Provider) QBack(ctx context.Context, name string) ([]byte, bool, error)
 	return p.mem.QBack(ctx, name)
 }
 
+// QRange 只读返回 [start, stop] 区间内的元素（队头 → 队尾）。
+// 状态层就是 mem，直接委托——队列在日志里没有独立索引，只按 op 顺序回放。
+func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) ([][]byte, error) {
+	if p.closed.Load() {
+		return nil, core.ErrClosed
+	}
+	return p.mem.QRange(ctx, name, start, stop)
+}
+
 // ---- ZSet ----
 
 func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) error {

@@ -28,6 +28,7 @@ const (
 	mQSize    = "QSIZE"
 	mQFront   = "QFRONT"
 	mQBack    = "QBACK"
+	mQRange   = "QRANGE"
 	mZSet     = "ZSET"
 	mZGet     = "ZGET"
 	mZDel     = "ZDEL"
@@ -50,6 +51,7 @@ const (
 //   - map（MGet）：块序列 [k1 v1 k2 v2 ...]，顺序不保证
 //   - []KeyValue（Scan）：块序列 [k1 v1 k2 v2 ...] 且**保序**
 //   - []ZItem（ZRange）：块序列 [member1 score1 member2 score2 ...] 且**保序**
+//   - [][]byte（QRange）：块序列 [v1 v2 v3 ...] 且**保序**
 //   - 可选 int64（如 TTL、ZGet、ZRank）：命中时首块为十进制值，未命中走 StatusEmpty
 //   - BatchOp：单块内自描述序列，见下方编码表
 

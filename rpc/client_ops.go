@@ -186,6 +186,23 @@ func (p *Provider) QBack(ctx context.Context, name string) ([]byte, bool, error)
 	return p.popLike(ctx, mQBack, name)
 }
 
+// QRange 返回区间内的元素（队头 → 队尾，保序）。
+func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) ([][]byte, error) {
+	st, payload, err := p.call(ctx, []byte(mQRange), []byte(name), encInt(start), encInt(stop))
+	if err != nil {
+		return nil, err
+	}
+	if st != codec.StatusOK {
+		return nil, errorForStatus(st, payload)
+	}
+	// payload 是原始字节块，逐个原样返回；空区间时 payload 为空，返回空切片。
+	out := make([][]byte, 0, len(payload))
+	for _, blk := range payload {
+		out = append(out, blk)
+	}
+	return out, nil
+}
+
 // ---- ZSet ----
 
 // ZSet 写入成员分数。

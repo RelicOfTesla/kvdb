@@ -336,6 +336,41 @@ func (f *fakeSSDB) dispatch(req [][]byte) [][]byte {
 		}
 		f.mu.Unlock()
 		return [][]byte{[]byte("ok"), v}
+	case "qslice":
+		// 复刻真实 SSDB 的 qslice（= Redis LRANGE）：begin/end 闭区间、
+		// 支持负索引、越界读到缺失即停（不报错）。真实实现见
+		// src/proc_queue.cpp:proc_qslice → SSDBImpl::qslice。
+		f.mu.Lock()
+		q := f.queue[arg(1)]
+		n := int64(len(q))
+		begin, err1 := strconv.ParseInt(arg(2), 10, 64)
+		end, err2 := strconv.ParseInt(arg(3), 10, 64)
+		if err1 != nil || err2 != nil {
+			f.mu.Unlock()
+			return [][]byte{[]byte("client_error"), []byte("bad range")}
+		}
+		if begin < 0 {
+			begin += n
+		}
+		if end < 0 {
+			end += n
+		}
+		if begin < 0 {
+			begin = 0
+		}
+		if end >= n {
+			end = n - 1
+		}
+		if n == 0 || begin > end || begin >= n {
+			f.mu.Unlock()
+			return [][]byte{[]byte("ok")}
+		}
+		out := [][]byte{[]byte("ok")}
+		for i := begin; i <= end; i++ {
+			out = append(out, append([]byte(nil), q[i]...))
+		}
+		f.mu.Unlock()
+		return out
 
 	case "zset":
 		f.mu.Lock()

@@ -571,6 +571,41 @@ func qPeekTx(tx *bolt.Tx, name string, back bool) ([]byte, bool) {
 	return append([]byte(nil), v...), true
 }
 
+// qRangeTx 只读返回 [start, stop] 区间内的元素，方向为队头 → 队尾。
+// 索引语义与 zRangeTx 完全一致（0 起闭区间、负索引从末尾数、越界裁剪）。
+func qRangeTx(tx *bolt.Tx, name string, start, stop int64) ([][]byte, error) {
+	size := int64(qCountersGet(tx, name).count)
+	if start < 0 {
+		start = size + start
+		if start < 0 {
+			start = 0
+		}
+	}
+	if stop < 0 {
+		stop = size + stop
+	}
+	if size == 0 || start > stop || start >= size {
+		return nil, nil
+	}
+	if stop >= size {
+		stop = size - 1
+	}
+	prefix := lp(name)
+	c := tx.Bucket(bQ).Cursor()
+	out := make([][]byte, 0, stop-start+1)
+	idx := int64(0)
+	for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+		if idx > stop {
+			break
+		}
+		if idx >= start {
+			out = append(out, append([]byte(nil), v...))
+		}
+		idx++
+	}
+	return out, nil
+}
+
 func qPopTx(tx *bolt.Tx, name string, back bool) ([]byte, bool, error) {
 	c, k, v := qSeekTx(tx, name, back)
 	if k == nil {
@@ -966,6 +1001,21 @@ func (p *Provider) QFront(ctx context.Context, name string) ([]byte, bool, error
 
 func (p *Provider) QBack(ctx context.Context, name string) ([]byte, bool, error) {
 	return p.qpeek(ctx, name, true)
+}
+
+// QRange 只读返回 [start, stop] 区间内的元素，方向为队头 → 队尾。
+func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) ([][]byte, error) {
+	_ = ctx
+	var out [][]byte
+	err := p.view(func(tx *bolt.Tx) error {
+		items, err := qRangeTx(tx, name, start, stop)
+		if err != nil {
+			return err
+		}
+		out = items
+		return nil
+	})
+	return out, err
 }
 
 func (p *Provider) qpeek(ctx context.Context, name string, back bool) ([]byte, bool, error) {

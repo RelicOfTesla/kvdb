@@ -446,6 +446,31 @@ func (s *storeOnlyStub) QBack(_ context.Context, name string) ([]byte, bool, err
 	return q[len(q)-1], true, nil
 }
 
+func (s *storeOnlyStub) QRange(_ context.Context, name string, start, stop int64) ([][]byte, error) {
+	q := s.queue[name]
+	n := int64(len(q))
+	if start < 0 {
+		start += n
+		if start < 0 {
+			start = 0
+		}
+	}
+	if stop < 0 {
+		stop += n
+	}
+	if n == 0 || start >= n || stop < start {
+		return nil, nil
+	}
+	if stop >= n {
+		stop = n - 1
+	}
+	out := make([][]byte, 0, stop-start+1)
+	for i := start; i <= stop; i++ {
+		out = append(out, q[i])
+	}
+	return out, nil
+}
+
 func (s *storeOnlyStub) ZSet(_ context.Context, name, key string, score int64) error {
 	if s.zset[name] == nil {
 		s.zset[name] = map[string]int64{}

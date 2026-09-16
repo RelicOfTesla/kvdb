@@ -173,6 +173,13 @@ func (a *adapter) QBack(ctx context.Context, name string) ([]byte, bool, error) 
 	return a.q.QBack(ctx, name)
 }
 
+func (a *adapter) QRange(ctx context.Context, name string, start, stop int64) ([][]byte, error) {
+	if a.q == nil {
+		return nil, ErrUnsupported
+	}
+	return a.q.QRange(ctx, name, start, stop)
+}
+
 // ---- ZSet（可选能力） ----
 
 func (a *adapter) ZSet(ctx context.Context, name, key string, score int64) error {

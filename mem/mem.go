@@ -493,6 +493,57 @@ func (p *Provider) QBack(ctx context.Context, name string) ([]byte, bool, error)
 	return p.qfront(ctx, name, true)
 }
 
+// QRange 只读返回 [start, stop] 区间内的元素，方向为队头 → 队尾。
+func (p *Provider) QRange(_ context.Context, name string, start, stop int64) ([][]byte, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if err := p.checkOpen(); err != nil {
+		return nil, err
+	}
+	l := p.queue[name]
+	if l == nil || l.Len() == 0 {
+		return nil, nil
+	}
+	lo, hi, ok := indexRange(int64(l.Len()), start, stop)
+	if !ok {
+		return nil, nil
+	}
+	out := make([][]byte, 0, hi-lo+1)
+	i := int64(0)
+	for e := l.Front(); e != nil; e = e.Next() {
+		if i > hi {
+			break
+		}
+		if i >= lo {
+			out = append(out, clone(e.Value.([]byte)))
+		}
+		i++
+	}
+	return out, nil
+}
+
+// indexRange 把 [start, stop] 的索引语义（0 起闭区间、负索引从末尾数）归一成
+// 可用的 [lo, hi]；ok=false 表示空区间或无交集。裁剪规矩与 ZRange 一致：
+// 越界不报错，按可用范围裁剪。
+func indexRange(n, start, stop int64) (lo, hi int64, ok bool) {
+	if start < 0 {
+		start = n + start
+		if start < 0 {
+			start = 0
+		}
+	}
+	if stop < 0 {
+		stop = n + stop
+	}
+	if n == 0 || start >= n || stop < start {
+		return 0, 0, false
+	}
+	if stop >= n {
+		stop = n - 1
+	}
+	return start, stop, true
+}
+
 func (p *Provider) qfront(_ context.Context, name string, back bool) ([]byte, bool, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()

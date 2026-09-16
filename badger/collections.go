@@ -192,6 +192,59 @@ func (p *Provider) qpeek(ctx context.Context, name string, back bool) ([]byte, b
 	return v, ok, nil
 }
 
+// qEach 按 seq 升序（即队头 → 队尾）遍历某队列的元素，fn 返回 false 即提前停止。
+// 键形如 nsQueue + lp(name) + be64(ordered(seq))，前缀扫描天然按 seq 升序。
+func qEach(txn *badgerdb.Txn, name string, fn func(v []byte) bool) error {
+	prefix := keyOf(nsQueue, lp(name))
+	opts := badgerdb.DefaultIteratorOptions
+	opts.Prefix = prefix
+	it := txn.NewIterator(opts)
+	defer it.Close()
+	for it.Rewind(); it.Valid(); it.Next() {
+		v, err := it.Item().ValueCopy(nil) // 必须拷贝：Badger 复用值缓冲
+		if err != nil {
+			return err
+		}
+		if !fn(v) {
+			return nil
+		}
+	}
+	return nil
+}
+
+// QRange 只读返回 [start, stop] 区间内的元素，方向为队头 → 队尾。
+// 索引语义与 ZRange 一致（0 起闭区间、负索引从末尾数、越界裁剪，空区间返回 nil）。
+func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) ([][]byte, error) {
+	_ = ctx
+	var out [][]byte
+	err := p.view("qrange", func(txn *badgerdb.Txn) error {
+		c, err := qCountersGet(txn, name) // 与 QSize 同源：计数器记录
+		if err != nil {
+			return err
+		}
+		lo, hi, ok := normalizeRange(start, stop, int64(c.count))
+		if !ok {
+			return nil
+		}
+		out = make([][]byte, 0, minCap(int(hi-lo+1)))
+		idx := int64(0)
+		return qEach(txn, name, func(v []byte) bool {
+			if idx > hi {
+				return false
+			}
+			if idx >= lo {
+				out = append(out, v) // qEach 已给副本
+			}
+			idx++
+			return true
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ---- ZSet ----
 //
 // 排序侧键 nsZScore + lp(name) + be64(ordered(score)) + member，成员分数索引键

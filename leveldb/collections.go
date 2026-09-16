@@ -112,6 +112,44 @@ func (p *Provider) qSeek(name string, back bool) (k, v []byte, ok bool, err erro
 	return nil, nil, false, nil
 }
 
+// QRange 只读返回 [start, stop] 区间内的元素，方向为队头 → 队尾。
+// 索引语义与 ZRange 一致（0 起闭区间、负索引从末尾数、越界裁剪）。
+func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) ([][]byte, error) {
+	_ = ctx
+	if err := p.check(); err != nil {
+		return nil, err
+	}
+	cs, err := p.qCountersGet(name)
+	if err != nil {
+		return nil, err
+	}
+	lo, hi, ok := normalizeRange(start, stop, int64(cs.count))
+	if !ok {
+		return nil, nil
+	}
+	r := nsRange(nsQueue, lp(name)...)
+	it := p.db.NewIterator(r, nil)
+	defer it.Release()
+	out := make([][]byte, 0, minCap(int(hi-lo+1)))
+	idx := int64(0)
+	// 注意写法：First() 已定位到首个元素，必须**先读后进**。
+	// 写成 `for it.First(); it.Next();` 会在读之前跳过首元素（off-by-one，
+	// 表现为 QRange(0,2) 返回 b,c,d）。
+	for it.First(); it.Valid(); it.Next() {
+		if idx > hi {
+			break
+		}
+		if idx >= lo {
+			out = append(out, append([]byte(nil), it.Value()...))
+		}
+		idx++
+	}
+	if ierr := it.Error(); ierr != nil {
+		return nil, fmt.Errorf("leveldb: qrange: %w", ierr)
+	}
+	return out, nil
+}
+
 // inRange 判定键是否落在 [r.Start, r.Limit) 内（Limit 为 nil 表示无上界）。
 func inRange(k []byte, r interface {
 	Contains([]byte) bool

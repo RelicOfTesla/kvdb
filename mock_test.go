@@ -215,6 +215,31 @@ func (q *fakeQueue) QBack(_ context.Context, _ string) ([]byte, bool, error) {
 	return []byte(q.items[len(q.items)-1]), true, nil
 }
 
+// QRange 与真实基座契约一致：0 起闭区间、负索引从末尾数、越界裁剪、只读。
+func (q *fakeQueue) QRange(_ context.Context, _ string, start, stop int64) ([][]byte, error) {
+	n := int64(len(q.items))
+	if start < 0 {
+		start += n
+		if start < 0 {
+			start = 0
+		}
+	}
+	if stop < 0 {
+		stop += n
+	}
+	if n == 0 || start >= n || stop < start {
+		return nil, nil
+	}
+	if stop >= n {
+		stop = n - 1
+	}
+	out := make([][]byte, 0, stop-start+1)
+	for i := start; i <= stop; i++ {
+		out = append(out, []byte(q.items[i]))
+	}
+	return out, nil
+}
+
 // drainQueue 只依赖 kvdb.QueueProvider。
 func drainQueue(ctx context.Context, q kvdb.QueueProvider) ([]string, error) {
 	var out []string

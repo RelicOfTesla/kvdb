@@ -808,6 +808,92 @@ func (p *Provider) qpeek(ctx context.Context, name, cmd string) ([]byte, bool, e
 	}
 }
 
+// QRange 只读返回 [start, stop] 索引区间内的元素，方向为队头 → 队尾。
+//
+// 底层用 SSDB 原生命令 **qslice**（`qslice name begin end`，服务端
+// src/proc_queue.cpp 的 proc_qslice → SSDBImpl::qslice，自 1.6.8.5 起提供，
+// ChangeLog："Add qslice(lrange), qget(lindex, lget) commands"，官方 PHP/C++
+// 客户端均绑定该命令）。它是只读命令（serv.cpp 里以 "rt" 注册，只读线程执行），
+// 不弹出任何元素，语义与 Redis LRANGE 对齐。
+//
+// 与 ZRange 一样，SSDB 的索引是 begin/end 双参形态（不是 offset/limit 的
+// qrange），负索引由**客户端**先经 qsize 归一化后再下发，从而保证：
+// 0 起闭区间、负索引从末尾数、start>stop 返回空、stop 越界由 qslice 自然裁剪
+// （qslice 逐 seq 读到缺失即停，不会报错）。空队列 qslice 回 ok + 无负载，
+// 直接映射为空切片且无错误。
+func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) ([][]byte, error) {
+	if err := p.check(); err != nil {
+		return nil, err
+	}
+	name = p.k(name)
+	begin, end, empty, err := p.qsliceArgs(ctx, name, start, stop)
+	if err != nil {
+		return nil, err
+	}
+	if empty {
+		return nil, nil
+	}
+	st, recs, err := p.do(ctx, "qslice", name, strconv.FormatInt(begin, 10), strconv.FormatInt(end, 10))
+	if err != nil {
+		return nil, err
+	}
+	if st != "ok" {
+		return nil, fmt.Errorf("ssdb: qslice: status %q", st)
+	}
+	if len(recs) == 0 {
+		return nil, nil
+	}
+	out := make([][]byte, len(recs))
+	copy(out, recs)
+	return out, nil
+}
+
+// qsliceArgs 把 Redis 风格 start/stop 闭区间索引换算为 qslice 的 begin/end。
+// 仅当存在负索引时才发一次 qsize（与 zrangeArgs 的策略一致，正索引零额外往返）；
+// empty=true 表示区间为空，调用方应直接返回空切片而不发命令。
+//
+// 归一化规则与 Redis LRANGE / ZRange 对称：
+//   - 负索引 + size 折成绝对偏移，并向下钳到 0（超头裁剪）；
+//   - stop 折算后仍为负 ⇒ 区间整体落在队头之前，返回空；
+//   - start > stop 返回空；
+//   - stop 超出队尾不裁剪（qslice 读到缺失元素即止）。
+func (p *Provider) qsliceArgs(ctx context.Context, name string, start, stop int64) (int64, int64, bool, error) {
+	if start >= 0 && stop >= 0 {
+		if start > stop {
+			return 0, 0, true, nil
+		}
+		return start, stop, false, nil
+	}
+	st, recs, err := p.do(ctx, "qsize", name)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	if st != "ok" {
+		return 0, 0, false, fmt.Errorf("ssdb: qsize: status %q", st)
+	}
+	size, err := strconv.ParseInt(string(firstPayload(recs)), 10, 64)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	if size == 0 {
+		return 0, 0, true, nil // 空队列：直接空结果，省掉一次 qslice
+	}
+	begin, end := start, stop
+	if begin < 0 {
+		begin += size
+		if begin < 0 {
+			begin = 0
+		}
+	}
+	if end < 0 {
+		end += size
+	}
+	if end < 0 || begin > end {
+		return 0, 0, true, nil
+	}
+	return begin, end, false, nil
+}
+
 // ---- ZSet ----
 
 func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) error {

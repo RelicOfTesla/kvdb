@@ -19,9 +19,11 @@ import (
 // 而不是共享一个 Codec 实例——Codec 带缓冲，必须一条连接一个。
 type codecFactory func(r io.Reader, w io.Writer) codec.Codec
 
-// CodecRESP / CodecBinary 是内置工厂，供 ServerConfig.Codec / Config.Codec 直接引用。
-func CodecRESP(r io.Reader, w io.Writer) codec.Codec   { return codec.NewRESP(r, w) }
-func CodecBinary(r io.Reader, w io.Writer) codec.Codec { return codec.NewBinary(r, w) }
+// CodecRESP / CodecBinary / CodecTextProto 是内置工厂，供 ServerConfig.Codec /
+// Config.Codec 直接引用。
+func CodecRESP(r io.Reader, w io.Writer) codec.Codec      { return codec.NewRESP(r, w) }
+func CodecBinary(r io.Reader, w io.Writer) codec.Codec    { return codec.NewBinary(r, w) }
+func CodecTextProto(r io.Reader, w io.Writer) codec.Codec { return codec.NewTextProto(r, w) }
 
 // defaultCodecFactory 是缺省实现：RESP（仿 Redis 协议）。
 func defaultCodecFactory(r io.Reader, w io.Writer) codec.Codec { return codec.NewRESP(r, w) }

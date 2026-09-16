@@ -324,6 +324,52 @@ func TestCodecBinary(t *testing.T) {
 	}
 }
 
+// TestCodecTextProto: 类 SSDB 的文本协议 codec 同样跑通全套功能。
+// 与 TestCodecBinary 一样，这是"Codec 抽象是真的"的证明——
+// 帧格式换成"长度前缀 + 空行结束"后，上层语义完全不变。
+func TestCodecTextProto(t *testing.T) {
+	_, addr := startServer(t, rpc.ServerConfig{Opener: memBackend(t), Codec: rpc.CodecTextProto})
+	ctx := context.Background()
+
+	p, err := rpc.OpenWithConfig(ctx, rpc.Config{Addr: addr, Codec: rpc.CodecTextProto})
+	if err != nil {
+		t.Fatalf("textproto codec 连接: %v", err)
+	}
+	defer p.Close()
+
+	// 该帧格式用显式长度，因此空参数与二进制脏值都必须原样往返
+	//（这正是它相对"裸文本分隔"的价值所在）。
+	if err := p.Set(ctx, "empty", []byte{}); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok, _ := p.Get(ctx, "empty"); !ok || len(v) != 0 {
+		t.Fatalf("空 value: %q,%v", v, ok)
+	}
+	dirty := []byte{0x00, 0xff, '\n', '\r', '\n', '0', '\n'}
+	if err := p.Set(ctx, "dirty", dirty); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok, _ := p.Get(ctx, "dirty"); !ok || string(v) != string(dirty) {
+		t.Fatalf("含换行的二进制 value 往返不一致: %q", v)
+	}
+	// 队列保序
+	for _, s := range []string{"a", "b", "c"} {
+		if err := p.QPush(ctx, "q", []byte(s)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, want := range []string{"a", "b", "c"} {
+		v, ok, err := p.QPop(ctx, "q")
+		if err != nil || !ok || string(v) != want {
+			t.Fatalf("QPop = %q,%v,%v; want %q", v, ok, err, want)
+		}
+	}
+	// 空队列 -> ok=false（走 StatusEmpty，而不是错误）
+	if _, ok, err := p.QPop(ctx, "q"); err != nil || ok {
+		t.Fatalf("空队列应 ok=false 且无错, got ok=%v err=%v", ok, err)
+	}
+}
+
 // TestCodecMismatchFails: 两端 codec 不一致必须**明确失败**，
 // 而不是解析出乱七八糟的数据继续跑。
 func TestCodecMismatchFails(t *testing.T) {

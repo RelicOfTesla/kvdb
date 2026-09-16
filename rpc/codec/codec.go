@@ -7,8 +7,10 @@
 //
 // 内置实现：
 //
-//	codec.RESP     —— 默认。仿 Redis 序列化协议（RESP2），见 resp.go
-//	codec.Binary   —— 长度前缀二进制帧，见 binary.go
+//	codec.RESP       —— 默认。仿 Redis 序列化协议（RESP2），见 resp.go
+//	codec.Binary     —— 长度前缀二进制帧，见 binary.go
+//	codec.TextProto  —— 类 SSDB 的文本协议（长度前缀 + 空行结束；命令与状态属
+//	                    kvdb，**不与 SSDB 互通**），见 textproto.go
 //
 // 自定义实现只需满足本接口；两端必须装配同一实现。
 package codec

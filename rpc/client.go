@@ -193,8 +193,10 @@ func ConfigFromURL(u *url.URL) (Config, error) {
 		cfg.Codec = CodecRESP
 	case "binary":
 		cfg.Codec = CodecBinary
+	case "textproto":
+		cfg.Codec = CodecTextProto
 	default:
-		return cfg, fmt.Errorf("rpc: unknown codec %q (want resp|binary)", q.Get("codec"))
+		return cfg, fmt.Errorf("rpc: unknown codec %q (want resp|binary|textproto)", q.Get("codec"))
 	}
 	tlsCfg, err := tlsConfigFromQuery(q)
 	if err != nil {

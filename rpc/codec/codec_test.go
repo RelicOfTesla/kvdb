@@ -10,17 +10,21 @@ import (
 	"github.com/RelicOfTesla/kvdb/rpc/codec"
 )
 
-// 两个内置 codec 必须能原样往返任意字节，包括空参数与二进制脏值——
+// 内置 codec 必须能原样往返任意字节，包括空参数与二进制脏值——
 // 这正是"参数不能用裸文本分隔"的起因（空参数会被当成报文结束）。
 
 func newCodec(name string, r io.Reader, w io.Writer) codec.Codec {
-	if name == "binary" {
+	switch name {
+	case "binary":
 		return codec.NewBinary(r, w)
+	case "textproto":
+		return codec.NewTextProto(r, w)
+	default:
+		return codec.NewRESP(r, w)
 	}
-	return codec.NewRESP(r, w)
 }
 
-func codecNames() []string { return []string{"resp", "binary"} }
+func codecNames() []string { return []string{"resp", "binary", "textproto"} }
 
 // TestRequestRoundTrip 覆盖空参数、二进制值、CRLF、以及参数个数为 0/1 的边界。
 func TestRequestRoundTrip(t *testing.T) {

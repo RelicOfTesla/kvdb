@@ -24,17 +24,23 @@ import (
 //
 // TypedStore 与 StoreProvider 一一对照（泛型壳只依赖这一个接口，不要求 Batch/Close）：
 //
-//	tdb := kvdb.Typed(store)                  // store 需满足 kvdb.StoreProvider
-//	u, err := tdb.Get[User](ctx, "user:1")    // = kvdb.D[User](store.Get(ctx, "user:1"))
-//	err = tdb.Set(ctx, "user:1", u)           // = store.Set(ctx, "user:1", kvdb.Enc(u))
-//	n, ok, err := tdb.Get[int64](ctx, "visits")   // 标量走文本编码，与 Incr 互操作
-//	job, ok, err := tdb.QPop[string](ctx, "jobs")
+//	tdb := kvdb.Typed(store)                     // store 需满足 kvdb.StoreProvider
+//	u, ok, err := tdb.Get[User](ctx, "user:1")   // = kvdb.D[User](store.Get(ctx, "user:1"))
+//	err = tdb.Set(ctx, "user:1", u)              // = store.Set(ctx, "user:1", kvdb.Enc(u))
+//	n, ok, err := tdb.Get[int64](ctx, "visits")  // 标量走文本编码，与 Incr 互操作
+//	job, ok, err := tdb.QPop[User](ctx, "jobs")
+//	jobs, err := tdb.QRange[User](ctx, "jobs", 0, -1)   // 区间读也带 T
 //
 // 编码/解码沿用 Enc/Dec/D 的规则与可替换的 Marshal/Unmarshal（见 bytes.go）：
 // 写方向一律 Enc[T]，读方向一律 Dec[T]/D[T]，因此 `T = []byte` 时行为与直接调用
 // 基座方法完全一致（Enc 对 []byte 原样透传，见 bytes.go），不引入额外拷贝语义。
 //
 // 读方法的签名与 D 一致（返回 (T, bool, error)），不把「缺失」折成错误。
+//
+// 覆盖范围：**凡值语义为 []byte 的契约方法都有对应的 T 版本**（Set/SetEx/SetExAt/Get/
+// MGet/QPush/QPushFront/QPop/QPopBack/QFront/QBack/QRange）。不携带值的方法
+// （Del/Exists/Incr/Scan/Expire/ExpireAt/TTL/QSize 以及 ZSet 各方法）不泛型化——
+// 它们要么无值可编解码，要么本就用 string/int64 表达（成员名、分数），加 T 无收益。
 //
 // 注意：带类型参数的方法（Get/MGet/Set/SetEx/QPop/...）会遮蔽内嵌接口的同名方法，
 // 因此 TypedStore 不满足 StoreProvider（签名不同）。这是刻意取舍：泛型壳给业务用，
@@ -62,6 +68,11 @@ func (t TypedStore) Set[T any](ctx context.Context, key string, value T) error {
 // SetEx 编码 value 并写入，同时设置 ttl 秒存活（覆盖既有 TTL）。
 func (t TypedStore) SetEx[T any](ctx context.Context, key string, value T, ttl int64) error {
 	return t.StoreProvider.SetEx(ctx, key, Enc(value), ttl)
+}
+
+// SetExAt 编码 value 并写入，使其在 at（unix 秒）过期；at 已是过去时间则删除该 key。
+func (t TypedStore) SetExAt[T any](ctx context.Context, key string, value T, at int64) error {
+	return t.StoreProvider.SetExAt(ctx, key, Enc(value), at)
 }
 
 // ---- KV：读 ----
@@ -124,6 +135,27 @@ func (t TypedStore) QFront[T any](ctx context.Context, name string) (T, bool, er
 // QBack 只读查看并解码队尾；ok=false 表示队列为空。签名与 D 一致。
 func (t TypedStore) QBack[T any](ctx context.Context, name string) (T, bool, error) {
 	return D[T](t.StoreProvider.QBack(ctx, name))
+}
+
+// QRange 只读返回 [start, stop] 区间内的元素并逐个解码为 T，方向为队头 → 队尾
+// （0 起闭区间、负索引从末尾数、越界裁剪，见 core.QueueProvider）。
+//
+// 与单值读方法的差别：区间内**某个元素解码失败**时无法用 ok 表达（区间本身可能
+// 非空），因此立即返回该错误；调用方若想容忍个别脏元素，请自行用底层 QRange。
+func (t TypedStore) QRange[T any](ctx context.Context, name string, start, stop int64) ([]T, error) {
+	raw, err := t.StoreProvider.QRange(ctx, name, start, stop)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]T, 0, len(raw))
+	for i, b := range raw {
+		v, err := Dec[T](b)
+		if err != nil {
+			return nil, fmt.Errorf("kvdb: QRange %q[%d]: %w", name, i, err)
+		}
+		out = append(out, v)
+	}
+	return out, nil
 }
 
 // ---- Batch ----

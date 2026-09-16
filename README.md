@@ -190,9 +190,11 @@ n, ok, err := tdb.Get[int64](ctx, "visits") // scalars use text encoding, intero
 ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 ```
 
-Writes are `Set[T]` / `SetEx[T]` / `QPush[T]` / `QPushFront[T]` (encoded with `Enc[T]`); reads are
-`Get[T]` / `MGet[T]` / `QPop[T]` / `QPopBack[T]` / `QFront[T]` / `QBack[T]` plus the non-generic
-`QRange` (queue elements are raw bytes), decoded with `Dec[T]`/`D[T]`. Read methods **keep `D`'s
+Writes are `Set[T]` / `SetEx[T]` / `SetExAt[T]` / `QPush[T]` / `QPushFront[T]` (encoded with
+`Enc[T]`); reads are `Get[T]` / `MGet[T]` / `QPop[T]` / `QPopBack[T]` / `QFront[T]` / `QBack[T]` /
+`QRange[T]`, decoded with `Dec[T]`/`D[T]`. Every `[]byte`-valued contract method has a `T`
+counterpart; methods that carry no value (`Del`/`Exists`/`Incr`/`Scan`/`TTL`/`QSize`/ZSet…) stay on
+the embedded `StoreProvider` and take no type parameter. Read methods **keep `D`'s
 signature** — `(T, bool, error)` — so a missing entry is `ok=false` with `err=nil` rather than a
 folded `ErrNotFound`; judge the trade-off where you call it. With `T = []byte` it is exactly equivalent to calling the
 backend directly. `tdb.BatchT(ctx, func(b kvdb.TypedBatch) error {...})` encodes at collection

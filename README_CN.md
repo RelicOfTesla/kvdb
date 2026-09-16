@@ -182,9 +182,11 @@ n, ok, err := tdb.Get[int64](ctx, "visits") // 标量走文本编码，与 Incr 
 ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 ```
 
-写为 `Set[T]` / `SetEx[T]` / `QPush[T]` / `QPushFront[T]`（`Enc[T]` 编码）；读为
-`Get[T]` / `MGet[T]` / `QPop[T]` / `QPopBack[T]` / `QFront[T]` / `QBack[T]`，另有非泛型的
-`QRange`（队列元素本身就是原始字节），解码用 `Dec[T]`/`D[T]`。读方法**沿用 `D` 的签名**——
+写为 `Set[T]` / `SetEx[T]` / `SetExAt[T]` / `QPush[T]` / `QPushFront[T]`（`Enc[T]` 编码）；
+读为 `Get[T]` / `MGet[T]` / `QPop[T]` / `QPopBack[T]` / `QFront[T]` / `QBack[T]` / `QRange[T]`，
+解码用 `Dec[T]`/`D[T]`。**凡值语义为 `[]byte` 的契约方法都有对应的 `T` 版本**；不携带值的
+方法（`Del`/`Exists`/`Incr`/`Scan`/`TTL`/`QSize`/ZSet 各方法…）仍经内嵌 `StoreProvider` 直取，
+不带类型参数。读方法**沿用 `D` 的签名**——
 `(T, bool, error)`——故缺失是 `ok=false` 且 `err=nil`，而不是折算成 `ErrNotFound`；
 要"缺失即错误"由调用处自行判断。
 `T = []byte` 时与直接调用基座完全等价。`tdb.BatchT(ctx, func(b kvdb.TypedBatch) error {...})`

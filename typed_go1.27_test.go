@@ -195,6 +195,99 @@ func TestTypedQueue(t *testing.T) {
 	}
 }
 
+// TestTypedQRange 验证区间读取的泛型形态：逐元素解码、保序、只读。
+func TestTypedQRange(t *testing.T) {
+	ctx := context.Background()
+	db, err := kvdb.Open(ctx, "stub://")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tdb := kvdb.Typed(db)
+
+	for i := 1; i <= 5; i++ {
+		if err := tdb.QPush(ctx, "qr", tUser{ID: int64(i), Name: "u"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 全区间
+	all, err := tdb.QRange[tUser](ctx, "qr", 0, -1)
+	if err != nil || len(all) != 5 {
+		t.Fatalf("QRange(0,-1) = %d 项, err=%v", len(all), err)
+	}
+	for i, u := range all {
+		if u.ID != int64(i+1) {
+			t.Fatalf("QRange[%d].ID = %d, want %d（须保序）", i, u.ID, i+1)
+		}
+	}
+	// 负索引 / 越界裁剪
+	tail, err := tdb.QRange[tUser](ctx, "qr", -2, -1)
+	if err != nil || len(tail) != 2 || tail[0].ID != 4 || tail[1].ID != 5 {
+		t.Fatalf("QRange(-2,-1) = %+v, err=%v", tail, err)
+	}
+	if got, err := tdb.QRange[tUser](ctx, "qr", 0, 100); err != nil || len(got) != 5 {
+		t.Fatalf("QRange(0,100) 应裁剪为 5 项, got %d err=%v", len(got), err)
+	}
+	if got, err := tdb.QRange[tUser](ctx, "qr", 3, 1); err != nil || len(got) != 0 {
+		t.Fatalf("空区间应为空, got %d err=%v", len(got), err)
+	}
+	// 空区间：空且无错。
+	// 注意：这里不断言"另一个队列名为空"——根部测试桩的 fakeQueue 忽略队列名
+	// （用单一共享列表），那属于测试替身的简化，不是产品行为。
+	if got, err := tdb.QRange[tUser](ctx, "qr", 10, 20); err != nil || len(got) != 0 {
+		t.Fatalf("越界区间应空且无错, got %d err=%v", len(got), err)
+	}
+	// 只读：长度不变
+	if n, err := db.QSize(ctx, "qr"); err != nil || n != 5 {
+		t.Fatalf("QRange 后 QSize = %d, err=%v", n, err)
+	}
+	// 标量元素同样可用（读末位：测试桩的队列忽略名字，是单一共享列表）
+	if err := tdb.QPush(ctx, "qr", int64(42)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := tdb.QRange[int64](ctx, "qr", -1, -1); err != nil || len(got) != 1 || got[0] != 42 {
+		t.Fatalf("QRange[int64] = %v, err=%v", got, err)
+	}
+	// 解码失败必须报错（区间可能非空，无法用 ok 表达）。
+	// 往末尾追加一个非法 JSON 元素，再读最后一个位置即可命中它。
+	if err := db.QPush(ctx, "qr", []byte("not-json")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tdb.QRange[tUser](ctx, "qr", -1, -1); err == nil {
+		t.Fatal("区间内存在不可解码元素时应报错")
+	}
+}
+
+// TestTypedSetExAt 验证绝对到期时刻的泛型形态。
+func TestTypedSetExAt(t *testing.T) {
+	ctx := context.Background()
+	db, err := kvdb.Open(ctx, "stub://")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tdb := kvdb.Typed(db)
+
+	// 未来时刻：写入且可读
+	u := tUser{ID: 9, Name: "future"}
+	at := core.NowUnix() + 100
+	if err := tdb.SetExAt(ctx, "at", u, at); err != nil {
+		t.Fatalf("SetExAt(未来): %v", err)
+	}
+	if got, ok, err := tdb.Get[tUser](ctx, "at"); err != nil || !ok || got.ID != 9 {
+		t.Fatalf("SetExAt 后 Get = %+v,%v,%v", got, ok, err)
+	}
+	// 桩的 TTL 恒返回 ok=false（不建模 TTL 表），故此处不校验 TTL 记录；
+	// 绝对时刻的语义由 kvdbtest 的 TTLBoundaries 在各真实基座上覆盖。
+	// 过去时刻：删除该 key
+	if err := tdb.SetExAt(ctx, "at", u, core.NowUnix()-1); err != nil {
+		t.Fatalf("SetExAt(过去): %v", err)
+	}
+	if _, ok, _ := tdb.Get[tUser](ctx, "at"); ok {
+		t.Fatal("SetExAt(过去) 应删除该 key")
+	}
+}
+
 // TestTypedOKVariants 验证 *OK 系列**保留 ok 原值**：空/缺失时 ok=false 且 err=nil，
 // 与不带 OK 后缀的形态（把"空"折算为 ErrNotFound）区分开。
 func TestTypedReadSignature(t *testing.T) {

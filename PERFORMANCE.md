@@ -1,115 +1,145 @@
-# 性能报告
+# Performance report
 
-`kvdb` 各基座的实测吞吐、成本模型与选型建议。
+**English** | [中文](PERFORMANCE_CN.md)
 
-> 数字为单机容器环境的相对量级，**不是承诺值**；绝对值受 CPU、存储介质、网络与
-> 容器配置影响很大。复现命令见 §7。
+Measured throughput, cost model, and selection guidance for each `kvdb` backend.
 
-## 1. 口径与方法
+> The numbers are relative magnitudes from a single-machine container environment and are
+> **not promises**; absolute values depend heavily on CPU, storage medium, network, and
+> container configuration. Reproduction commands are in §7.
 
-只使用一种口径：**固定时间窗内跑满并发负载，统计实际完成量**（ops/s；批写折算到
-条目级 items/s）。基准为 `bench/throughput_test.go` 的 `BenchmarkThroughput*`，
-默认 8 个 goroutine、`-benchtime` 控制窗口长度。
+## 1. Scope and method
 
-**为什么不以单步长（`ns/op`）为基准**：写入路径普遍带合并与异步成分——SQL 组提交、
-SQLite WAL 检查点搭车、LSM memtable 批量落盘、jsonl 缓冲落盘、Batch 摊薄提交，以及
-各引擎的后台 compaction。串行测一条再取倒数会把这些全部抹平，并把"被缓冲吸收"误读为
-"落盘很快"：例如 jsonl 缓冲档单看 `ns/op` 约 4.5 µs，但那只是"写进内存缓冲"的耗时，
-真实持续写盘能力要看窗口内完成了多少。因此本报告只认时间窗口指标，`ns/op` 仅作辅助。
+Only one methodology is used: **saturate the backend with concurrent load over a fixed time
+window and count what actually completes** (ops/s; batch writes are converted to per-item
+items/s). The basis is `BenchmarkThroughput*` in `bench/throughput_test.go`, with 8
+goroutines by default and `-benchtime` controlling the window length.
 
-比较时必须固定三个变量：
+**Why not use per-step latency (`ns/op`) as the basis**: the write path generally involves
+coalescing and asynchrony — SQL group commit, SQLite WAL checkpoint piggybacking, LSM
+memtable batch flushing, jsonl buffer flushing, Batch-amortized commits, and each engine's
+background compaction. Measuring one call serially and taking its reciprocal flattens all of
+that away and misreads "absorbed by a buffer" as "fast to disk": for example, the jsonl
+buffered mode shows roughly 4.5 µs per `ns/op`, but that is only the cost of "writing into
+the memory buffer"; real sustained write capacity depends on how much completes within the
+window. This report therefore recognizes only time-window metrics; `ns/op` is auxiliary.
 
-| 维度 | 影响 |
+Three variables must be held fixed when comparing:
+
+| Dimension | Impact |
 |---|---|
-| **介质** | tmpfs / ext4(WSL vhdx) / drvfs(9p) 的 fsync 差 3 个数量级 |
-| **持久化等级** | 嵌入式基座默认不逐条 fsync（`?sync=1` 才开启）；跨级比较无意义 |
-| **key 分布** | 同 key 热点受单点串行限制，多 key 才能吃到组提交 |
+| **Medium** | fsync on tmpfs / ext4 (WSL vhdx) / drvfs (9p) differs by 3 orders of magnitude |
+| **Durability level** | Embedded backends do not fsync per operation by default (only `?sync=1` enables it); comparisons across levels are meaningless |
+| **key distribution** | Same-key hotspots are limited by single-point serialization; only multiple keys benefit from group commit |
 
-**介质必须真实（涉及 `sync=1` 时尤其如此）**：tmpfs 上 fsync 是空操作，会把耐久档的
-代价整体抹平——实测同一基座在 tmpfs 上 `sync=1` 只慢 13%，在真实 ext4 上慢 570×。
-因此 **tmpfs 数据不得用于"fsync 代价/耐久档退避"这类结论**，只用于基座间相对比较。
+**The medium must be real (especially when `sync=1` is involved)**: on tmpfs fsync is a no-op
+and flattens the entire cost of the durable mode — measured on the same backend, `sync=1` on
+tmpfs is only 13% slower, while on real ext4 it is 570× slower. Therefore **tmpfs data must
+not be used for conclusions such as "fsync cost / durable-mode backoff"**; it is only for
+relative comparisons between backends.
 
-裸 `write(16B)+fsync` 参考值（解释成因用，非吞吐）：tmpfs 2–4 µs、ext4(vhdx) ~2.5 ms、
-drvfs(9p) 3.8–5.5 ms。**本环境的"常规磁盘"是 WSL vhdx，一次 fsync 约 2.5 ms，
-只比 9p 快约 1.5×，不属于快的那一档。**
+Bare `write(16B)+fsync` reference values (to explain the causes, not throughput): tmpfs
+2–4 µs, ext4 (vhdx) ~2.5 ms, drvfs (9p) 3.8–5.5 ms. **The "ordinary disk" in this
+environment is a WSL vhdx; one fsync takes about 2.5 ms, only about 1.5× faster than 9p, so
+it does not belong to the fast tier.**
 
-### 1.1 持久化档位（嵌入式基座已统一为 `sync` 开关）
+### 1.1 Durability modes (embedded backends now share one `sync` switch)
 
-| 基座 | 缺省（高速） | `?sync=1`（耐久） | 备注 |
+| Backend | Default (fast) | `?sync=1` (durable) | Notes |
 |---|---|---|---|
-| jsonl | flush 每 500ms + fsync 每 1s | 逐操作 flush + fsync | 两个旋钮独立：`?each_flush=1` 逐操作 flush、`?flush_interval`/`?sync_interval` 调周期 |
-| bolt | 不逐提交 fsync，**周期落盘（缺省 1s）** | 逐提交 fsync | bbolt `NoSync=true` + SDK 自建周期 Sync；`?sync_interval=1s` 可调 |
-| leveldb | 不 fsync | 逐提交 fsync | goleveldb `WriteOptions.Sync=false` |
-| badger | 不 fsync | 逐提交 fsync | `WithSyncWrites(false)` |
-| sqlite | `NORMAL` | `FULL`（逐提交 fsync） | `?sync=0` 等价缺省（显式写法）；不提供 `OFF`（会损坏库） |
+| jsonl | flush every 500ms + fsync every 1s | flush + fsync per operation | The two knobs are independent: `?each_flush=1` flushes per operation, `?flush_interval`/`?sync_interval` adjust the periods |
+| bolt | no fsync per commit, **periodic flush to disk (1s by default)** | fsync per commit | bbolt `NoSync=true` plus an SDK-built periodic Sync; tunable via `?sync_interval=1s` |
+| leveldb | no fsync | fsync per commit | goleveldb `WriteOptions.Sync=false` |
+| badger | no fsync | fsync per commit | `WithSyncWrites(false)` |
+| sqlite | `NORMAL` | `FULL` (fsync per commit) | `?sync=0` is equivalent to the default (the explicit form); `OFF` is not offered (it corrupts the database) |
 
-**五个本地基座的缺省档取向一致**：都不逐提交 fsync，`?sync=1` 才要断电安全
-（sqlite 同理：`NORMAL` 为缺省，`FULL` 对应 `?sync=1`）。
+**The five local backends take the same default-mode stance**: none of them fsyncs per
+commit, and only `?sync=1` provides power-loss safety (the same holds for sqlite: `NORMAL` is
+the default and `FULL` corresponds to `?sync=1`).
 
-**缺省档不等于"永不落盘"**，但各基座的兜底层次不同，不要混为一谈：
+**The default mode does not mean "never persisted"**, but the backends differ in their
+fallback layers, and these should not be conflated:
 
-- **jsonl / bolt**：数据先落在**进程内存缓冲**里 → 进程崩溃就会丢。因此都有有界兜底：
-  jsonl 每 500ms flush、bolt 每 1s 周期落盘，且两者 `Close` 都强制落盘一次
-  （bbolt 自身的 `Close` 不做 fdatasync，这一层由 SDK 补）。strace 实证：静置 600ms、
-  写入 1 次时，`sync_interval=100ms` 触发 9 次 fdatasync，调到 5s 降到 4 次——
-  落盘频率确由该参数控制。
-- **sqlite（NORMAL）**：每次提交都已 `write()` 进 **OS 页缓存**，WAL 里有全部记录 →
-  **进程崩溃不丢**（实测写 200 条后不 Close 直接退出，FULL/NORMAL 均 200/200 恢复）。
-  它省掉的只是"提交时 fsync WAL"，故只影响**机器掉电**。SQLite 的 checkpoint
-  **按帧数**触发（`DEFAULT_WAL_AUTOCHECKPOINT=1000` 页），**没有时间驱动的 checkpoint**：
-  实测写 3000 条（越过阈值，主库 4KB→11.9MB）后静置 5s，主库与 WAL 字节数完全不变。
-  所以它**不需要**周期落盘兜底——缺省档的丢失边界就是"掉电丢最近若干提交"。
+- **jsonl / bolt**: data first lands in a **process memory buffer** → a process crash loses
+  it. Both therefore have a bounded fallback: jsonl flushes every 500ms, bolt flushes to disk
+  on a 1s period, and `Close` on both forces one flush (bbolt's own `Close` does not
+  fdatasync, so the SDK supplies this layer). Confirmed by strace: with 600ms idle and one
+  write, `sync_interval=100ms` triggers 9 fdatasyncs, while at 5s it drops to 4 — the flush
+  frequency is indeed controlled by that parameter.
+- **sqlite (NORMAL)**: every commit has already been `write()`-ten into the **OS page
+  cache**, and the WAL holds every record → **a process crash loses nothing** (measured:
+  after writing 200 records, exiting directly without Close recovers 200/200 for both FULL
+  and NORMAL). All it skips is "fsync the WAL at commit", so it only affects **machine power
+  loss**. SQLite's checkpoint **triggers on frame count** (`DEFAULT_WAL_AUTOCHECKPOINT=1000`
+  pages), and there is **no time-driven checkpoint**: measured after writing 3000 records
+  (crossing the threshold, with the main database growing 4KB→11.9MB) and then idling for 5s,
+  the main database and WAL byte counts are completely unchanged. So it **does not need** a
+  periodic flush fallback — the loss boundary of the default mode is simply "power loss loses
+  the most recent few commits".
 
-`nosync` 不是可用参数：写它直接报错（缺省即不 fsync，接受它反而会让人误判持久化等级）。
+`nosync` is not a usable parameter: writing it produces an immediate error (the default
+already means no fsync, and accepting it would mislead people about the durability level).
 
-## 2. 各基座实测吞吐（主表：ext4 + 缺省档）
+## 2. Measured throughput (main table: ext4 + default mode)
 
-**这是选型时唯一需要看的一张表**：真实块设备（ext4/WSL vhdx）、各基座缺省档
-（不逐提交 fsync）。其余介质与 `?sync=1` 档位见 §2.5 的矩阵对照。
+**This is the only table you need to look at when choosing a backend**: a real block device
+(ext4/WSL vhdx) with each backend in its default mode (no fsync per commit). Other media and
+the `?sync=1` modes are covered by the matrix in §2.5.
 
-单位 ops/s；`MGet条目` 与 `批写条目` 为折算到**条目级**的 items/s。均为 8 goroutine、
-时间窗 `-benchtime 2s`、统计实际完成量。`Incr多key` 是各写者用独立 key，
-`Incr同key` 是所有写者打同一个计数器。
+Units are ops/s; the `MGet items` and `Batch items` columns are items/s converted to the
+**per-item** level. All use 8 goroutines, a `-benchtime 2s` time window, and count what
+actually completes. `Incr multi-key` has each writer using an independent key, while
+`Incr same-key` has all writers hitting the same counter.
 
-`混合读` / `混合写` 来自 `BenchmarkThroughputMixedReadWrite`（8 goroutine 中一半持续读
-同一 64-key 热集、一半写各自互不重叠的 key）；`读保留率` = 混合读 ÷ 该基座纯读 Get。
+`Mixed read` / `Mixed write` come from `BenchmarkThroughputMixedReadWrite` (of 8 goroutines,
+half continuously read the same 64-key hot set and half write their own non-overlapping
+keys); `Read retention` = mixed read ÷ that backend's pure-read Get.
 
-| 基座 | Set | Get | Incr多key | Incr同key | QPush | MGet条目 | 批写条目 | 混合读 | 混合写 | 读保留率 |
-|---|---|---|---|---|---|---|---|---|---|---
+| Backend | Set | Get | Incr multi-key | Incr same-key | QPush | MGet items | Batch items | Mixed read | Mixed write | Read retention |
+|---|---|---|---|---|---|---|---|---|---|---|
 | jsonl | ~353.6k | ~10.0M | ~190.1k | ~242.2k | ~639.3k | ~14.1M | ~454.7k | ~474k | ~105k | 5% |
 | bolt | ~25.2k | ~591.1k | ~22.9k | ~26.9k | ~20.9k | ~2.6M | ~473.8k | ~170k | ~13.5k | 27% |
 | leveldb | ~164.6k | ~1.0M | ~111.8k | ~122.4k | ~111.8k | ~1.0M | ~354.2k | ~98.7k | ~52.4k | 11% |
 | badger | ~81.8k | ~274.4k | ~63.5k | ~34.0k | ~64.7k | ~608.2k | ~493.8k | ~76.4k | ~49.7k | 28% |
 | sqlite | ~12.6k | ~62.9k | ~5.0k | ~5.8k | ~5.5k | ~450.9k | ~37.6k | ~40.1k | ~5.8k | 64% |
 
-**参照系（不同介质/部署，不与上表直接比较）**
+**Reference set (different medium/deployment; not directly comparable to the table above)**
 
-| 基座 | 介质 | Set | Get | Incr多key | Incr同key | QPush | MGet条目 | 批写条目 | 混合读 | 混合写 | 读保留率 |
-|---|---|---|---|---|---|---|---|---|---|---|---
-| mem | 无 IO | ~775k | ~8.4M | ~825k | ~3.0M | ~2.85M | ~14.8M | ~1.48M | ~783k | ~251k | 9% |
-| redis | 容器 ext4 | ~12.7k | ~12.4k | ~14.9k | ~13.4k | ~13.2k | ~256.4k | ~497.2k | ~7.1k | ~7.0k | 57% |
-| ssdb | 容器 ext4 | ~8.0k | ~7.6k | ~7.7k | ~7.9k | ~8.2k | ~137.4k | ~20.6k | ~3.7k | ~3.5k | 48% |
-| mysql 8.0 | 容器 ext4 | ~718 | ~5.3k | ~428 | ~119 | ~400 | ~95.6k | ~4.6k | ~2.9k | ~453 | 55% |
-| pg 16 | 容器 ext4 | ~2.4k | ~9.9k | ~2.2k | ~647 | ~1.4k | ~185.7k | ~8.8k | ~5.3k | ~1.4k | 54% |
+| Backend | Medium | Set | Get | Incr multi-key | Incr same-key | QPush | MGet items | Batch items | Mixed read | Mixed write | Read retention |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| mem | no IO | ~775k | ~8.4M | ~825k | ~3.0M | ~2.85M | ~14.8M | ~1.48M | ~783k | ~251k | 9% |
+| redis | container ext4 | ~12.7k | ~12.4k | ~14.9k | ~13.4k | ~13.2k | ~256.4k | ~497.2k | ~7.1k | ~7.0k | 57% |
+| ssdb | container ext4 | ~8.0k | ~7.6k | ~7.7k | ~7.9k | ~8.2k | ~137.4k | ~20.6k | ~3.7k | ~3.5k | 48% |
+| mysql 8.0 | container ext4 | ~718 | ~5.3k | ~428 | ~119 | ~400 | ~95.6k | ~4.6k | ~2.9k | ~453 | 55% |
+| pg 16 | container ext4 | ~2.4k | ~9.9k | ~2.2k | ~647 | ~1.4k | ~185.7k | ~8.8k | ~5.3k | ~1.4k | 54% |
 
-### 2.1 从主表读出的结论
+### 2.1 Conclusions read from the main table
 
-- **读路径几乎不受介质支配**：同一基座的 Get/MGet 在 tmpfs/ext4/9p 各档上基本不变
-  （如 leveldb Get ~1.0M、jsonl Get ~9.4–10.1M），因为读命中页缓存；写路径才受介质支配。
-- **"要不要 `sync=1`"比"选哪个基座"影响更大**：缺省档把 fsync 从写热路径摘掉后，
-  嵌入式写吞吐比 `sync=1` 高 1–2 个数量级（§2.5）。选型时应先定持久化档位，再挑基座。
-- **服务端基座的读吞吐低于嵌入式**：redis Get ~12.4k vs bolt Get ~590k，瓶颈是网络
-  往返而非磁盘；但服务端基座天然"缺省即耐久"，无需在速度与安全间二选一。
-- **SQL 的同 key 热点掉档最严重**：mysql 多 key 428 → 同 key 119（3.6×）、
-  pg 2.2k → 647（3.4×）。嵌入式基座因单写者模型，同 key 与多 key 差距很小。
-- **SSDB 各项吞吐均衡但上限低**（约 8k ops/s 且批写仅 2.6×）：无事务，流水线只省往返。
-- **mem 是唯一"读写都不受任何 IO 约束"的基座**（Set ~775k、Get ~8.4M、批写 ~1.5M）。
-- **写吞吐最高的嵌入式基座是 jsonl**（Set ~353.6k），但它与 leveldb（~164.6k）的差距
-  主要来自"flush 有 500ms 周期缓冲"而非引擎差异，读延迟与持久化语义须一并权衡（§2.4）。
+- **The read path is barely dominated by the medium**: for the same backend, Get/MGet is
+  essentially unchanged across tmpfs/ext4/9p (e.g. leveldb Get ~1.0M, jsonl Get ~9.4–10.1M),
+  because reads hit the page cache; only the write path is dominated by the medium.
+- **"Whether to use `sync=1`" matters more than "which backend to pick"**: once the default
+  mode removes fsync from the write hot path, embedded write throughput is 1–2 orders of
+  magnitude higher than with `sync=1` (§2.5). When choosing, decide the durability mode
+  first, then pick the backend.
+- **Server backends have lower read throughput than embedded ones**: redis Get ~12.4k vs bolt
+  Get ~590k — the bottleneck is the network round trip, not the disk; but server backends are
+  naturally "durable by default", so there is no need to choose between speed and safety.
+- **SQL suffers the worst same-key hotspot degradation**: mysql goes from 428 multi-key to 119
+  same-key (3.6×), pg from 2.2k to 647 (3.4×). Embedded backends, with their single-writer
+  model, show very little gap between same-key and multi-key.
+- **SSDB is balanced across metrics but has a low ceiling** (about 8k ops/s, and batch writes
+  only 2.6×): no transactions, and pipelining only saves round trips.
+- **mem is the only backend "constrained by no IO at all for either reads or writes"**
+  (Set ~775k, Get ~8.4M, batch writes ~1.5M).
+- **The embedded backend with the highest write throughput is jsonl** (Set ~353.6k), but its
+  lead over leveldb (~164.6k) comes mainly from "flush having a 500ms periodic buffer" rather
+  than from an engine difference, and read latency and durability semantics must be weighed
+  alongside it (§2.4).
 
-### 2.2 批写收益（批写条目吞吐 ÷ Set 吞吐，主表档位）
+### 2.2 Batch-write benefit (batch items throughput ÷ Set throughput, main-table mode)
 
-| 基座 | ext4 缺省 |
+| Backend | ext4 default |
 |---|---|
 | jsonl | 2.3× |
 | bolt | 18.8× |
@@ -117,72 +147,98 @@ drvfs(9p) 3.8–5.5 ms。**本环境的"常规磁盘"是 WSL vhdx，一次 fsync
 | badger | 6.0× |
 | sqlite | 3.0× |
 
-收益取决于单条写中可被摊薄的提交成本：
+The benefit depends on how much commit cost in a single write can be amortized:
 
-- **批写收益与"单条写里有多少提交成本"成正比**：`sync=1` 下一次提交含一次 fsync，
-  批写能把 N 次 fsync 摊成 1 次，故倍数高达 39–86×（§2.5）；缺省档已无 fsync，倍数
-  回落到 2.2–6.0×，剩下的可摊薄成本是事务/Batch 本身的固定开销。
-- **bolt 在缺省档仍有 18.8×**：它每写必开一个 bbolt 事务，该开销与介质无关，因此在
-  tmpfs 上照样能被批掉。
-- SQL 系收益偏低（mysql 6.4×、pg 3.7×）是因为批内仍逐条语句执行，只是共享一次提交；
-  Redis 39× 来自 MULTI/EXEC 一次往返 + 服务端合并。
+- **The batch-write benefit is proportional to "how much commit cost a single write
+  contains"**: with `sync=1`, one commit includes one fsync, so batch writes can collapse N
+  fsyncs into 1, giving multipliers as high as 39–86× (§2.5); the default mode has no fsync
+  left, so the multiplier falls back to 2.2–6.0×, and the remaining amortizable cost is the
+  fixed overhead of the transaction/Batch itself.
+- **bolt still shows 18.8× in the default mode**: it opens a bbolt transaction on every
+  write, and that overhead is independent of the medium, so it can still be batched away on
+  tmpfs.
+- The SQL family has lower benefit (mysql 6.4×, pg 3.7×) because statements are still
+  executed one by one inside the batch and only the commit is shared; Redis's 39× comes from
+  a single MULTI/EXEC round trip plus server-side merging.
 
-### 2.3 读写混合：读者会不会被写者阻塞
+### 2.3 Mixed read/write: are readers blocked by writers?
 
-主表的 `混合读/混合写/读保留率` 三列即此结论的来源，各档位对照见 §2.5。
+The `Mixed read/Mixed write/Read retention` columns of the main table are the source of this
+conclusion; the cross-mode comparison is in §2.5.
 
-- **服务端基座几乎不互相阻塞**：读写各保留 ~44–63%，相当于把并发度对半分。连接池
-  隔离了请求，读不会因为写而排队。
-- **mem / jsonl 在高写频率下读掉到纯读的 ~5–9%**。jsonl 的读路径不取自身任何锁，
-  仍只有 5%，说明瓶颈是两者共用的 mem 全局锁粒度：每次写进入该锁都会让后续读者排队。
-- **掉幅由写者进入共享同步原语的频率决定，而不是介质带宽**：写频率越低（如 9p 上
-  几百 ops/s），读保留率越高——盘慢反而让读者更容易穿插。
-- **"Get 比 Set 快几十倍"只在无写或低写负载下成立**。混合负载下应看读保留率，而改善
-  读阻塞的抓手与降低写延迟同源：批写（把 N 次对锁/事务的占用合并成 1 次）与分片。
-- **badger 的混合读由"写提交窗口"支配，而不是写频率**：`sync=1` 时一次提交在 ext4/9p
-  上要 1.3–3 ms，读者排在提交锁之后，读保留率只剩 0.2–0.4%（它对写的保留率却高达
-  91–98%，说明写本身没被拖慢）。缺省档（不 fsync）已消除这一现象：读回到 ~76.4k、
-  保留率 ~28%，与其他嵌入式同级。
-- **写频率推高后读保留率并不会更差**：bolt/leveldb/badger 缺省档的写频率比 `sync=1`
-  高 1–2 个数量级，读保留率仍在 11–28%。说明这些基座的读阻塞主要来自"写者占据同步
-  原语的**时长**"，而非次数。
-- 读保留率 >100%（sqlite 部分档位）是该档纯读基准自身的调度与页缓存波动，属噪声量级。
+- **Server backends barely block each other**: reads and writes each retain ~44–63%,
+  equivalent to splitting concurrency in half. The connection pool isolates requests, so
+  reads do not queue behind writes.
+- **mem / jsonl reads drop to ~5–9% of pure-read under high write frequency**. jsonl's read
+  path takes no lock of its own yet still only reaches 5%, showing that the bottleneck is the
+  granularity of the global lock in mem that both share: every write entering that lock makes
+  subsequent readers queue.
+- **The size of the drop is determined by how often writers enter the shared synchronization
+  primitive, not by medium bandwidth**: the lower the write frequency (e.g. a few hundred
+  ops/s on 9p), the higher the read retention — a slower disk actually lets readers interleave
+  more easily.
+- **"Get is dozens of times faster than Set" holds only under no or low write load**. Under
+  mixed load you should look at read retention, and the levers that improve read blocking are
+  the same ones that cut write latency: batch writes (merging N acquisitions of a lock or
+  transaction into 1) and sharding.
+- **badger's mixed read is governed by the "write commit window", not by write frequency**:
+  with `sync=1`, one commit on ext4/9p takes 1.3–3 ms, readers queue behind the commit lock,
+  and read retention falls to only 0.2–0.4% (yet its retention for writes is as high as
+  91–98%, showing that writes themselves are not slowed). The default mode (no fsync) has
+  eliminated this phenomenon: reads return to ~76.4k and retention to ~28%, on par with the
+  other embedded backends.
+- **Raising write frequency does not make read retention worse**: bolt/leveldb/badger in the
+  default mode have write frequencies 1–2 orders of magnitude higher than with `sync=1`, yet
+  read retention remains at 11–28%. This shows that read blocking in these backends comes
+  mainly from the **duration** for which a writer occupies the synchronization primitive, not
+  from the number of times.
+- Read retention >100% (some sqlite modes) is scheduling and page-cache jitter in that mode's
+  own pure-read baseline, at the noise level.
 
-### 2.4 jsonl 的两个落盘旋钮
+### 2.4 jsonl's two flush-to-disk knobs
 
-jsonl 的落盘分两个**独立**的旋钮，各自有周期，互不干涉：
+jsonl's flushing to disk is split into two **independent** knobs, each with its own period and
+no interference between them:
 
-| 旋钮 | 缺省 | 干的事 | 决定什么 |
+| Knob | Default | What it does | What it determines |
 |---|---|---|---|
-| **flush** | 每 500ms | 把进程缓冲（bufio）交给 OS | 进程崩溃丢多少（已 flush 的在 OS 页缓存，进程崩溃不丢） |
-| **fsync** | 每 1s | 让 OS 把数据写到介质 | 机器掉电丢多少 |
+| **flush** | every 500ms | hands the process buffer (bufio) to the OS | how much a process crash loses (already-flushed data is in the OS page cache, so a process crash loses nothing) |
+| **fsync** | every 1s | makes the OS write the data to the medium | how much a machine power loss loses |
 
-| 档位 | 行为 | 丢失边界 | 写失败可见性 |
+| Mode | Behavior | Loss boundary | Write-failure visibility |
 |---|---|---|---|
-| 缺省 | flush 每 500ms、fsync 每 1s | 进程崩溃丢 ≤500ms；掉电丢 ≤1s | 推迟到周期 tick 或 Close |
-| `?each_flush=1` | 逐操作 flush，fsync 仍按周期 | 进程崩溃不丢；掉电丢 ≤1s | 当次操作立即返回 |
-| `?sync=1` | 逐操作 flush + fsync | 都不丢 | 当次操作立即返回 |
+| default | flush every 500ms, fsync every 1s | process crash loses ≤500ms; power loss loses ≤1s | deferred to the periodic tick or Close |
+| `?each_flush=1` | flush per operation, fsync still periodic | process crash loses nothing; power loss loses ≤1s | returned immediately by that operation |
+| `?sync=1` | flush + fsync per operation | loses nothing either way | returned immediately by that operation |
 
-**两个周期都是"真周期"**（Open 起跑、回调自我重排），不是"空闲才触发"：否则持续
-写入会不断推后到期时间，等于永不落盘。`?flush_interval` / `?sync_interval` 可调。
+**Both periods are "true periods"** (they start at Open and reschedule themselves from the
+callback), not "triggered only when idle": otherwise sustained writes would keep pushing the
+due time back, amounting to never flushing to disk. `?flush_interval` / `?sync_interval` are
+tunable.
 
-**fsync 隐含 flush**：`Sync` 只作用于 fd 上"已写出去"的字节，数据还在 bufio 缓冲里
-时它刷不到——所以周期 fsync 到期会先 Flush 再 Sync，否则那段数据既没交给 OS 也没落盘
-（这次 fsync 等于白做，且症状隐蔽：fsync 照常发生，只是同步了个空）。
+**fsync implies flush**: `Sync` only acts on bytes already "written out" on the fd; while the
+data is still in the bufio buffer it cannot reach them — so when a periodic fsync comes due it
+flushes first and then syncs, otherwise that data would neither have been handed to the OS nor
+persisted (making the fsync a no-op, with a subtle symptom: the fsync happens as usual, it
+just syncs nothing).
 
-**失败即停写**：`bufio.Writer` 的错误是粘性的（Go 没有清除 `b.err` 的公开 API），
-一旦 Flush/Write 出错，缓冲里残留的字节再也不会被写出去。因此任何落盘失败都会把
-Provider 置为不可写，后续写操作一律报错、内存不被改动，`Close` 也必定把该错误报出
-——而不是"每次 Set 都报成功、却永远写不出去"。要"写失败当次即报"用 `each_flush=1`。
+**Fail-stop**: errors from `bufio.Writer` are sticky (Go has no public API to clear `b.err`),
+so once Flush/Write fails, the bytes left in the buffer will never be written out again. Any
+flush-to-disk failure therefore marks the Provider as unwritable, all subsequent write
+operations return errors without touching memory, and `Close` is bound to report that error —
+rather than "every Set reports success yet nothing ever gets written out". To have write
+failures reported on the spot, use `each_flush=1`.
 
-### 2.5 介质与持久化档位矩阵对照
+### 2.5 Medium × durability-mode matrix
 
-主表只覆盖"ext4 + 缺省档"。其余组合如下，**不与主表直接比较**（换介质或换档位即换了
-比较基准）。
+The main table covers only "ext4 + default mode". The remaining combinations follow and
+**must not be compared directly to the main table** (changing the medium or the mode changes
+the comparison baseline).
 
-**`?sync=1`（逐提交 fsync）@ ext4**：只有写路径受影响，读与主表相同。
+**`?sync=1` (fsync per commit) @ ext4**: only the write path is affected; reads are the same
+as in the main table.
 
-| 基座 | Set | QPush | 批写条目 | 相对缺省档慢 |
+| Backend | Set | QPush | Batch items | Slower than default |
 |---|---|---|---|---|
 | jsonl | ~377 | ~410 | — | ~940× |
 | bolt | ~449 | ~464 | ~86× | ~56× |
@@ -190,29 +246,30 @@ Provider 置为不可写，后续写操作一律报错、内存不被改动，`C
 | badger | ~748 | ~736 | ~39× | ~109× |
 | sqlite | ~440 | — | ~70× | ~29× |
 
-**文件基座 @ tmpfs（内存盘）**
+**File backends @ tmpfs (RAM disk)**
 
-| 基座 | Set | Get | Incr多key | Incr同key | QPush | MGet条目 | 批写条目 |
-|---|---|---|---|---|---|---|---
+| Backend | Set | Get | Incr multi-key | Incr same-key | QPush | MGet items | Batch items |
+|---|---|---|---|---|---|---|---|
 | jsonl | ~330.7k | ~10.1M | ~221.9k | ~298.2k | ~580.9k | ~13.4M | ~510.5k |
 | bolt | ~22.1k | ~569.8k | ~22.9k | ~26.9k | ~20.9k | ~2.2M | ~479.1k |
 | leveldb | ~137.0k | ~1.0M | ~111.8k | ~122.4k | ~108.5k | ~1.0M | ~381.8k |
 | badger | ~67.0k | ~274.4k | ~63.5k | ~34.0k | ~53.1k | ~638.4k | ~461.5k |
 | sqlite | ~12.9k | ~64.9k | ~5.8k | ~7.4k | ~8.8k | ~460.1k | ~42.6k |
 
-**文件基座 @ drvfs(9p)**
+**File backends @ drvfs (9p)**
 
-| 基座 | Set | Get | Incr多key | Incr同key | QPush | MGet条目 | 批写条目 |
-|---|---|---|---|---|---|---|---
+| Backend | Set | Get | Incr multi-key | Incr same-key | QPush | MGet items | Batch items |
+|---|---|---|---|---|---|---|---|
 | jsonl | ~1.4k | ~9.6M | ~1.5k | ~1.5k | ~1.6k | ~13.3M | ~110.3k |
 | bolt | ~89 | ~589.5k | ~91 | ~88 | ~94 | ~2.6M | ~7.1k |
 | leveldb | ~1.0k | ~1.1M | ~1.0k | ~288 | ~1.1k | ~1.0M | ~75.2k |
 | badger | ~321 | ~297.6k | ~312 | ~286 | ~338 | ~622.8k | ~26.8k |
 | sqlite | ~234 | ~9.6k | ~129 | ~151 | ~105 | ~102.0k | ~16.1k |
 
-**混合读写 @ 各档位**（主表已列缺省档，此处补齐其余组合）
+**Mixed read/write @ each mode** (the main table already lists the default mode; the remaining
+combinations are filled in here)
 
-| 基座 | 介质/档位 | 混合读 | 混合写 | 读保留率 |
+| Backend | Medium/Mode | Mixed read | Mixed write | Read retention |
 |---|---|---|---|---|
 | jsonl | tmpfs | ~485k | ~101k | 5% |
 | jsonl | 9p | ~4.45M | ~1.5k | 46% |
@@ -229,82 +286,96 @@ Provider 置为不可写，后续写操作一律报错、内存不被改动，`C
 | sqlite | ext4 `sync=1` | ~74k | ~409 | 121% |
 | sqlite | 9p | ~19k | ~85 | 193% |
 
-**读矩阵的两条结论**：
+**Two conclusions from the read matrix**:
 
-- **tmpfs 不适合测 fsync 代价**：tmpfs 上 fsync 是空操作，会把耐久档的代价抹平
-  （同一场景 tmpfs 只差 13%，真实 ext4 差 570×）。tmpfs 数据只用于基座间相对比较。
-- **9p 档收益普遍更高**（批写 68–84×）：连 flush 都要过协议往返，单条写被往返成本支配。
+- **tmpfs is unsuitable for measuring fsync cost**: fsync on tmpfs is a no-op and flattens the
+  cost of the durable mode (in the same scenario tmpfs differs by only 13%, while real ext4
+  differs by 570×). tmpfs data is only for relative comparisons between backends.
+- **The 9p mode generally has a larger benefit** (batch writes 68–84×): even flush has to go
+  through a protocol round trip, so a single write is dominated by round-trip cost.
 
-## 3. 写入成本模型（每操作做了什么）
+## 3. Write cost model (what each operation does)
 
-| 操作 | mem | jsonl | bolt | leveldb | badger | sqlite / pg | mysql | redis | ssdb |
+| Operation | mem | jsonl | bolt | leveldb | badger | sqlite / pg | mysql | redis | ssdb |
 |---|---|---|---|---|---|---|---|---|---|
-| Set | map 写 | 1 次 append+flush | 1 个事务（缺省无 fsync） | 1 次 `Write(batch)`（缺省无 fsync） | 1 个 `Update` 事务（缺省无 fsync） | 1 条 upsert（sqlite 缺省 NORMAL；`sync=1` 为 FULL） | 1 条 upsert | 1 命令 | 1 往返 |
-| Incr | map 写 | 1 次 append+flush | 1 个事务 | 分片锁内读-改-写 + 1 次 `Write` | 分片锁内读-改-写 + 1 个事务 | 1 条 upsert+`RETURNING` | 事务：3 条语句 | 1 命令 | 1 往返 |
-| QPush | map 写 | 1 次 append+flush | 1 个事务 | 1 次 `Write`（元素+计数器同批） | 1 个事务（元素+计数器同批） | 事务：2 条语句 | 事务：4 条语句 | 1 命令 | 1 往返 |
-| Batch(N) | N 次写（1 次持锁） | 1 次 write+flush | **1 个事务** | **1 个 Batch** | **1 个 `Update` 事务** | **1 个事务** | **1 个事务** | 1 次 MULTI/EXEC | 1 次流水线 |
+| Set | map write | 1 append+flush | 1 transaction (no fsync by default) | 1 `Write(batch)` (no fsync by default) | 1 `Update` transaction (no fsync by default) | 1 upsert (sqlite default NORMAL; `sync=1` is FULL) | 1 upsert | 1 command | 1 round trip |
+| Incr | map write | 1 append+flush | 1 transaction | read-modify-write under a shard lock + 1 `Write` | read-modify-write under a shard lock + 1 transaction | 1 upsert+`RETURNING` | transaction: 3 statements | 1 command | 1 round trip |
+| QPush | map write | 1 append+flush | 1 transaction | 1 `Write` (element and counter in the same batch) | 1 transaction (element and counter in the same batch) | transaction: 2 statements | transaction: 4 statements | 1 command | 1 round trip |
+| Batch(N) | N writes (1 lock acquisition) | 1 write+flush | **1 transaction** | **1 Batch** | **1 `Update` transaction** | **1 transaction** | **1 transaction** | 1 MULTI/EXEC | 1 pipeline |
 
-瓶颈通常是**每个事务一次持久化（fsync）**，而不是语句条数。加 `?sync=1` 后嵌入式基座
-的每次提交都回到这条瓶颈上（§2 的 `sync=1` 表：377–1.3k ops/s）；缺省档把它摘掉了。
-同机隔离实验（MySQL，300 次单语句自增）：
+The bottleneck is usually **one durability point (fsync) per transaction**, not the number of
+statements. Adding `?sync=1` puts every commit of the embedded backends back on that
+bottleneck (the `sync=1` table in §2: 377–1.3k ops/s); the default mode removes it. Isolated
+same-machine experiment (MySQL, 300 single-statement increments):
 
-| 配置 | 单语句自增 | 事务 3 语句 |
+| Setting | Single-statement increment | 3-statement transaction |
 |---|---|---|
-| `innodb_flush_log_at_trx_commit=1`（默认） | 131 op/s | 127 op/s |
+| `innodb_flush_log_at_trx_commit=1` (default) | 131 op/s | 127 op/s |
 | `innodb_flush_log_at_trx_commit=2` | **266 op/s** | 174 op/s |
 
-把 3 条语句压成 1 条约 +3%，放宽持久化等级约 2×；PostgreSQL 同理
-（`synchronous_commit=off` 时 490 → 1280 op/s）。**部署侧参数与批写是两个独立杠杆。**
+Collapsing 3 statements into 1 gains about +3%; relaxing the durability level gains about 2×;
+PostgreSQL behaves the same way (490 → 1280 op/s with `synchronous_commit=off`).
+**Deployment-side parameters and batch writes are two independent levers.**
 
-## 4. 已落地的实现优化
+## 4. Implemented optimizations
 
-| 项 | 效果 |
+| Item | Effect |
 |---|---|
-| SQLite / PG 的 `Incr` 用单语句 `upsert + RETURNING`（缺失按 0、原子累加、非整数报错） | 替代事务多语句路径；MySQL 无 `RETURNING` 保留事务路径 |
-| MySQL 键列用 `VARBINARY(255)` | 兼容 5.6 默认索引前缀限制 |
-| SQLite 进程内写串行化 + WAL | 写排队而非 `SQLITE_BUSY`，读仍可并行 |
-| SSDB 连接池 | 单连接是串行请求-应答，池化后并发才真正并行 |
-| LevelDB 所有多键写收进单个 `Write(batch)` | 值+TTL、zset 双侧索引、队列元素+计数器各自原子 |
-| Badger 多键写收进单个 `db.Update` 事务 | 同上，且批内 read-your-writes（`BatchComposed=true`） |
-| Badger 同键读-改-写用分片锁先行串行化 | 避免 SSI 冲突重试风暴；冲突重试仅作兜底 |
+| SQLite / PG `Incr` uses a single-statement `upsert + RETURNING` (missing counts as 0, atomic accumulation, error on non-integer) | Replaces the multi-statement transaction path; MySQL has no `RETURNING` and keeps the transaction path |
+| MySQL key column uses `VARBINARY(255)` | Compatible with the 5.6 default index prefix limit |
+| SQLite in-process write serialization + WAL | Writes queue instead of `SQLITE_BUSY`, and reads can still run in parallel |
+| SSDB connection pool | A single connection is serial request-response; only with pooling does concurrency become truly parallel |
+| LevelDB routes all multi-key writes into a single `Write(batch)` | Value+TTL, zset two-sided index, and queue element+counter are each atomic |
+| Badger routes multi-key writes into a single `db.Update` transaction | Same as above, plus in-batch read-your-writes (`BatchComposed=true`) |
+| Badger same-key read-modify-write is serialized up front with a shard lock | Avoids an SSI conflict retry storm; conflict retry is only a fallback |
 
-未采用的方案：CGO 版 SQLite 驱动——实测真实存储上纯 Go 与 CGO 吞吐基本一致
-（瓶颈是每事务持久化，不是驱动实现），故不引入 CGO 依赖。
+Approaches not adopted: the CGO SQLite driver — measured on real storage, pure Go and CGO
+throughput are essentially identical (the bottleneck is per-transaction durability, not driver
+implementation), so a CGO dependency is not introduced.
 
-## 5. 选型建议
+## 5. Choosing a backend
 
-- **嵌入式 + 点查为主**：`bolt`（mmap/B+tree 读极快，且每写一事务，批写收益在
-  任何介质都成立）。
-- **嵌入式 + 写吞吐优先**：`leveldb`（LSM 批量落盘，tmpfs/9p 上单条写都不错）。
-- **需要事务 / 批内依赖组合**：`badger`（唯一提供 MVCC 事务与批内可见性的嵌入式基座）；
-  代价是默认同步写下读写被提交窗口耦合（§2.3），且写吞吐低于 leveldb。
-- **需要 SQL 能力 / 多进程共享**：`sqlite` / `mysql` / `pg`；注意同 key 热点掉档。
-- **服务端 KV**：`redis`（批写收益最大）、`ssdb`（原生协议，但无事务、批写收益有限）。
-- **进程内轻量持久化**：`mem`（不落盘）、`jsonl`（append-only WAL，需理解其持久化等级）。
-- **通用原则**：在 WSL/虚拟化盘上，**先把写改成批写**，再谈挑基座；要"每条落盘且
-  高吞吐"需真实本地 NVMe 或依赖服务端的组提交策略。
-- **读写混合场景**（§2.3）：`mem`/`jsonl` 因共用全局锁，高写频率下读只剩纯读的 5–9%；
-  `bolt`/`leveldb`/`sqlite` 的 SDK 层读路径不取锁，但读保留率仍随写频率下滑
-  （tmpfs 为 11–61%，9p 为 54–193%）；服务端基座读写互不阻塞（各保留 44–63%）。
+- **Embedded + point lookups dominant**: `bolt` (mmap/B+tree reads are extremely fast, and one
+  transaction per write means the batch-write benefit holds on any medium).
+- **Embedded + write throughput first**: `leveldb` (LSM batch flushing; single writes are
+  decent on both tmpfs and 9p).
+- **Need transactions / in-batch dependent composition**: `badger` (the only embedded backend
+  offering MVCC transactions and in-batch visibility); the cost is that with synchronous
+  writes by default, reads and writes are coupled to the commit window (§2.3), and write
+  throughput is lower than leveldb.
+- **Need SQL capability / multi-process sharing**: `sqlite` / `mysql` / `pg`; watch out for
+  same-key hotspot degradation.
+- **Server KV**: `redis` (largest batch-write benefit), `ssdb` (native protocol, but no
+  transactions and limited batch-write benefit).
+- **Lightweight in-process persistence**: `mem` (does not hit disk), `jsonl` (append-only WAL;
+  its durability level must be understood).
+- **General principle**: on WSL/virtualized disks, **first turn writes into batch writes**,
+  then talk about picking a backend; wanting "every record persisted and high throughput"
+  requires real local NVMe or a server-side group-commit strategy.
+- **Mixed read/write scenarios** (§2.3): `mem`/`jsonl` share a global lock, so under high write
+  frequency reads drop to only 5–9% of pure reads; `bolt`/`leveldb`/`sqlite` take no lock in
+  the SDK-level read path, yet read retention still declines with write frequency (11–61% on
+  tmpfs, 54–193% on 9p); server backends do not block reads and writes against each other
+  (each retains 44–63%).
 
-## 6. 已知取舍
+## 6. Known trade-offs
 
-| 事项 | 说明 |
+| Item | Notes |
 |---|---|
-| 单 key 计数器 | SQL 系为行锁串行 + 每提交 fsync，固有成本 |
-| SSDB 批写 | 无事务，流水线失败可能部分生效（价值在减少往返） |
-| Redis 批内可见性 | 不保证（见 README「批量写」与 `Capabilities().BatchComposed`） |
-| Badger 读被提交窗口耦合 | `?sync=1` 时一次提交 1.3–3 ms，混合读保留率仅 0.2–0.4%；**缺省档（不 fsync）已消除该现象**（读保留率回到 ~28%） |
-| 缺省档的持久化代价 | 嵌入式基座缺省不逐条 fsync：进程崩溃/断电可能丢最近的已确认写入。要断电安全必须显式 `?sync=1`（代价见 §2 的 `sync=1` 表：慢 56–570×） |
-| 介质标注 | 仓库内 `kvdb/tmp` 属 `G:\` 的 drvfs(9p)，**不是**常规磁盘；测 ext4 须放 WSL 根盘（如 `~/test/tmp`） |
-| tmpfs 数据不可用于 fsync 结论 | tmpfs 上 fsync 是空操作，`sync=1` 的代价会被完全抹平（实测仅慢 13%，真实 ext4 上慢 570×） |
+| Single-key counters | The SQL family serializes on row locks plus an fsync per commit — an inherent cost |
+| SSDB batch writes | No transactions; a pipeline failure may take partial effect (the value is in reducing round trips) |
+| Redis in-batch visibility | Not guaranteed (see README "Batch writes" and `Capabilities().BatchComposed`) |
+| Badger reads coupled to the commit window | With `?sync=1` a commit takes 1.3–3 ms and mixed-read retention is only 0.2–0.4%; **the default mode (no fsync) has eliminated this phenomenon** (read retention back to ~28%) |
+| Durability cost of the default mode | Embedded backends do not fsync per operation by default: a process crash or power loss may lose the most recent acknowledged writes. Power-loss safety requires an explicit `?sync=1` (cost in the `sync=1` table in §2: 56–570× slower) |
+| Medium annotation | `kvdb/tmp` in this repository belongs to `G:\`'s drvfs (9p) and is **not** an ordinary disk; testing ext4 requires a WSL root disk (e.g. `~/test/tmp`) |
+| tmpfs data must not be used for fsync conclusions | fsync on tmpfs is a no-op, so the cost of `sync=1` is completely flattened (measured only 13% slower, versus 570× slower on real ext4) |
 
-## 7. 复现
+## 7. Reproducing
 
 ```bash
-cd bench   # 独立模块；换目录即换介质
+cd bench   # standalone module; changing the directory changes the medium
 
-D=/dev/shm/bt            # tmpfs；或 ~/test/tmp（ext4/WSL vhdx）、./tmp（drvfs 9p）
+D=/dev/shm/bt            # tmpfs; or ~/test/tmp (ext4/WSL vhdx), ./tmp (drvfs 9p)
 mkdir -p "$D"
 BE='ThroughputSet$|ThroughputGet$|ThroughputIncrMultiKey$|ThroughputIncrSameKey$|\
 ThroughputQPush$|ThroughputMGet$|ThroughputBatchedSet$|ThroughputMixedReadWrite$'
@@ -316,14 +387,14 @@ for u in jsonl bolt leveldb badger sqlite; do
   KVDB_BENCH_URI="$u://$p" go test -run '^$' -bench "$BE" -benchtime 2s
 done
 
-# 耐久档对照：只在真实块设备上做（tmpfs 的 fsync 是空操作，测不出代价）
+# Durable-mode comparison: only on a real block device (fsync on tmpfs is a no-op and shows no cost)
 for u in jsonl bolt leveldb badger; do
   case $u in jsonl) p="$D/s.jsonl";; bolt) p="$D/s.bolt";;
                  leveldb) p="$D/s.ldb";; badger) p="$D/s.badger";; esac
   KVDB_BENCH_URI="$u://$p?sync=1" go test -run '^$' -bench "$BE" -benchtime 2s
 done
 
-# 服务端基座（需先起容器，见 README「测试」）
+# Server backends (containers must be started first, see README "Testing")
 KVDB_BENCH_URI='redis://127.0.0.1:6379/0' go test -run '^$' -bench "$BE" -benchtime 2s
 KVDB_BENCH_URI='ssdb://127.0.0.1:8888'    go test -run '^$' -bench "$BE" -benchtime 2s
 KVDB_BENCH_URI='mysql://root:pw@127.0.0.1:3306/db?parseTime=true' \
@@ -332,13 +403,16 @@ KVDB_BENCH_URI='pg://postgres:pw@127.0.0.1:5432/db?sslmode=disable' \
   go test -run '^$' -bench "$BE" -benchtime 2s
 ```
 
-上报指标：`ops/s`（真实吞吐）、`items/s`（MGet / 批写折算到条目级）、
-`reads/s` 与 `writes/s`（混合负载下两个角色各自的完成量）、
-`µs/op-actual`（由完成量与墙钟算出的平均耗时，不是单条串行延迟）。
+Reported metrics: `ops/s` (real throughput), `items/s` (MGet / batch writes converted to the
+per-item level), `reads/s` and `writes/s` (how much each of the two roles completes under
+mixed load), `µs/op-actual` (the average latency computed from completed volume and wall
+clock, not the serial latency of a single call).
 
-另有 `BenchmarkSet`/`Get`/`IncrSequential` 等**顺序调用**基准，仅用于排查单次调用的
-固有开销与回归对比；吞吐结论一律以本节实测数据为准。
+There are also **sequential-call** benchmarks such as `BenchmarkSet`/`Get`/`IncrSequential`,
+used only to investigate the inherent cost of a single call and for regression comparison;
+all throughput conclusions are based on the measured data in this section.
 
-注意：仓库内 `kvdb/tmp` 属 `G:\` 的 drvfs(9p) 挂载，不是常规磁盘；测 ext4 须放 WSL
-根盘（如 `~/test/tmp`，即 `/dev/sdd`）。Docker 容器数据盘在 ext4(vhdx) 上，因此
-服务端基座的数字可与"文件基座 @ ext4"一档类比看。
+Note: `kvdb/tmp` in this repository is a drvfs (9p) mount of `G:\`, not an ordinary disk;
+testing ext4 requires a WSL root disk (e.g. `~/test/tmp`, i.e. `/dev/sdd`). Docker container
+data disks are on ext4 (vhdx), so the server-backend numbers can be read as analogous to the
+"file backends @ ext4" tier.

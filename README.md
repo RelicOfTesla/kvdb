@@ -296,12 +296,15 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 - version and gating: method-level type parameters have been supported since Go 1.27, and the implementation lives in a file carrying `//go:build go1.27`
 ## Semantics
 
-- **KV**: `Set / SetEx / Get / Del / Exists / Incr / MGet / Scan / Expire / TTL`,
+- **KV**: `Set / SetEx / SetExAt / Get / Del / Exists / Incr / MGet / Scan / Expire / ExpireAt / TTL`,
   corresponding to SSDB `set/setx/get/del/exists/incr/multi_get/scan/expire/ttl`.
   - Keys and values are binary-safe; `Scan(start, end, limit)` is **byte-ordered closed-interval**
     ascending, an empty string means unbounded on that side, and `limit<=0` uses
     `DefaultScanLimit` (100).
   - `Set` preserves the existing TTL; `SetEx` overwrites the TTL, and `ttl<=0` returns `ErrInvalidTTL`.
+  - `SetExAt` / `ExpireAt` take an **absolute** deadline in unix seconds (Redis `SETEXAT` / `EXPIREAT`);
+    a deadline already in the past **deletes the key** rather than erroring. Use these when the deadline
+    must survive a restart or be shared across processes — `SetEx(ttl)` computes it from "now".
   - A missing `Incr` key counts from 0; a value that is not a decimal integer returns `ErrNotInteger`.
   - `TTL` returns `(remaining seconds, ok)`, where `ok=false` means the key does not exist /
     has no TTL / has expired.
@@ -322,6 +325,7 @@ know them before porting Redis code:
 | Topic | Redis | kvdb |
 |---|---|---|
 | `Set` and TTL | **clears** the TTL (`KEEPTTL` needed to keep it) | **preserves** the TTL (SSDB `set` semantics); the Redis backend uses `SET ... KEEPTTL` internally |
+| Absolute deadlines | `SETEXAT` requires Redis ≥ 6.2; `EXPIREAT` in seconds | `SetExAt` / `ExpireAt` always available; SSDB has no absolute command, so its backend converts to a relative TTL client-side |
 | `Scan` | cursor-based iteration, unordered, only guarantees full coverage over a finite number of calls | deterministic **byte-ordered closed-interval** range query, ascending, with a limit |
 | `TTL` | `-2` = key missing, `-1` = exists without TTL | both collapse into `ok=false`; the two cases cannot be told apart |
 | `Del` / `Expire` | return how many keys were affected | return only `error` |

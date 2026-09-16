@@ -290,6 +290,9 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
   - 键与值二进制安全；`Scan(start, end, limit)` 为**字节序闭区间**升序，
     空串表示该侧不限，`limit<=0` 取 `DefaultScanLimit`（100）。
   - `Set` 保留既有 TTL；`SetEx` 覆盖 TTL，`ttl<=0` 返回 `ErrInvalidTTL`。
+  - `SetExAt` / `ExpireAt` 接受 **绝对**到期时刻（unix 秒，对应 Redis `SETEXAT` / `EXPIREAT`）；
+    传入已过去的时刻会**删除该 key** 而不是报错。需要到期时刻跨重启/跨进程一致时用它——
+    `SetEx(ttl)` 的到期时刻是按"当前"算出来的。
   - `Incr` 缺失按 0 起算；值非十进制整数返回 `ErrNotInteger`。
   - `TTL` 返回 `(剩余秒数, ok)`，`ok=false` 表示 key 不存在 / 无 TTL / 已过期。
 - **Queue**：`QPush / QPushFront / QPop / QPopBack / QSize / QFront / QBack`，先进先出。
@@ -307,6 +310,7 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 | 主题 | Redis | kvdb |
 |---|---|---|
 | `Set` 与 TTL | **清除** TTL（要保留需 `KEEPTTL`） | **保留** TTL（SSDB `set` 语义）；Redis 基座内部用 `SET ... KEEPTTL` 对齐 |
+| 绝对到期时刻 | `SETEXAT` 需 Redis ≥ 6.2；`EXPIREAT` 秒级 | `SetExAt` / `ExpireAt` 恒可用；SSDB 无绝对时间命令，其基座在客户端换算为相对 TTL |
 | `Scan` | 游标式遍历，无序，只保证有限次遍历内覆盖全部 | 确定性**字节序闭区间**范围查询，升序，带 limit |
 | `TTL` | `-2` 表示 key 不存在、`-1` 表示存在但无 TTL | 两者都收敛为 `ok=false`，无法区分 |
 | `Del` / `Expire` | 返回受影响 key 数 | 只返回 `error` |

@@ -59,6 +59,18 @@ func RunWithOptions(t *testing.T, opt Options, factory func(t *testing.T) core.K
 	t.Run("ReadOwnership", func(t *testing.T) { TestReadOwnership(t, newDB(t, factory)) })
 	t.Run("NamespaceIndependence", func(t *testing.T) { TestNamespaceIndependence(t, newDB(t, factory)) })
 	t.Run("ExpiredConcurrentRead", func(t *testing.T) { TestExpiredConcurrentRead(t, newDB(t, factory), opt) })
+	// 生命周期 / 所有权 / 命名空间 / 复用的扩展用例（见 lifecycle.go）。
+	// 每个用例用独立实例：CloseSemantics 会真的关闭 db，不得与其他用例共用。
+	t.Run("CloseSemantics", func(t *testing.T) { TestCloseSemantics(t, newDB(t, factory)) })
+	t.Run("WriteOwnership", func(t *testing.T) { TestWriteOwnership(t, newDB(t, factory)) })
+	t.Run("EmptyValue", func(t *testing.T) { TestEmptyValue(t, newDB(t, factory)) })
+	t.Run("MGetScanQRangeOwnership", func(t *testing.T) { TestMGetScanQRangeOwnership(t, newDB(t, factory)) })
+	t.Run("NamespacePrefixKeys", func(t *testing.T) { TestNamespacePrefixKeys(t, newDB(t, factory)) })
+	t.Run("EmptyName", func(t *testing.T) { TestEmptyName(t, newDB(t, factory)) })
+	t.Run("ScanBoundaries", func(t *testing.T) { TestScanBoundaries(t, newDB(t, factory)) })
+	t.Run("TTLBoundaries", func(t *testing.T) { TestTTLBoundaries(t, newDB(t, factory)) })
+	t.Run("IncrBoundaries", func(t *testing.T) { TestIncrBoundaries(t, newDB(t, factory)) })
+	t.Run("ZSetRangeBoundaries", func(t *testing.T) { TestZSetRangeBoundaries(t, newDB(t, factory)) })
 }
 
 // waitExpired 轮询等待 key 过期（TTL 粒度为秒，不能只 sleep 固定时长：

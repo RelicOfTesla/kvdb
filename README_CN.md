@@ -305,10 +305,15 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 - **Queue**：`QPush / QPushFront / QPop / QPopBack / QSize / QFront / QBack / QRange`，
   先进先出。`QRange(name, start, stop)` 按位置读取且**不改动队列**（0 起闭区间、负索引从末尾数、
   越界裁剪，与 `ZRange` 同一套规矩）——这正是"只读遍历队列"（如迁移）得以实现的前提。
-- **ZSet**：`ZSet / ZGet / ZDel / ZSize / ZRank / ZRange / ZIncr`，排序
+- **ZSet**：`ZSet / ZGet / ZDel / ZSize / ZRank / ZRange / ZRangeByScore / ZIncr`，排序
   `(score 升序, key 升序)`，排名 0 起；`ZRange(start, stop)` 为 0 起闭区间索引，
   负索引从末尾数。**分数类型为 int64**（对齐 SSDB）；Redis 基座经 float64 换算，
   `|score| ≤ 2^53` 内无损。
+  - `ZRangeByScore(min, max, limit, desc)` 返回分数落在**闭区间 `[min, max]`** 内的成员。
+    `desc` 只改**遍历方向**（false=升序、true=降序），**不改参数含义**——恒有
+    `min <= max`，不同于 Redis `ZREVRANGEBYSCORE` 要求把 `max, min` 对调。同分成员在两个
+    方向下都保持**按成员升序**（与 Redis 一致）。`limit > 0` 按方向取前若干条
+    （故 `desc` 取到的是**最高分**那端）；`limit <= 0` 不限。`min > max` 视为空区间而非错误。
 - 三类数据的命名空间相互独立。哨兵错误：`ErrUnsupported` / `ErrClosed` /
   `ErrNotInteger` / `ErrInvalidTTL` / `ErrNotFound`。
 
@@ -326,6 +331,7 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 | `Exists` | 可传多 key，返回计数 | 单 key，返回 `bool` |
 | `Incr` 溢出 | 始终报错 | SQL/Redis 报错；mem/bolt/jsonl/leveldb/badger/SSDB **静默回绕**（经 `Caps.IncrWraps` 显式探测） |
 | ZSet 分数 | IEEE-754 double（可有小数） | `int64`；Redis 基座在 `\|score\| ≤ 2^53` 内无损 |
+| `ZREVRANGEBYSCORE` 参数 | 传 `max, min`（大的在前） | `ZRangeByScore` 在**两个方向**下都保持 `min <= max`，仅由 `desc` 决定方向 |
 | 列表命令 | `LPUSH`/`RPUSH`/`LPOP`/`RPOP`/`LLEN`/`LINDEX` | `QPush`/`QPushFront`/`QPop`/`QPopBack`/`QSize`/`QFront`/`QBack` |
 | 有序集命令 | `ZADD`/`ZSCORE`/`ZREM`/`ZCARD`/`ZINCRBY` | `ZSet`/`ZGet`/`ZDel`/`ZSize`/`ZIncr`（仅 `ZRank`/`ZRange` 沿用 Redis 名） |
 

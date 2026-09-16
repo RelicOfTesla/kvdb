@@ -320,11 +320,19 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
   first in first out. `QRange(name, start, stop)` reads a positional slice **without modifying the
   queue** (0-based inclusive, negative indices from the end, out-of-range clamped — the same
   convention as `ZRange`); this is what makes read-only queue traversal (e.g. migration) possible.
-- **ZSet**: `ZSet / ZGet / ZDel / ZSize / ZRank / ZRange / ZIncr`, ordered by
+- **ZSet**: `ZSet / ZGet / ZDel / ZSize / ZRank / ZRange / ZRangeByScore / ZIncr`, ordered by
   `(score ascending, key ascending)`, ranks starting at 0; `ZRange(start, stop)` uses
   0-based inclusive indices, and negative indices count from the end. **The score type is int64**
   (aligned with SSDB); the Redis backend converts through float64, which is
   lossless within `|score| ≤ 2^53`.
+  - `ZRangeByScore(min, max, limit, desc)` returns members whose score lies in the **closed
+    interval `[min, max]`**. `desc` changes only the **direction** (false = ascending,
+    true = descending) and **not the meaning of the arguments** — `min <= max` always holds,
+    unlike Redis's `ZREVRANGEBYSCORE`, which wants `max, min` swapped. Members with equal
+    scores stay in **ascending member order** in both directions (matching Redis).
+    `limit > 0` caps the result at that many entries taken from the direction-appropriate end
+    (so `desc` yields the *highest* scores); `limit <= 0` means unlimited. `min > max` is an
+    empty range, not an error.
 - The namespaces of the three data types are independent of each other. Sentinel errors:
   `ErrUnsupported` / `ErrClosed` / `ErrNotInteger` / `ErrInvalidTTL` / `ErrNotFound`.
 
@@ -343,6 +351,7 @@ know them before porting Redis code:
 | `Exists` | accepts multiple keys, returns a count | single key, returns `bool` |
 | `Incr` overflow | always errors | errors on SQL/Redis; **wraps around silently** on mem/bolt/jsonl/leveldb/badger/SSDB (probe via `Caps.IncrWraps`) |
 | ZSet score | IEEE-754 double (fractional values allowed) | `int64`; the Redis backend is lossless only within `\|score\| ≤ 2^53` |
+| `ZRevRangeByScore` args | takes `max, min` (larger first) | `ZRangeByScore` keeps `min <= max` in **both** directions; only `desc` flips the order |
 | List commands | `LPUSH`/`RPUSH`/`LPOP`/`RPOP`/`LLEN`/`LINDEX` | `QPush`/`QPushFront`/`QPop`/`QPopBack`/`QSize`/`QFront`/`QBack` |
 | Sorted-set commands | `ZADD`/`ZSCORE`/`ZREM`/`ZCARD`/`ZINCRBY` | `ZSet`/`ZGet`/`ZDel`/`ZSize`/`ZIncr` (only `ZRank`/`ZRange` keep the Redis names) |
 

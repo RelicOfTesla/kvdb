@@ -380,6 +380,16 @@ func (p *kvOnly) SetEx(ctx context.Context, key string, value []byte, ttl int64)
 	return p.Set(ctx, key, value)
 }
 
+func (p *kvOnly) SetExAt(ctx context.Context, key string, value []byte, at int64) error {
+	if at <= core.NowUnix() {
+		p.mu.Lock()
+		delete(p.m, key)
+		p.mu.Unlock()
+		return nil
+	}
+	return p.Set(ctx, key, value)
+}
+
 func (p *kvOnly) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -455,6 +465,15 @@ func (p *kvOnly) Scan(ctx context.Context, start, end string, limit int) ([]core
 func (p *kvOnly) Expire(ctx context.Context, key string, ttl int64) error {
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
+	}
+	return nil
+}
+
+func (p *kvOnly) ExpireAt(_ context.Context, key string, at int64) error {
+	if at <= core.NowUnix() {
+		p.mu.Lock()
+		delete(p.m, key)
+		p.mu.Unlock()
 	}
 	return nil
 }

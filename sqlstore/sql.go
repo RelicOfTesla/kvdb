@@ -99,6 +99,7 @@ const (
 	kvSetExStmt      = "kvSetEx"
 	kvIncrSeedKey    = "kvIncrSeed"
 	kvIncrSelectKey  = "kvIncrSelect"
+	kvIncrUpdateKey  = "kvIncrUpdate"
 	qSeqEnsureKey    = "qSeqEnsure"
 	qSeqSelectKey    = "qSeqSelect"
 	qItemPopKey      = "qItemPop"
@@ -108,6 +109,17 @@ const (
 	zUpsertKey       = "zUpsert"
 	zIncrUpsertKey   = "zIncrUpsert"
 	zRangeKey        = "zRange"
+	// zRangeByScoreKey / zRangeByScoreDescKey 与 zRangeKey 同理：两个方向的 ORDER BY
+	// 无法用"同一模板 + 后缀"表达（LIMIT 与 ORDER BY 的相对位置在方言间不同），
+	// 故各占一个键、分别整句覆盖。占位符序固定为
+	// {1}=name、{2}=min、{3}=max、{4}=limit；limit<=0 时用无限版语句、无 {4}。
+	// LIMIT 后置（MySQL/SQLite/PG）与 OFFSET/FETCH（MSSQL）分别由默认模板与
+	// StmtOverrides 提供，见 makeStmts 与 MSSQLDialect。
+	zRangeByScoreKey          = "zRangeByScore"
+	zRangeByScoreDescKey      = "zRangeByScoreDesc"
+	zRangeByScoreLimitKey     = "zRangeByScoreLimit"
+	zRangeByScoreDescLimitKey = "zRangeByScoreDescLimit"
+
 	// qRangeKey 与 zRangeKey 同理：LIMIT 后置方言无法用"同一模板 + 后缀"表达，
 	// 故也允许整句覆盖（占位符序同为 {1}=name、{2}=limit、{3}=offset）。
 	qRangeKey = "qRange"
@@ -216,32 +228,38 @@ var (
 	// 二级索引，255 留有充足余量，并给出与 MySQL 相同的写入期校验口径。
 	MSSQLDialect = Dialect{
 		Name: "mssql",
-		Ph:   func(n int) string { return "?" }, // go-mssqldb 以位置 "?" 绑定（内部重写为 @pN）
+		// go-mssqldb 原生占位符是 @pN："sqlserver" 注册名下 processQueryText=false，
+		// 驱动不做 "?" 重写（只有 "mssql" 注册名才重写），因此必须直接命名。
+		// 命名参数可重复引用（build 对重复 {n} 输出同一 @pN），按序号绑定。
+		Ph: func(n int) string { return "@p" + strconv.Itoa(n) },
 		// upsert/行锁/分页无法收敛进"单一冲突子句"，全部走整条语句覆盖（见 StmtOverrides）。
 		Returning: false, // MSSQL 无 UPDATE ... RETURNING，Incr 走事务路径（溢出在 Go 侧显式检查）
 		StmtOverrides: map[string]string{
+			// MERGE 语法要求以分号结束，所有 MERGE 覆盖模板的末行都带 ";"。
 			kvUpsertKey: "MERGE kv_items WITH (HOLDLOCK) AS t " +
 				"USING (VALUES ({1}, {2}, {3})) AS src(k, v, now) ON t.k = src.k " +
 				// 与 MySQL/PG 的 KvUpsertTail 同义：既有行已过期时把 expire_at 归零，
 				// 否则 Set 成功了键仍会被读路径当过期过滤掉。
 				"WHEN MATCHED THEN UPDATE SET v = src.v, " +
 				"expire_at = CASE WHEN t.expire_at > 0 AND t.expire_at <= src.now THEN 0 ELSE t.expire_at END " +
-				"WHEN NOT MATCHED THEN INSERT (k, v, expire_at) VALUES (src.k, src.v, src.now)",
+				"WHEN NOT MATCHED THEN INSERT (k, v, expire_at) VALUES (src.k, src.v, 0);", // 新增行 expire_at 恒为 0（无 TTL），与 INSERT 省略 expire_at 列的方言一致
 			kvSetExStmt: "MERGE kv_items WITH (HOLDLOCK) AS t " +
 				"USING (VALUES ({1}, {2}, {3})) AS src(k, v, expire_at) ON t.k = src.k " +
 				"WHEN MATCHED THEN UPDATE SET v = src.v, expire_at = src.expire_at " +
-				"WHEN NOT MATCHED THEN INSERT (k, v, expire_at) VALUES (src.k, src.v, src.expire_at)",
+				"WHEN NOT MATCHED THEN INSERT (k, v, expire_at) VALUES (src.k, src.v, src.expire_at);",
 			kvIncrSeedKey: "MERGE kv_items WITH (HOLDLOCK) AS t " +
 				// 占位值 '0' 用二进制字面量避免隐式 varchar->varbinary 转换歧义。
 				"USING (VALUES ({1}, CAST(0x30 AS VARBINARY(MAX)))) AS src(k, v) ON t.k = src.k " +
 				// 已存在则原值写回（自赋值是合法 no-op），保证后续 UPDLOCK SELECT 锁到已存在行。
 				"WHEN MATCHED THEN UPDATE SET v = t.v " +
-				"WHEN NOT MATCHED THEN INSERT (k, v) VALUES (src.k, src.v)",
+				"WHEN NOT MATCHED THEN INSERT (k, v) VALUES (src.k, src.v);",
 			kvIncrSelectKey: "SELECT v, expire_at FROM kv_items WITH (UPDLOCK, HOLDLOCK) WHERE k = {1}",
+			// v 列是 varbinary，绑定字符串需显式 CONVERT（MSSQL 不允许 nvarchar -> varbinary 隐式转换）。
+			kvIncrUpdateKey: "UPDATE kv_items SET v = CONVERT(VARBINARY(MAX), {1}), expire_at = {2} WHERE k = {3}",
 			qSeqEnsureKey: "MERGE q_seq WITH (HOLDLOCK) AS t " +
 				"USING (VALUES ({1}, 0, 0)) AS src(q, next, prev) ON t.q = src.q " +
 				"WHEN MATCHED THEN UPDATE SET next = t.next, prev = t.prev " +
-				"WHEN NOT MATCHED THEN INSERT (q, next, prev) VALUES (src.q, 0, 0)",
+				"WHEN NOT MATCHED THEN INSERT (q, next, prev) VALUES (src.q, 0, 0);",
 			qSeqSelectKey: "SELECT next, prev FROM q_seq WITH (UPDLOCK, HOLDLOCK) WHERE q = {1}",
 			qItemPopKey:   "SELECT seq, v FROM q_items WITH (UPDLOCK, HOLDLOCK) WHERE q = {1} ORDER BY seq ASC OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY",
 			qItemPopBackKey: "SELECT seq, v FROM q_items WITH (UPDLOCK, HOLDLOCK) WHERE q = {1} " +
@@ -256,13 +274,27 @@ var (
 			zUpsertKey: "MERGE z_items WITH (HOLDLOCK) AS t " +
 				"USING (VALUES ({1}, {2}, {3})) AS src(z, k, sc) ON t.z = src.z AND t.k = src.k " +
 				"WHEN MATCHED THEN UPDATE SET s = src.sc " +
-				"WHEN NOT MATCHED THEN INSERT (z, k, s) VALUES (src.z, src.k, src.sc)",
+				"WHEN NOT MATCHED THEN INSERT (z, k, s) VALUES (src.z, src.k, src.sc);",
 			zIncrUpsertKey: "MERGE z_items WITH (HOLDLOCK) AS t " +
 				"USING (VALUES ({1}, {2}, {3})) AS src(z, k, delta) ON t.z = src.z AND t.k = src.k " +
 				"WHEN MATCHED THEN UPDATE SET s = t.s + src.delta " +
-				"WHEN NOT MATCHED THEN INSERT (z, k, s) VALUES (src.z, src.k, src.delta)",
+				"WHEN NOT MATCHED THEN INSERT (z, k, s) VALUES (src.z, src.k, src.delta);",
 			zRangeKey: "SELECT k, s FROM z_items WHERE z = {1} ORDER BY s ASC, k ASC " +
 				"OFFSET {3} ROWS FETCH NEXT {2} ROWS ONLY",
+			// ZRangeByScore 两个方向各一条：MSSQL 2012+ 无 LIMIT，取前 n 行只能
+			// 用 OFFSET ... FETCH NEXT。limit<=0（不限）时为 NULL 语义，这里把
+			// OFFSET 写 0、FETCH NEXT 2147483647 —— SQL Server 的 FETCH NEXT
+			// 不接受 NULL，用 INT 上限兜底即"实际不限"（z_items 行数远低于此）。
+			// 注意方向只翻转 s，k 恒为 ASC：同分成员按成员字节序升序，desc 时不翻转。
+			zRangeByScoreKey: "SELECT k, s FROM z_items WHERE z = {1} AND s >= {2} AND s <= {3} " +
+				"ORDER BY s ASC, k ASC OFFSET 0 ROWS FETCH NEXT 2147483647 ROWS ONLY",
+			zRangeByScoreDescKey: "SELECT k, s FROM z_items WHERE z = {1} AND s >= {2} AND s <= {3} " +
+				"ORDER BY s DESC, k ASC OFFSET 0 ROWS FETCH NEXT 2147483647 ROWS ONLY",
+			// 含 limit 的两条（{4} = limit 行数；OFFSET/FETCH 是 MSSQL 唯一的取前 n 行写法）：
+			zRangeByScoreLimitKey: "SELECT k, s FROM z_items WHERE z = {1} AND s >= {2} AND s <= {3} " +
+				"ORDER BY s ASC, k ASC OFFSET 0 ROWS FETCH NEXT {4} ROWS ONLY",
+			zRangeByScoreDescLimitKey: "SELECT k, s FROM z_items WHERE z = {1} AND s >= {2} AND s <= {3} " +
+				"ORDER BY s DESC, k ASC OFFSET 0 ROWS FETCH NEXT {4} ROWS ONLY",
 		},
 		// 键列 VARBINARY(255)：与 MySQL 同一口径（255 字节内索引安全，写入期校验超长）。
 		MaxKeyLen:  255,
@@ -318,7 +350,11 @@ type stmts struct {
 	zRankMember string
 	zRankCount  string
 	zRange      string
-	zIncrSelect string
+	// zRangeByScore 取"按分数闭区间"的结果。limit <= 0 表示不限，此时走
+	// 无 LIMIT 的语句（绝不把 0/负数当 LIMIT 传给 SQL）；desc 只决定用哪条
+	// 整句覆盖（方向只翻转 s，k 恒为 ASC），见 StmtOverrides 的键注释。
+	zRangeByScore func(desc, hasLimit bool) string
+	zIncrSelect   string
 	// zIncrOne 是单语句原子自增 + RETURNING 新分数（方言支持 Returning 时），
 	// 消除"upsert 后另起语句回读"在并发下返回值不对应该次调用的竞态。
 	zIncrOne string
@@ -509,7 +545,7 @@ func makeStmts(d Dialect) stmts {
 		kvIncrSelect: ovr(kvIncrSelectKey, build(d, "SELECT v, expire_at FROM kv_items WHERE k = {1}"+d.ForUpdate)),
 		kvIncrSeed:   ovr(kvIncrSeedKey, build(d, "INSERT INTO kv_items (k, v) VALUES ({1}, '0') "+d.IncrSeedTail)),
 		// expire_at 一并写回：过期键按不存在处理时归零（{2}），未过期时保持原值。
-		kvIncrUpdate: build(d, "UPDATE kv_items SET v = {1}, expire_at = {2} WHERE k = {3}"),
+		kvIncrUpdate: ovr(kvIncrUpdateKey, build(d, "UPDATE kv_items SET v = {1}, expire_at = {2} WHERE k = {3}")),
 		kvIncrOne:    build(d, d.IncrSQL),
 		// 已过期（非 0 且 <= now）的键按不存在处理，不"复活"。
 		kvExpire:  build(d, "UPDATE kv_items SET expire_at = {1} WHERE k = {2} AND (expire_at = 0 OR expire_at > {3})"),
@@ -583,6 +619,24 @@ func makeStmts(d Dialect) stmts {
 		zRankMember: build(d, "SELECT s FROM z_items WHERE z = {1} AND k = {2}"),
 		zRankCount:  build(d, "SELECT COUNT(*) FROM z_items WHERE z = {1} AND (s < {2} OR (s = {3} AND k < {4}))"),
 		zRange:      ovr(zRangeKey, build(d, "SELECT k, s FROM z_items WHERE z = {1} ORDER BY s ASC, k ASC LIMIT {2} OFFSET {3}")),
+		zRangeByScore: func(desc, hasLimit bool) string {
+			// 方向二选一（两个键各自整句覆盖），limit 有无再二选一，共四条语句：
+			// 有 LIMIT 的模板 {4}=limit；不限的模板压根不写 LIMIT 子句，也就
+			// 不会把 0/负数当行数交给 SQL（负 LIMIT 在 SQLite 里是"无上限"、
+			// 在 MySQL/PostgreSQL 里直接报错，语义按基座分叉，必须避免）。
+			// 排序键只在 s 上翻转，k 恒为 ASC：同分成员按成员字节序升序，
+			// desc 时该次序不翻转（Redis 同分行为一致）。
+			ord := "ASC"
+			noLimitKey, limitKey := zRangeByScoreKey, zRangeByScoreLimitKey
+			if desc {
+				ord, noLimitKey, limitKey = "DESC", zRangeByScoreDescKey, zRangeByScoreDescLimitKey
+			}
+			where := "SELECT k, s FROM z_items WHERE z = {1} AND s >= {2} AND s <= {3} "
+			if hasLimit {
+				return ovr(limitKey, build(d, where+"ORDER BY s "+ord+", k ASC LIMIT {4}"))
+			}
+			return ovr(noLimitKey, build(d, where+"ORDER BY s "+ord+", k ASC"))
+		},
 		zIncrSelect: build(d, "SELECT s FROM z_items WHERE z = {1} AND k = {2}"),
 	}
 	if d.Returning {
@@ -868,7 +922,10 @@ func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, er
 	if expired {
 		newExpire = 0
 	}
-	if _, err := tx.ExecContext(ctx, p.st.kvIncrUpdate, strconv.FormatInt(newVal, 10), newExpire, bs(key)); err != nil {
+	// 新值以字节形态绑定：MySQL/PG/SQLite 的 TEXT/BLOB 列都能收 varbinary 形态的
+	// 十进制文本；MSSQL 的 varbinary 列则必须由 Go 侧按二进制绑定（显式
+	// CONVERT(nvarchar->varbinary) 得到的是 UTF-16 编码，会静默写坏计数值）。
+	if _, err := tx.ExecContext(ctx, p.st.kvIncrUpdate, []byte(strconv.FormatInt(newVal, 10)), newExpire, bs(key)); err != nil {
 		return 0, fmt.Errorf("sqlstore: incr update: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -1420,6 +1477,52 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 		var s int64
 		if err := rows.Scan(&k, &s); err != nil {
 			return nil, fmt.Errorf("sqlstore: zrange row: %w", err)
+		}
+		out = append(out, core.ZItem{Key: string(k), Score: s})
+	}
+	return out, rows.Err()
+}
+
+// ZRangeByScore 返回分数落在闭区间 [min, max] 内的成员，按 (s, k) 序。
+//
+// desc 只翻转分数方向，不改参数含义：始终 min <= max，min > max 是空区间。
+// 同分成员恒按成员字节序升序（desc 时也不翻转），与 ZRange 的排序一致。
+// limit <= 0 表示不限，此时语句里根本没有 LIMIT 子句——绝不把 0/负数交给
+// SQL（SQLite 视负 LIMIT 为不限、MySQL/PostgreSQL 直接报错，语义会按方言分叉）。
+func (p *Provider) ZRangeByScore(ctx context.Context, name string, min, max int64, limit int, desc bool) ([]core.ZItem, error) {
+	if err := p.check(); err != nil {
+		return nil, err
+	}
+	// 空区间/倒置区间在读之前就短路：与 QRange 的"绝对不可能有结果"分支一致，
+	// 省一次往返，也避免方言对矛盾 WHERE 的退化执行计划。
+	if min > max {
+		return []core.ZItem{}, nil
+	}
+	hasLimit := limit > 0
+	stmt := p.st.zRangeByScore(desc, hasLimit)
+	args := []any{bs(name), min, max}
+	// 预分配按 1024 封顶，理由与 ZRange/QRange 相同：limit 是调用方入参，
+	// 按"合法但巨大"的值直接分配会被打爆内存（行数由 SQL LIMIT 保证）。
+	prealloc := limit
+	if prealloc > maxZRangePrealloc {
+		prealloc = maxZRangePrealloc
+	}
+	if hasLimit {
+		args = append(args, limit)
+	} else {
+		prealloc = maxZRangePrealloc
+	}
+	rows, err := p.db.QueryContext(ctx, stmt, args...)
+	if err != nil {
+		return nil, fmt.Errorf("sqlstore: zrangebyscore: %w", err)
+	}
+	defer rows.Close()
+	out := make([]core.ZItem, 0, prealloc)
+	for rows.Next() {
+		var k []byte
+		var s int64
+		if err := rows.Scan(&k, &s); err != nil {
+			return nil, fmt.Errorf("sqlstore: zrangebyscore row: %w", err)
 		}
 		out = append(out, core.ZItem{Key: string(k), Score: s})
 	}

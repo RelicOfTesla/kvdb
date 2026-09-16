@@ -2,10 +2,15 @@
 
 **English** | [中文](README_CN.md)
 
-A Go persistence adapter SDK modeled on **Redis command semantics**: it exposes a unified
-**KV + Queue + ZSet** interface, while the underlying pluggable persistence backend
-(in-memory / jsonl / SQL / Redis / SSDB / BoltDB) can be swapped at will, with built-in
+A Go persistence adapter SDK. It exposes a unified **KV + Queue + ZSet** interface over a
+pluggable persistence backend (in-memory / jsonl / SQL / Redis / SSDB / BoltDB), with built-in
 batched writes and byte codec helpers.
+
+Semantics follow the **SSDB/Redis family**, with the command *names* taken from SSDB
+(`qpush`/`qpop`/`zset`…) while KV behavior follows Redis where the two agree. A few points
+differ deliberately from Redis — see [Semantics](#semantics) for the exact list (notably
+`Set` preserving TTL, and `Scan` being a deterministic range query rather than Redis's
+cursor-based `SCAN`).
 
 ```go
 db, _ := kvdb.Open(ctx, "sqlite://./data.db")
@@ -308,6 +313,26 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
   lossless within `|score| ≤ 2^53`.
 - The namespaces of the three data types are independent of each other. Sentinel errors:
   `ErrUnsupported` / `ErrClosed` / `ErrNotInteger` / `ErrInvalidTTL` / `ErrNotFound`.
+
+### Differences from Redis
+
+Command **names** are SSDB's, not Redis's. The following points also differ in behavior —
+know them before porting Redis code:
+
+| Topic | Redis | kvdb |
+|---|---|---|
+| `Set` and TTL | **clears** the TTL (`KEEPTTL` needed to keep it) | **preserves** the TTL (SSDB `set` semantics); the Redis backend uses `SET ... KEEPTTL` internally |
+| `Scan` | cursor-based iteration, unordered, only guarantees full coverage over a finite number of calls | deterministic **byte-ordered closed-interval** range query, ascending, with a limit |
+| `TTL` | `-2` = key missing, `-1` = exists without TTL | both collapse into `ok=false`; the two cases cannot be told apart |
+| `Del` / `Expire` | return how many keys were affected | return only `error` |
+| `Exists` | accepts multiple keys, returns a count | single key, returns `bool` |
+| `Incr` overflow | always errors | errors on SQL/Redis/SSDB; **wraps around silently** on mem/bolt/jsonl (no unified promise) |
+| ZSet score | IEEE-754 double (fractional values allowed) | `int64`; the Redis backend is lossless only within `\|score\| ≤ 2^53` |
+| List commands | `LPUSH`/`RPUSH`/`LPOP`/`RPOP`/`LLEN`/`LINDEX` | `QPush`/`QPushFront`/`QPop`/`QPopBack`/`QSize`/`QFront`/`QBack` |
+| Sorted-set commands | `ZADD`/`ZSCORE`/`ZREM`/`ZCARD`/`ZINCRBY` | `ZSet`/`ZGet`/`ZDel`/`ZSize`/`ZIncr` (only `ZRank`/`ZRange` keep the Redis names) |
+
+`ZRange`'s 0-based inclusive indices, negative indices counting from the end, and the
+`(score, key)` ordering all match Redis exactly.
 
 ### Backend differences (unified externally)
 

@@ -49,7 +49,10 @@ type KeyValue struct {
 // 由适配器 DB.Close 断言调用；也可由业务方自行管理。
 // 三种数据结构的命名空间彼此独立。
 type KvProvider interface {
-	// Set 写入 key 的 value；不改变 key 已存在的 TTL（与 SSDB set / Redis SET 一致）。
+	// Set 写入 key 的 value；**不改变 key 已存在的 TTL**。
+	// 取 SSDB set 语义（set 不动 ttl 表）。注意与 Redis SET **不同**：
+	// Redis SET 默认清除 TTL，需显式 KEEPTTL 才保留（Redis 基座内部即用
+	// KEEPTTL 对齐本语义，见 redis 包）。
 	Set(ctx context.Context, key string, value []byte) error
 	// SetEx 写入 value 并设置 ttl 秒存活（对应 Redis SETEX / SSDB setx，
 	// 覆盖 key 既有 TTL）；ttl<=0 返回 ErrInvalidTTL。
@@ -71,6 +74,10 @@ type KvProvider interface {
 	// Scan 返回 start<=key<=end（字节序闭区间）的前 limit 个键值对；
 	// start/end 为空串表示对应侧不限；limit<=0 按 DefaultScanLimit。
 	// 返回按 key 升序。
+	//
+	// 与 Redis SCAN **无共同点**（仅名字相近）：Redis SCAN 是游标式遍历，
+	// 不保证顺序、只保证有限次遍历内返回全部元素；这里是确定性的闭区间范围
+	// 查询。更接近 SSDB 的 scan（开区间 + limit），本契约统一为闭区间。
 	Scan(ctx context.Context, start, end string, limit int) ([]KeyValue, error)
 	// Expire 设置 key 的存活秒数（ttl>0）；key 不存在时不视为错误
 	// （基座按各自语义对齐：SSDB/Redis 均返回 ok）。
@@ -78,6 +85,9 @@ type KvProvider interface {
 	// TTL 返回 key 剩余秒数与是否"存在有效 TTL"：
 	// ok=false 表示 key 不存在、无 TTL 或已过期（SSDB ttl 对缺失/无 TTL 均返回 -1，
 	// 各基座统一映射为 ok=false）；ok=true 时返回剩余秒数。
+	//
+	// 注意与 Redis TTL **不同**：Redis 用 -2 区分"key 不存在"、-1 区分"存在但无 TTL"，
+	// 本契约把这两种情况都收敛为 ok=false，因此调用方无法再由返回值区分二者。
 	TTL(ctx context.Context, key string) (seconds int64, ok bool, err error)
 }
 

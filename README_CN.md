@@ -2,9 +2,14 @@
 
 [English](README.md) | **中文**
 
-以 **Redis 命令语义为原型**的 Go 持久化适配器 SDK：对外提供统一的
-**KV + Queue + ZSet** 接口，底层可插拔切换不同持久化基座（内存 / jsonl /
-SQL / Redis / SSDB / BoltDB），并内置批量写与字节编解码辅助。
+Go 持久化适配器 SDK：对外提供统一的 **KV + Queue + ZSet** 接口，底层可插拔切换
+不同持久化基座（内存 / jsonl / SQL / Redis / SSDB / BoltDB），并内置批量写与字节
+编解码辅助。
+
+语义以 **SSDB/Redis 家族**为准：命令**命名**取自 SSDB（`qpush`/`qpop`/`zset`…），
+KV 行为在两者一致处对齐 Redis。有若干点**刻意与 Redis 不同**——完整清单见
+[语义要点](#语义要点)（重点：`Set` 保留 TTL，以及 `Scan` 是确定性范围查询而非
+Redis 的游标式 `SCAN`）。
 
 ```go
 db, _ := kvdb.Open(ctx, "sqlite://./data.db")
@@ -294,6 +299,24 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
   `|score| ≤ 2^53` 内无损。
 - 三类数据的命名空间相互独立。哨兵错误：`ErrUnsupported` / `ErrClosed` /
   `ErrNotInteger` / `ErrInvalidTTL` / `ErrNotFound`。
+
+### 与 Redis 的差异
+
+命令**命名**取自 SSDB 而非 Redis。以下行为点也与 Redis 不同——从 Redis 迁移代码前请先了解：
+
+| 主题 | Redis | kvdb |
+|---|---|---|
+| `Set` 与 TTL | **清除** TTL（要保留需 `KEEPTTL`） | **保留** TTL（SSDB `set` 语义）；Redis 基座内部用 `SET ... KEEPTTL` 对齐 |
+| `Scan` | 游标式遍历，无序，只保证有限次遍历内覆盖全部 | 确定性**字节序闭区间**范围查询，升序，带 limit |
+| `TTL` | `-2` 表示 key 不存在、`-1` 表示存在但无 TTL | 两者都收敛为 `ok=false`，无法区分 |
+| `Del` / `Expire` | 返回受影响 key 数 | 只返回 `error` |
+| `Exists` | 可传多 key，返回计数 | 单 key，返回 `bool` |
+| `Incr` 溢出 | 始终报错 | SQL/Redis/SSDB 报错；mem/bolt/jsonl **静默回绕**（契约不统一承诺） |
+| ZSet 分数 | IEEE-754 double（可有小数） | `int64`；Redis 基座在 `\|score\| ≤ 2^53` 内无损 |
+| 列表命令 | `LPUSH`/`RPUSH`/`LPOP`/`RPOP`/`LLEN`/`LINDEX` | `QPush`/`QPushFront`/`QPop`/`QPopBack`/`QSize`/`QFront`/`QBack` |
+| 有序集命令 | `ZADD`/`ZSCORE`/`ZREM`/`ZCARD`/`ZINCRBY` | `ZSet`/`ZGet`/`ZDel`/`ZSize`/`ZIncr`（仅 `ZRank`/`ZRange` 沿用 Redis 名） |
+
+`ZRange` 的 0 起闭区间索引、负索引从末尾数、以及 `(score, key)` 排序均与 Redis 完全一致。
 
 ### 各基座差异（对外已统一）
 

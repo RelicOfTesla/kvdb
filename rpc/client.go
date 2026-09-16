@@ -499,6 +499,11 @@ func (p *Provider) Close() error {
 // BatchComposed 透传底层基座的批内可见性声明。
 func (p *Provider) BatchComposed() bool { return p.caps.BatchComposed }
 
+// IncrWraps 透传底层基座的 Incr 溢出语义（Caps.IncrWraps，CAPS bit4）。
+// 两者与 BatchComposed 一样按标记接口透传：根适配器/业务经类型断言拿到
+// 的一定是"服务端底座的真实语义"，不会因 RPC 这一层被抹平。
+func (p *Provider) IncrWraps() bool { return p.caps.IncrWraps }
+
 // Ping 探活：验证连接与认证仍然有效（不做任何数据操作）。
 func (p *Provider) Ping(ctx context.Context) error {
 	st, payload, err := p.call(ctx, []byte(cmdPing))

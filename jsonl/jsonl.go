@@ -563,6 +563,14 @@ func (p *Provider) appendOps(recs []op) error {
 	return nil
 }
 
+// ---- KV 能力声明 ----
+
+// IncrWraps 能力声明：jsonl 的所有数据操作都委托给内嵌的 mem 基座，Incr
+// 同样按 int64 回绕（不加溢出检查），见 core.IncrWrapsProvider 与 Caps.IncrWraps。
+func (p *Provider) IncrWraps() bool { return true }
+
+var _ core.IncrWrapsProvider = (*Provider)(nil)
+
 // ---- Batch ----
 
 // ApplyBatch 实现 core.BatchProvider：整批写成**一行** batch 记录（一次 Flush，

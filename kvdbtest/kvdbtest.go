@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -53,6 +54,7 @@ func RunWithOptions(t *testing.T, opt Options, factory func(t *testing.T) core.K
 	t.Run("Queue", func(t *testing.T) { TestQueue(t, newDB(t, factory)) })
 	t.Run("ZSet", func(t *testing.T) { TestZSet(t, newDB(t, factory)) })
 	t.Run("Batch", func(t *testing.T) { TestBatch(t, newDB(t, factory)) })
+	t.Run("BatchComposed", func(t *testing.T) { TestBatchComposed(t, newDB(t, factory)) })
 	t.Run("ExpiredWrites", func(t *testing.T) { TestExpiredWrites(t, newDB(t, factory), opt) })
 	t.Run("ReadOwnership", func(t *testing.T) { TestReadOwnership(t, newDB(t, factory)) })
 	t.Run("NamespaceIndependence", func(t *testing.T) { TestNamespaceIndependence(t, newDB(t, factory)) })
@@ -788,5 +790,129 @@ func TestBatch(t *testing.T, db kvdb.DB) {
 	}
 	if ok, _ := db.Exists(ctx, "bk10"); ok {
 		t.Fatal("校验失败时整批不应生效")
+	}
+}
+
+// TestBatchComposed 校验"批内组合结果"的跨基座行为：
+//
+//   - 声明 BatchComposed=true 的基座，组合语义必须是**确定**的：
+//     同批覆盖同一 key、同批同队列按声明顺序入队且序号不撞、
+//     ZSet+ZIncr 同批累加、成员 Set->Del->Set 计数正确；
+//   - 未声明（BatchComposed=false）的基座，契约允许组合终值有差异，
+//     这里只校验不依赖批内可见性的底线：每条 op 至少各生效一次。
+//
+// 该用例与 Capabilities() 联动，正是把"契约照着写、测试逼着对"落到
+// 跨基座层面：此前 leveldb 的批内计数互相覆盖 / 元素丢失就是被这类
+// 序号碰撞漏掉，契约测试补上后自动被所有基座运行。
+func TestBatchComposed(t *testing.T, db kvdb.DB) {
+	caps := db.Capabilities()
+	if !caps.Batch {
+		t.Skip("基座不支持 Batch")
+	}
+	ctx := context.Background()
+	composed := caps.BatchComposed
+
+	// 1. 同批覆盖同一 key
+	if err := db.Batch(ctx, func(b *kvdb.Batch) error {
+		b.Set("bc:over", []byte("first"))
+		b.Set("bc:over", []byte("second"))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	v, ok, err := db.Get(ctx, "bc:over")
+	if err != nil || !ok {
+		t.Fatalf("Get after batch: %v ok=%v err=%v", v, ok, err)
+	}
+	if composed && string(v) != "second" {
+		t.Fatalf("BatchComposed 基座同批覆盖应为\"后者覆盖前者\"，got %q", v)
+	}
+
+	// 2. 同批同队列按声明顺序入队（序号不碰撞是正确性的硬指标，
+	// 任何基座出现同批元素丢失都必须在这里被发现——composed 与否）
+	if err := db.Batch(ctx, func(b *kvdb.Batch) error {
+		b.QPush("bc:q", []byte("a"))
+		b.QPush("bc:q2", []byte("x"))
+		b.QPush("bc:q2", []byte("y"))
+		b.QPush("bc:q2", []byte("z"))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	n, err := db.QSize(ctx, "bc:q2")
+	if err != nil || n != 3 {
+		t.Fatalf("同批同队列 3 条入队后 QSize=%d err=%v（不得丢元素）", n, err)
+	}
+	if composed {
+		var got []byte
+		for i, want := range []string{"x", "y", "z"} {
+			got, ok, err = db.QPop(ctx, "bc:q2")
+			if err != nil || !ok || string(got) != want {
+				t.Fatalf("队列序 #%d: got=%q ok=%v err=%v (want %q)", i, got, ok, err, want)
+			}
+		}
+	}
+
+	// 3. ZSet + ZIncr 同批累加
+	if err := db.Batch(ctx, func(b *kvdb.Batch) error {
+		b.ZSet("bc:z", "m", 10)
+		b.ZIncr("bc:z", "m", 5)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	score, ok, err := db.ZGet(ctx, "bc:z", "m")
+	if err != nil || !ok {
+		t.Fatalf("ZGet: %d ok=%v err=%v", score, ok, err)
+	}
+	if composed && score != 15 {
+		t.Fatalf("BatchComposed 基座 ZSet+ZIncr 应累加 (10+5)，got %d", score)
+	}
+	if !composed && score < 10 {
+		t.Fatalf("非批量可见性基座至少保证成员存在且分数不被前序覆盖变负: %d", score)
+	}
+
+	// 4. 成员 Set -> Del -> Set 在批内不漏计数
+	if err := db.Batch(ctx, func(b *kvdb.Batch) error {
+		b.ZSet("bc:z2", "m", 1)
+		b.ZDel("bc:z2", "m")
+		b.ZSet("bc:z2", "m", 2)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	size, err := db.ZSize(ctx, "bc:z2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// composed 基座最终恰 1 个成员；即便 composed 与否，成员也必须可达、
+	// ZSize 与 ZGet/ZDel 观察一致（计数失真是此前 leveldb 的实际病灶）。
+	if size != 1 {
+		t.Fatalf("Set->Del->Set 后成员数应为 1（计数不得失真）: %d", size)
+	}
+	if s, ok, err := db.ZGet(ctx, "bc:z2", "m"); err != nil || !ok || s != 2 {
+		t.Fatalf("成员分数应可达且为批内末值 2: %d ok=%v err=%v", s, ok, err)
+	}
+
+	// 5. 能力自洽断言：Capabilities().IncrWraps 声明的是真承诺——声明"回绕"
+	//    就必须真的回绕，未声明就不得静默回绕。与 composed 的确定性断言
+	//    同属"能力即承诺"。
+	if caps.IncrWraps {
+		// 回绕型基座：设置 MaxInt64 再加正数必须回绕，不报错。
+		if err := db.Set(ctx, "bc:wrap", []byte("9223372036854775807")); err != nil {
+			t.Fatal(err)
+		}
+		if n, err := db.Incr(ctx, "bc:wrap", 1); err != nil || n != math.MinInt64 {
+			t.Fatalf("IncrWraps 基座应回绕至 MinInt64，got %d err=%v", n, err)
+		}
+	} else {
+		if err := db.Set(ctx, "bc:wrap", []byte("9223372036854775807")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Incr(ctx, "bc:wrap", 1); !errors.Is(err, core.ErrNotInteger) && err == nil {
+			// 报错型基座并不要求必然用该哨兵（远端可能给别的形态），
+			// 只要求**不能**"静默回绕成负数"。
+			t.Fatalf("非回绕基座应报错而非回绕: %v", err)
+		}
 	}
 }

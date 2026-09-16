@@ -27,16 +27,18 @@ import (
 //	tdb := kvdb.Typed(store)                  // store 需满足 kvdb.StoreProvider
 //	u, err := tdb.Get[User](ctx, "user:1")    // = kvdb.D[User](store.Get(ctx, "user:1"))
 //	err = tdb.Set(ctx, "user:1", u)           // = store.Set(ctx, "user:1", kvdb.Enc(u))
-//	n, err := tdb.Get[int64](ctx, "visits")   // 标量走文本编码，与 Incr 互操作
-//	job, err := tdb.QPop[string](ctx, "jobs")
+//	n, ok, err := tdb.Get[int64](ctx, "visits")   // 标量走文本编码，与 Incr 互操作
+//	job, ok, err := tdb.QPop[string](ctx, "jobs")
 //
 // 编码/解码沿用 Enc/Dec/D 的规则与可替换的 Marshal/Unmarshal（见 bytes.go）：
 // 写方向一律 Enc[T]，读方向一律 Dec[T]/D[T]，因此 `T = []byte` 时行为与直接调用
 // 基座方法完全一致（Enc 对 []byte 原样透传，见 bytes.go），不引入额外拷贝语义。
 //
-// 注意：带类型参数的方法（Get/GetOK/MGet/Set/SetEx/QPop/...）会遮蔽内嵌接口的
-// 同名方法，因此 TypedStore 不满足 StoreProvider（签名不同）。这是刻意取舍：
-// 泛型壳给业务用，原始接口由其内嵌字段 StoreProvider 直取。
+// 读方法的签名与 D 一致（返回 (T, bool, error)），不把「缺失」折成错误。
+//
+// 注意：带类型参数的方法（Get/MGet/Set/SetEx/QPop/...）会遮蔽内嵌接口的同名方法，
+// 因此 TypedStore 不满足 StoreProvider（签名不同）。这是刻意取舍：泛型壳给业务用，
+// 原始接口由其内嵌字段 StoreProvider 直取。
 type TypedStore struct {
 	StoreProvider
 }
@@ -64,27 +66,12 @@ func (t TypedStore) SetEx[T any](ctx context.Context, key string, value T, ttl i
 
 // ---- KV：读 ----
 
-// mustExist 把 D 的 (T, ok, err) 收敛为 (T, error)：ok=false 视为 ErrNotFound。
-// 这是"缺失即错误"的形态，供不带 OK 后缀的读方法使用。
-func mustExist[T any](v T, ok bool, err error) (T, error) {
-	if err != nil {
-		return v, err
-	}
-	if !ok {
-		var zero T
-		return zero, ErrNotFound
-	}
-	return v, nil
-}
-
-// Get 读取 key 并解码为 T；key 不存在或已过期返回 ErrNotFound。
-// 需要区分"缺失"与"出错"时用 GetOK。
-func (t TypedStore) Get[T any](ctx context.Context, key string) (T, error) {
-	return mustExist(D[T](t.StoreProvider.Get(ctx, key)))
-}
-
-// GetOK 与 Get 相同，但**保留 ok 原值**：key 不存在时 ok=false 且 err=nil。
-func (t TypedStore) GetOK[T any](ctx context.Context, key string) (T, bool, error) {
+// Get 读取 key 并解码为 T，**签名与 D 一致**：ok=false 表示 key 不存在（含已过期），
+// 此时 err=nil；只有 IO/解析失败才有 err。
+//
+// 这样做是为了不与底层契约打架：取出「缺失」与「出错」的取舍交给调用方，
+// 而不是让这一层把缺失折成 ErrNotFound（想那样做只需自己判 !ok）。
+func (t TypedStore) Get[T any](ctx context.Context, key string) (T, bool, error) {
 	return D[T](t.StoreProvider.Get(ctx, key))
 }
 
@@ -119,44 +106,23 @@ func (t TypedStore) QPushFront[T any](ctx context.Context, name string, value T)
 
 // ---- Queue：读 ----
 
-// QPop 取出并解码队头；队列为空返回 ErrNotFound。
-// 需要区分"空队列"与"出错"时用 QPopOK。
-func (t TypedStore) QPop[T any](ctx context.Context, name string) (T, error) {
-	return mustExist(D[T](t.StoreProvider.QPop(ctx, name)))
-}
-
-// QPopOK 与 QPop 相同，但**保留 ok 原值**：队列为空时 ok=false 且 err=nil。
-func (t TypedStore) QPopOK[T any](ctx context.Context, name string) (T, bool, error) {
+// QPop 取出并解码队头；ok=false 表示队列为空（此时 err=nil）。签名与 D 一致。
+func (t TypedStore) QPop[T any](ctx context.Context, name string) (T, bool, error) {
 	return D[T](t.StoreProvider.QPop(ctx, name))
 }
 
-// QPopBack 取出并解码队尾；队列为空返回 ErrNotFound。
-func (t TypedStore) QPopBack[T any](ctx context.Context, name string) (T, error) {
-	return mustExist(D[T](t.StoreProvider.QPopBack(ctx, name)))
-}
-
-// QPopBackOK 与 QPopBack 相同，但**保留 ok 原值**。
-func (t TypedStore) QPopBackOK[T any](ctx context.Context, name string) (T, bool, error) {
+// QPopBack 取出并解码队尾；ok=false 表示队列为空。签名与 D 一致。
+func (t TypedStore) QPopBack[T any](ctx context.Context, name string) (T, bool, error) {
 	return D[T](t.StoreProvider.QPopBack(ctx, name))
 }
 
-// QFront 只读查看并解码队头；队列为空返回 ErrNotFound。
-func (t TypedStore) QFront[T any](ctx context.Context, name string) (T, error) {
-	return mustExist(D[T](t.StoreProvider.QFront(ctx, name)))
-}
-
-// QFrontOK 与 QFront 相同，但**保留 ok 原值**。
-func (t TypedStore) QFrontOK[T any](ctx context.Context, name string) (T, bool, error) {
+// QFront 只读查看并解码队头；ok=false 表示队列为空。签名与 D 一致。
+func (t TypedStore) QFront[T any](ctx context.Context, name string) (T, bool, error) {
 	return D[T](t.StoreProvider.QFront(ctx, name))
 }
 
-// QBack 只读查看并解码队尾；队列为空返回 ErrNotFound。
-func (t TypedStore) QBack[T any](ctx context.Context, name string) (T, error) {
-	return mustExist(D[T](t.StoreProvider.QBack(ctx, name)))
-}
-
-// QBackOK 与 QBack 相同，但**保留 ok 原值**。
-func (t TypedStore) QBackOK[T any](ctx context.Context, name string) (T, bool, error) {
+// QBack 只读查看并解码队尾；ok=false 表示队列为空。签名与 D 一致。
+func (t TypedStore) QBack[T any](ctx context.Context, name string) (T, bool, error) {
 	return D[T](t.StoreProvider.QBack(ctx, name))
 }
 

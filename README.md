@@ -184,17 +184,17 @@ neither `Batch` nor `Close`:
 
 ```go
 tdb := kvdb.Typed(db)                      // db only needs to satisfy kvdb.StoreProvider
-u, err := tdb.Get[User](ctx, "user:1")     // = kvdb.D[User](db.Get(ctx, "user:1"))
-err = tdb.Set(ctx, "user:1", u)            // = db.Set(ctx, "user:1", kvdb.Enc(u))
-n, err := tdb.Get[int64](ctx, "visits")    // scalars use text encoding, interoperating with Incr
+u, ok, err := tdb.Get[User](ctx, "user:1")  // = kvdb.D[User](db.Get(ctx, "user:1"))
+err = tdb.Set(ctx, "user:1", u)             // = db.Set(ctx, "user:1", kvdb.Enc(u))
+n, ok, err := tdb.Get[int64](ctx, "visits") // scalars use text encoding, interoperating with Incr
 ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 ```
 
 Writes are `Set[T]` / `SetEx[T]` / `QPush[T]` / `QPushFront[T]` (encoded with `Enc[T]`); reads are
 `Get[T]` / `MGet[T]` / `QPop[T]` / `QPopBack[T]` / `QFront[T]` / `QBack[T]` plus the non-generic
-`QRange` (queue elements are raw bytes), decoded with `Dec[T]`/`D[T]`; a missing entry folds to
-`ErrNotFound`, and each read has an `…OK` variant (`GetOK` / `QPopOK` / …) that preserves
-`ok` instead (`ok=false`, `err=nil`). With `T = []byte` it is exactly equivalent to calling the
+`QRange` (queue elements are raw bytes), decoded with `Dec[T]`/`D[T]`. Read methods **keep `D`'s
+signature** — `(T, bool, error)` — so a missing entry is `ok=false` with `err=nil` rather than a
+folded `ErrNotFound`; judge the trade-off where you call it. With `T = []byte` it is exactly equivalent to calling the
 backend directly. `tdb.BatchT(ctx, func(b kvdb.TypedBatch) error {...})` encodes at collection
 time and **one batch may mix types**; `Del`/`Expire`/`ZSet` remain available via the embedded
 `*Batch`. The generic methods shadow same-named ones, so `TypedStore` does **not** satisfy

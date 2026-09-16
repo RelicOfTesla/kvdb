@@ -32,9 +32,9 @@ func TestTypedGet(t *testing.T) {
 	if err := db.Set(ctx, "u:7", kvdb.Enc(want)); err != nil {
 		t.Fatal(err)
 	}
-	got, err := tdb.Get[tUser](ctx, "u:7")
-	if err != nil {
-		t.Fatalf("Get[tUser]: %v", err)
+	got, ok, err := tdb.Get[tUser](ctx, "u:7")
+	if err != nil || !ok {
+		t.Fatalf("Get[tUser]: ok=%v err=%v", ok, err)
 	}
 	if got.ID != want.ID || got.Name != want.Name || len(got.Tags) != 2 {
 		t.Fatalf("结构体不一致: %+v", got)
@@ -44,28 +44,26 @@ func TestTypedGet(t *testing.T) {
 	if _, err := db.Incr(ctx, "visits", 5); err != nil {
 		t.Fatal(err)
 	}
-	n, err := tdb.Get[int64](ctx, "visits")
-	if err != nil || n != 5 {
-		t.Fatalf("Get[int64] = %d, %v", n, err)
+	n, ok, err := tdb.Get[int64](ctx, "visits")
+	if err != nil || !ok || n != 5 {
+		t.Fatalf("Get[int64] = %d,%v,%v", n, ok, err)
 	}
 	if _, err := db.Incr(ctx, "visits", 2); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := tdb.Get[int64](ctx, "visits"); err != nil || n != 7 {
-		t.Fatalf("Incr 后 Get[int64] = %d, %v", n, err)
+	if n, ok, err := tdb.Get[int64](ctx, "visits"); err != nil || !ok || n != 7 {
+		t.Fatalf("Incr 后 Get[int64] = %d,%v,%v", n, ok, err)
 	}
 
-	// 缺失 -> ErrNotFound
-	if _, err := tdb.Get[tUser](ctx, "missing"); !errors.Is(err, core.ErrNotFound) {
-		t.Fatalf("缺失应 ErrNotFound, got %v", err)
+	// 缺失：ok=false 且 err=nil（与 D 一致，不折成 ErrNotFound）
+	if v, ok, err := tdb.Get[tUser](ctx, "missing"); err != nil || ok || v.ID != 0 {
+		t.Fatalf("缺失应为零值,false,nil，got %+v,%v,%v", v, ok, err)
 	}
-
-	// GetOK 保留 ok 语义
-	if v, ok, err := tdb.GetOK[string](ctx, "missing"); err != nil || ok || v != "" {
-		t.Fatalf("GetOK 缺失 = %q,%v,%v", v, ok, err)
+	if v, ok, err := tdb.Get[string](ctx, "missing"); err != nil || ok || v != "" {
+		t.Fatalf("缺失(string) = %q,%v,%v", v, ok, err)
 	}
-	if v, ok, err := tdb.GetOK[int64](ctx, "visits"); err != nil || !ok || v != 7 {
-		t.Fatalf("GetOK = %d,%v,%v", v, ok, err)
+	if v, ok, err := tdb.Get[int64](ctx, "visits"); err != nil || !ok || v != 7 {
+		t.Fatalf("Get = %d,%v,%v", v, ok, err)
 	}
 
 	// MGet 批量解码（结构体 + 标量混合场景）
@@ -94,8 +92,8 @@ func TestTypedSet(t *testing.T) {
 	if v, ok, _ := db.Get(ctx, "u:7"); !ok || string(v) != string(kvdb.Enc(u)) {
 		t.Fatalf("Set 编码应等于 Enc[tUser]")
 	}
-	if got, err := tdb.Get[tUser](ctx, "u:7"); err != nil || got.Name != "alice" {
-		t.Fatalf("回读 = %+v, %v", got, err)
+	if got, ok, err := tdb.Get[tUser](ctx, "u:7"); err != nil || !ok || got.Name != "alice" {
+		t.Fatalf("回读 = %+v,%v,%v", got, ok, err)
 	}
 
 	// 标量：与 Incr 互操作（文本编码）
@@ -105,8 +103,8 @@ func TestTypedSet(t *testing.T) {
 	if n, err := db.Incr(ctx, "cnt", 1); err != nil || n != 42 {
 		t.Fatalf("Set(int64) 后 Incr = %d, %v", n, err)
 	}
-	if n, err := tdb.Get[int64](ctx, "cnt"); err != nil || n != 42 {
-		t.Fatalf("Get[int64] = %d, %v", n, err)
+	if n, ok, err := tdb.Get[int64](ctx, "cnt"); err != nil || !ok || n != 42 {
+		t.Fatalf("Get[int64] = %d,%v,%v", n, ok, err)
 	}
 
 	// SetEx 走基座的 SetEx（桩的 fakeKV.SetEx 不实现 TTL，只验证调用被正确透传；
@@ -179,27 +177,27 @@ func TestTypedQueue(t *testing.T) {
 	}
 
 	// 队头应为 QPushFront 的 j2
-	if got, err := tdb.QFront[tUser](ctx, "jobs"); err != nil || got.Name != "job-2" {
-		t.Fatalf("QFront = %+v, %v", got, err)
+	if got, ok, err := tdb.QFront[tUser](ctx, "jobs"); err != nil || !ok || got.Name != "job-2" {
+		t.Fatalf("QFront = %+v,%v,%v", got, ok, err)
 	}
-	if got, err := tdb.QBack[tUser](ctx, "jobs"); err != nil || got.Name != "job-1" {
-		t.Fatalf("QBack = %+v, %v", got, err)
+	if got, ok, err := tdb.QBack[tUser](ctx, "jobs"); err != nil || !ok || got.Name != "job-1" {
+		t.Fatalf("QBack = %+v,%v,%v", got, ok, err)
 	}
-	if got, err := tdb.QPop[tUser](ctx, "jobs"); err != nil || got.ID != 2 {
-		t.Fatalf("QPop = %+v, %v", got, err)
+	if got, ok, err := tdb.QPop[tUser](ctx, "jobs"); err != nil || !ok || got.ID != 2 {
+		t.Fatalf("QPop = %+v,%v,%v", got, ok, err)
 	}
-	if got, err := tdb.QPopBack[tUser](ctx, "jobs"); err != nil || got.ID != 1 {
-		t.Fatalf("QPopBack = %+v, %v", got, err)
+	if got, ok, err := tdb.QPopBack[tUser](ctx, "jobs"); err != nil || !ok || got.ID != 1 {
+		t.Fatalf("QPopBack = %+v,%v,%v", got, ok, err)
 	}
-	// 空队列 -> ErrNotFound（不带 OK 后缀的形态把"空"折算为错误）
-	if _, err := tdb.QPop[tUser](ctx, "jobs"); !errors.Is(err, core.ErrNotFound) {
-		t.Fatalf("空队列应 ErrNotFound, got %v", err)
+	// 空队列 -> ok=false 且 err=nil（与 D 一致，不再折算为 ErrNotFound）
+	if _, ok, err := tdb.QPop[tUser](ctx, "jobs"); err != nil || ok {
+		t.Fatalf("空队列应 ok=false 且无错, got ok=%v err=%v", ok, err)
 	}
 }
 
 // TestTypedOKVariants 验证 *OK 系列**保留 ok 原值**：空/缺失时 ok=false 且 err=nil，
 // 与不带 OK 后缀的形态（把"空"折算为 ErrNotFound）区分开。
-func TestTypedOKVariants(t *testing.T) {
+func TestTypedReadSignature(t *testing.T) {
 	ctx := context.Background()
 	db, err := kvdb.Open(ctx, "stub://")
 	if err != nil {
@@ -208,23 +206,20 @@ func TestTypedOKVariants(t *testing.T) {
 	defer db.Close()
 	tdb := kvdb.Typed(db)
 
-	// 缺失 key：Get 报 ErrNotFound，GetOK 给 ok=false + err=nil
-	if _, err := tdb.Get[string](ctx, "missing"); !errors.Is(err, core.ErrNotFound) {
-		t.Fatalf("Get 缺失应 ErrNotFound, got %v", err)
-	}
-	if v, ok, err := tdb.GetOK[string](ctx, "missing"); err != nil || ok || v != "" {
-		t.Fatalf("GetOK 缺失应为 \"\",false,nil，got %q,%v,%v", v, ok, err)
+	// 读方法的签名与 D 一致：缺失/空队列给 ok=false + err=nil，不折成 ErrNotFound
+	if v, ok, err := tdb.Get[string](ctx, "missing"); err != nil || ok || v != "" {
+		t.Fatalf("Get 缺失应为 \"\",false,nil，got %q,%v,%v", v, ok, err)
 	}
 
-	// 空队列：四个读方法都有 OK 变体
+	// 四个队列读方法同签名
 	for _, tc := range []struct {
 		name string
 		call func() (string, bool, error)
 	}{
-		{"QPopOK", func() (string, bool, error) { return tdb.QPopOK[string](ctx, "empty") }},
-		{"QPopBackOK", func() (string, bool, error) { return tdb.QPopBackOK[string](ctx, "empty") }},
-		{"QFrontOK", func() (string, bool, error) { return tdb.QFrontOK[string](ctx, "empty") }},
-		{"QBackOK", func() (string, bool, error) { return tdb.QBackOK[string](ctx, "empty") }},
+		{"QPop", func() (string, bool, error) { return tdb.QPop[string](ctx, "empty") }},
+		{"QPopBack", func() (string, bool, error) { return tdb.QPopBack[string](ctx, "empty") }},
+		{"QFront", func() (string, bool, error) { return tdb.QFront[string](ctx, "empty") }},
+		{"QBack", func() (string, bool, error) { return tdb.QBack[string](ctx, "empty") }},
 	} {
 		v, ok, err := tc.call()
 		if err != nil || ok || v != "" {
@@ -232,15 +227,22 @@ func TestTypedOKVariants(t *testing.T) {
 		}
 	}
 
-	// 有值时 OK 变体正常返回 ok=true
+	// 有值时正常返回 ok=true
 	if err := tdb.QPush(ctx, "jobs", "job-1"); err != nil {
 		t.Fatal(err)
 	}
-	if v, ok, err := tdb.QFrontOK[string](ctx, "jobs"); err != nil || !ok || v != "job-1" {
-		t.Fatalf("QFrontOK 有值 = %q,%v,%v", v, ok, err)
+	if v, ok, err := tdb.QFront[string](ctx, "jobs"); err != nil || !ok || v != "job-1" {
+		t.Fatalf("QFront 有值 = %q,%v,%v", v, ok, err)
 	}
-	if v, ok, err := tdb.QPopOK[string](ctx, "jobs"); err != nil || !ok || v != "job-1" {
-		t.Fatalf("QPopOK 有值 = %q,%v,%v", v, ok, err)
+	if v, ok, err := tdb.QPop[string](ctx, "jobs"); err != nil || !ok || v != "job-1" {
+		t.Fatalf("QPop 有值 = %q,%v,%v", v, ok, err)
+	}
+	// 解析错误仍须上报为 err（不是 ok=false）
+	if err := db.Set(ctx, "bad", []byte("not-an-int")); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := tdb.Get[int64](ctx, "bad"); err == nil || ok {
+		t.Fatalf("非整数应报 err 且 ok=false，got ok=%v err=%v", ok, err)
 	}
 }
 
@@ -276,16 +278,17 @@ func TestTypedBatch(t *testing.T) {
 		key  string
 		want string
 	}{{"u:1", "a"}, {"u:2", "b"}, {"u:3", "c"}} {
-		got, err := tdb.Get[tUser](ctx, tc.key)
+		got, ok, err := tdb.Get[tUser](ctx, tc.key)
+		_ = ok
 		if err != nil || got.Name != tc.want {
 			t.Fatalf("批内 %s = %+v, %v", tc.key, got, err)
 		}
 	}
-	if got, err := tdb.QPop[tUser](ctx, "jobs"); err != nil || got.ID != 4 {
-		t.Fatalf("批内 QPush 后 QPop = %+v, %v", got, err)
+	if got, ok, err := tdb.QPop[tUser](ctx, "jobs"); err != nil || !ok || got.ID != 4 {
+		t.Fatalf("批内 QPush 后 QPop = %+v,%v,%v", got, ok, err)
 	}
-	if n, err := tdb.Get[int](ctx, "cnt"); err != nil || n != 42 {
-		t.Fatalf("批内混装的 int = %d, %v", n, err)
+	if n, ok, err := tdb.Get[int](ctx, "cnt"); err != nil || !ok || n != 42 {
+		t.Fatalf("批内混装的 int = %d,%v,%v", n, ok, err)
 	}
 }
 
@@ -321,14 +324,14 @@ func TestTypedAcceptsStoreProvider(t *testing.T) {
 	if err := tdb.Set(ctx, "k", 42); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	if n, err := tdb.Get[int](ctx, "k"); err != nil || n != 42 {
-		t.Fatalf("Get = %d, %v", n, err)
+	if n, ok, err := tdb.Get[int](ctx, "k"); err != nil || !ok || n != 42 {
+		t.Fatalf("Get = %d,%v,%v", n, ok, err)
 	}
 	if err := tdb.QPush(ctx, "q", "job"); err != nil {
 		t.Fatalf("QPush: %v", err)
 	}
-	if v, err := tdb.QPop[string](ctx, "q"); err != nil || v != "job" {
-		t.Fatalf("QPop = %q, %v", v, err)
+	if v, ok, err := tdb.QPop[string](ctx, "q"); err != nil || !ok || v != "job" {
+		t.Fatalf("QPop = %q,%v,%v", v, ok, err)
 	}
 	if err := tdb.ZSet(ctx, "z", "m", 1); err != nil {
 		t.Fatalf("ZSet: %v", err)

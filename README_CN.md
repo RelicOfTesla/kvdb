@@ -176,16 +176,17 @@ gob）；标量路径不受影响。`Enc` 编码失败会 panic——需要处�
 
 ```go
 tdb := kvdb.Typed(db)                      // db 只需满足 kvdb.StoreProvider
-u, err := tdb.Get[User](ctx, "user:1")     // = kvdb.D[User](db.Get(ctx, "user:1"))
-err = tdb.Set(ctx, "user:1", u)            // = db.Set(ctx, "user:1", kvdb.Enc(u))
-n, err := tdb.Get[int64](ctx, "visits")    // 标量走文本编码，与 Incr 互操作
+u, ok, err := tdb.Get[User](ctx, "user:1")  // = kvdb.D[User](db.Get(ctx, "user:1"))
+err = tdb.Set(ctx, "user:1", u)             // = db.Set(ctx, "user:1", kvdb.Enc(u))
+n, ok, err := tdb.Get[int64](ctx, "visits") // 标量走文本编码，与 Incr 互操作
 ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 ```
 
 写为 `Set[T]` / `SetEx[T]` / `QPush[T]` / `QPushFront[T]`（`Enc[T]` 编码）；读为
 `Get[T]` / `MGet[T]` / `QPop[T]` / `QPopBack[T]` / `QFront[T]` / `QBack[T]`，另有非泛型的
-`QRange`（队列元素本身就是原始字节），解码用 `Dec[T]`/`D[T]`；缺失折算为 `ErrNotFound`，
-每个读方法都有 `…OK` 变体（`GetOK` / `QPopOK` / …）**保留 `ok`**（`ok=false`、`err=nil`）。
+`QRange`（队列元素本身就是原始字节），解码用 `Dec[T]`/`D[T]`。读方法**沿用 `D` 的签名**——
+`(T, bool, error)`——故缺失是 `ok=false` 且 `err=nil`，而不是折算成 `ErrNotFound`；
+要"缺失即错误"由调用处自行判断。
 `T = []byte` 时与直接调用基座完全等价。`tdb.BatchT(ctx, func(b kvdb.TypedBatch) error {...})`
 在收集时编码，**同一批可混装多种类型**；`Del`/`Expire`/`ZSet` 经内嵌 `*Batch` 仍可用。
 泛型方法会遮蔽同名方法，故 `TypedStore` **不满足** `StoreProvider`（用 `tdb.StoreProvider`）。

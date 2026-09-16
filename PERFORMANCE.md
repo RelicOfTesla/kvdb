@@ -6,7 +6,7 @@ Measured throughput, cost model, and selection guidance for each `kvdb` backend.
 
 > The numbers are relative magnitudes from a single-machine container environment and are
 > **not promises**; absolute values depend heavily on CPU, storage medium, network, and
-> container configuration. Reproduction commands are in §7.
+> container configuration. Reproduction commands are in §6.
 
 ## 1. Scope and method
 
@@ -41,7 +41,8 @@ relative comparisons between backends.
 Bare `write(16B)+fsync` reference values (to explain the causes, not throughput): tmpfs
 2–4 µs, ext4 (vhdx) ~2.5 ms, drvfs (9p) 3.8–5.5 ms. **The "ordinary disk" in this
 environment is a WSL vhdx; one fsync takes about 2.5 ms, only about 1.5× faster than 9p, so
-it does not belong to the fast tier.**
+it does not belong to the fast tier.** Note also that this repository itself lives on a drvfs
+(9p) mount of `G:\`; measure ext4 on a WSL root disk such as `~/test/tmp`.
 
 ### 1.1 Durability modes (embedded backends now share one `sync` switch)
 
@@ -218,13 +219,10 @@ combinations are filled in here)
 | sqlite | ext4 `sync=1` | ~74k | ~409 | 121% |
 | sqlite | 9p | ~19k | ~85 | 193% |
 
-**Two conclusions from the read matrix**:
-
-- **tmpfs is unsuitable for measuring fsync cost**: fsync on tmpfs is a no-op and flattens the
-  cost of the durable mode (in the same scenario tmpfs differs by only 13%, while real ext4
-  differs by 570×). tmpfs data is only for relative comparisons between backends.
-- **The 9p mode generally has a larger benefit** (batch writes 68–84×): even flush has to go
-  through a protocol round trip, so a single write is dominated by round-trip cost.
+**One conclusion from the read matrix**: **the 9p mode generally has a larger batch-write
+benefit** (68–84×) — even flush has to go through a protocol round trip, so a single write is
+dominated by round-trip cost. (Why tmpfs numbers must not be used for fsync conclusions is in
+§1; it is not repeated here.)
 
 ### 2.4 Mixed read/write: are readers blocked by writers?
 
@@ -283,23 +281,7 @@ Collapsing 3 statements into 1 gains about +3%; relaxing the durability level ga
 PostgreSQL behaves the same way (490 → 1280 op/s with `synchronous_commit=off`).
 **Deployment-side parameters and batch writes are two independent levers.**
 
-## 4. Implemented optimizations
-
-| Item | Effect |
-|---|---|
-| SQLite / PG `Incr` uses a single-statement `upsert + RETURNING` (missing counts as 0, atomic accumulation, error on non-integer) | Replaces the multi-statement transaction path; MySQL has no `RETURNING` and keeps the transaction path |
-| MySQL key column uses `VARBINARY(255)` | Compatible with the 5.6 default index prefix limit |
-| SQLite in-process write serialization + WAL | Writes queue instead of `SQLITE_BUSY`, and reads can still run in parallel |
-| SSDB connection pool | A single connection is serial request-response; only with pooling does concurrency become truly parallel |
-| LevelDB routes all multi-key writes into a single `Write(batch)` | Value+TTL, zset two-sided index, and queue element+counter are each atomic; in-batch counters/scores are composed via per-batch pending state, giving read-your-writes (`BatchComposed=true`) |
-| Badger routes multi-key writes into a single `db.Update` transaction | Same as above, plus in-batch read-your-writes (`BatchComposed=true`) |
-| Badger same-key read-modify-write is serialized up front with a shard lock | Avoids an SSI conflict retry storm; conflict retry is only a fallback |
-
-Approaches not adopted: the CGO SQLite driver — measured on real storage, pure Go and CGO
-throughput are essentially identical (the bottleneck is per-transaction durability, not driver
-implementation), so a CGO dependency is not introduced.
-
-## 5. Choosing a backend
+## 4. Choosing a backend
 
 - **Embedded + point lookups dominant**: `bolt` (mmap/B+tree reads are extremely fast, and one
   transaction per write means the batch-write benefit holds on any medium).
@@ -324,7 +306,7 @@ implementation), so a CGO dependency is not introduced.
   tmpfs, 54–193% on 9p); server backends do not block reads and writes against each other
   (each retains 44–63%).
 
-## 6. Known trade-offs
+## 5. Known trade-offs
 
 | Item | Notes |
 |---|---|
@@ -333,10 +315,8 @@ implementation), so a CGO dependency is not introduced.
 | Redis in-batch visibility | Not guaranteed (see README "Batch writes" and `Capabilities().BatchComposed`) |
 | Badger reads coupled to the commit window | With `?sync=1` a commit takes 1.3–3 ms and mixed-read retention is only 0.2–0.4%; **the default mode (no fsync) has eliminated this phenomenon** (read retention back to ~28%) |
 | Durability cost of the default mode | Embedded backends do not fsync per operation by default: a process crash or power loss may lose the most recent acknowledged writes. Power-loss safety requires an explicit `?sync=1` (cost in the `sync=1` table in §2: 56–570× slower) |
-| Medium annotation | This repository lives on a drvfs (9p) mount of `G:\`, which is **not** an ordinary disk; testing ext4 requires a WSL root disk (e.g. `~/test/tmp`) |
-| tmpfs data must not be used for fsync conclusions | fsync on tmpfs is a no-op, so the cost of `sync=1` is completely flattened (measured only 13% slower, versus 570× slower on real ext4) |
 
-## 7. Reproducing
+## 6. Reproducing
 
 ```bash
 cd example/bench   # standalone module; changing the directory changes the medium
@@ -378,7 +358,5 @@ There are also **sequential-call** benchmarks such as `BenchmarkSet`/`Get`/`Incr
 used only to investigate the inherent cost of a single call and for regression comparison;
 all throughput conclusions are based on the measured data in this section.
 
-Note: this repository lives on a drvfs (9p) mount of `G:\`, which is not an ordinary disk;
-testing ext4 requires a WSL root disk (e.g. `~/test/tmp`, i.e. `/dev/sdd`). Docker container
-data disks are on ext4 (vhdx), so the server-backend numbers can be read as analogous to the
-"file backends @ ext4" tier.
+Docker container data disks sit on ext4 (vhdx), so the server-backend numbers can be read as
+analogous to the "file backends @ ext4" tier. (Medium caveats for this environment are in §1.)

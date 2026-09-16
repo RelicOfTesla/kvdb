@@ -35,7 +35,7 @@ import (
 // 写方向一律 Enc[T]，读方向一律 Dec[T]/D[T]，因此 `T = []byte` 时行为与直接调用
 // 基座方法完全一致（Enc 对 []byte 原样透传，见 bytes.go），不引入额外拷贝语义。
 //
-// 读方法的签名与 D 一致（返回 (T, bool, error)），不把「缺失」折成错误。
+// 读方法的签名与 D 一致：返回 (T, bool, error)，缺失时 ok=false 且 err=nil。
 //
 // 覆盖范围：**凡值语义为 []byte 的契约方法都有对应的 T 版本**（Set/SetEx/SetExAt/Get/
 // MGet/QPush/QPushFront/QPop/QPopBack/QFront/QBack/QRange）。不携带值的方法
@@ -77,11 +77,9 @@ func (t TypedStore) SetExAt[T any](ctx context.Context, key string, value T, at 
 
 // ---- KV：读 ----
 
-// Get 读取 key 并解码为 T，**签名与 D 一致**：ok=false 表示 key 不存在（含已过期），
-// 此时 err=nil；只有 IO/解析失败才有 err。
-//
-// 这样做是为了不与底层契约打架：取出「缺失」与「出错」的取舍交给调用方，
-// 而不是让这一层把缺失折成 ErrNotFound（想那样做只需自己判 !ok）。
+// Get 读取 key 并解码为 T，签名与 D 一致：ok=false 表示 key 不存在（含已过期），此时
+// err=nil；只有 IO/解析失败才有 err。「缺失」与「出错」的取舍因此留在调用方
+// （判 !ok 即可）。
 func (t TypedStore) Get[T any](ctx context.Context, key string) (T, bool, error) {
 	return D[T](t.StoreProvider.Get(ctx, key))
 }

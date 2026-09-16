@@ -173,10 +173,8 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 读为 `Get[T]` / `MGet[T]` / `QPop[T]` / `QPopBack[T]` / `QFront[T]` / `QBack[T]` / `QRange[T]`，
 解码用 `Dec[T]`/`D[T]`。**凡值语义为 `[]byte` 的契约方法都有对应的 `T` 版本**；不携带值的
 方法（`Del`/`Exists`/`Incr`/`Scan`/`TTL`/`QSize`/ZSet 各方法…）仍经内嵌 `StoreProvider` 直取，
-不带类型参数。读方法**沿用 `D` 的签名**——
-`(T, bool, error)`——故缺失是 `ok=false` 且 `err=nil`，而不是折算成 `ErrNotFound`；
-要"缺失即错误"由调用处自行判断。
-`T = []byte` 时与直接调用基座完全等价。`tdb.BatchT(ctx, func(b kvdb.TypedBatch) error {...})`
+不带类型参数。读方法采用 `D` 的签名——`(T, bool, error)`——缺失时
+`ok=false` 且 `err=nil`。`T = []byte` 时与直接调用基座完全等价。`tdb.BatchT(ctx, func(b kvdb.TypedBatch) error {...})`
 在收集时编码，**同一批可混装多种类型**；`Del`/`Expire`/`ZSet` 经内嵌 `*Batch` 仍可用。
 泛型方法会遮蔽同名方法，故 `TypedStore` **不满足** `StoreProvider`（用 `tdb.StoreProvider`）。
 由 `//go:build go1.27` 门禁。

@@ -285,7 +285,7 @@ func TestKV(t *testing.T, db kvdb.DB) {
 	}
 
 	// Scan × limit：start 键存在且区间内键数 > limit 时，必须返回闭区间的
-	// **前 limit 个**（含 start 键本身）——回归 ssdb 基座此前"满页丢 start"的分歧。
+	// **前 limit 个**（含 start 键本身）。
 	for _, k := range []string{"sl2", "sl3", "sl4", "sl5", "sl6"} {
 		if err := db.Set(ctx, k, []byte(k)); err != nil {
 			t.Fatal(err)

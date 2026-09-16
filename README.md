@@ -180,10 +180,9 @@ Writes are `Set[T]` / `SetEx[T]` / `SetExAt[T]` / `QPush[T]` / `QPushFront[T]` (
 `Enc[T]`); reads are `Get[T]` / `MGet[T]` / `QPop[T]` / `QPopBack[T]` / `QFront[T]` / `QBack[T]` /
 `QRange[T]`, decoded with `Dec[T]`/`D[T]`. Every `[]byte`-valued contract method has a `T`
 counterpart; methods that carry no value (`Del`/`Exists`/`Incr`/`Scan`/`TTL`/`QSize`/ZSet…) stay on
-the embedded `StoreProvider` and take no type parameter. Read methods **keep `D`'s
-signature** — `(T, bool, error)` — so a missing entry is `ok=false` with `err=nil` rather than a
-folded `ErrNotFound`; judge the trade-off where you call it. With `T = []byte` it is exactly equivalent to calling the
-backend directly. `tdb.BatchT(ctx, func(b kvdb.TypedBatch) error {...})` encodes at collection
+the embedded `StoreProvider` and take no type parameter. Read methods take `D`'s
+signature — `(T, bool, error)` — so a missing entry is `ok=false` with `err=nil`. With
+`T = []byte` it is exactly equivalent to calling the backend directly. `tdb.BatchT(ctx, func(b kvdb.TypedBatch) error {...})` encodes at collection
 time and **one batch may mix types**; `Del`/`Expire`/`ZSet` remain available via the embedded
 `*Batch`. The generic methods shadow same-named ones, so `TypedStore` does **not** satisfy
 `StoreProvider` (use `tdb.StoreProvider`). Gated by `//go:build go1.27`.

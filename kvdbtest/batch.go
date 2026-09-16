@@ -87,8 +87,8 @@ func TestBatch(t *testing.T, db kvdb.DB) {
 		t.Fatalf("bk1 批内 Expire = %d,%v", secs, has)
 	}
 
-	// 批内 Set 不得清掉既有 TTL（契约：Set 不改变已存在键的 TTL）。
-	// 回归 redis 基座此前批内用裸 SET 清 TTL 的分歧。
+	// 批内 Set 不清掉既有 TTL（契约：Set 不改变已存在键的 TTL）——这条对
+	// 批内的 Set 同样成立，不只是单条 Set。
 	if err := db.SetEx(ctx, "bkttl", []byte("v"), 30); err != nil {
 		t.Fatal(err)
 	}
@@ -170,20 +170,8 @@ func TestBatch(t *testing.T, db kvdb.DB) {
 //   - 未声明（BatchComposed=false）的基座，契约允许组合终值有差异，
 //     这里只校验不依赖批内可见性的底线：每条 op 至少各生效一次。
 //
-// 该用例与 Capabilities() 联动，正是把"契约照着写、测试逼着对"落到
-// 跨基座层面：此前 leveldb 的批内计数互相覆盖 / 元素丢失就是被这类
-
-// TestBatchComposed 校验"批内组合结果"的跨基座行为：
-//
-//   - 声明 BatchComposed=true 的基座，组合语义必须是**确定**的：
-//     同批覆盖同一 key、同批同队列按声明顺序入队且序号不撞、
-//     ZSet+ZIncr 同批累加、成员 Set->Del->Set 计数正确；
-//   - 未声明（BatchComposed=false）的基座，契约允许组合终值有差异，
-//     这里只校验不依赖批内可见性的底线：每条 op 至少各生效一次。
-//
-// 该用例与 Capabilities() 联动，正是把"契约照着写、测试逼着对"落到
-// 跨基座层面：此前 leveldb 的批内计数互相覆盖 / 元素丢失就是被这类
-// 序号碰撞漏掉，契约测试补上后自动被所有基座运行。
+// 该用例与 Capabilities() 联动，把"契约照着写、测试逼着对"落到跨基座层面：
+// 批内计数互相覆盖、元素丢失、序号碰撞这类问题，只能靠逐个基座跑同一套断言发现。
 func TestBatchComposed(t *testing.T, db kvdb.DB) {
 	caps := db.Capabilities()
 	if !caps.Batch {
@@ -265,8 +253,8 @@ func TestBatchComposed(t *testing.T, db kvdb.DB) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// composed 基座最终恰 1 个成员；即便 composed 与否，成员也必须可达、
-	// ZSize 与 ZGet/ZDel 观察一致（计数失真是此前 leveldb 的实际病灶）。
+	// composed 基座最终恰 1 个成员；无论 composed 与否，成员都必须可达，且
+	// ZSize 与 ZGet/ZDel 的观察结果一致（计数一旦失真，三者就会互相矛盾）。
 	if size != 1 {
 		t.Fatalf("Set->Del->Set 后成员数应为 1（计数不得失真）: %d", size)
 	}

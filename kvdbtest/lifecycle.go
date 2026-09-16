@@ -157,11 +157,10 @@ func TestEmptyName(t *testing.T, db kvdb.DB) {
 	ctx := context.Background()
 	caps := db.Capabilities()
 
-	// 契约（core.ErrInvalidKey）把空 key/空名字定义为**非法**，且要求
-	// **读写一致拒绝**。此前契约沉默：ssdb 只在写路径拒绝（真实 SSDB 对空 key
-	// 返回 ok 却静默丢弃写入），bolt 由 bbolt 的 ErrKeyRequired 顺带拒绝，
-	// 其余基座两种都接受——于是出现"写不进去却读得到"这类自相矛盾。
-	// 现在统一在适配层校验，这里逐个断言，任何基座漏掉都会立刻暴露。
+	// 契约（core.ErrInvalidKey）把空 key/空名字定义为**非法**，且要求**读写一致
+	// 拒绝**：只拒写不拒读会留下"写不进去却读得到"的自相矛盾。
+	// 校验由各基座在实现里经 core.CheckKey 完成（不在 DB 适配层），因此这里逐个
+	// 断言读写两侧，任何基座漏掉都会立刻暴露。
 	wantErr := func(what string, err error) {
 		t.Helper()
 		if !errors.Is(err, core.ErrInvalidKey) {

@@ -28,11 +28,10 @@ var (
 	ErrNotFound = errors.New("kvdb: key not found")
 	// ErrInvalidKey 表示 key/队列名/zset 名为空串。
 	//
-	// 契约把空 key 定义为**非法**，且**读写一致地拒绝**：若只拒写不拒读，就会出现
-	// "写不进去却读得到"（或反过来）的自相矛盾状态，调用方无从判断。此前仅 ssdb
-	// 基座在写路径上拒绝（真实 SSDB 对空 key 返回 ok 但静默丢弃写入），
-	// 其余基座两种都接受——现统一为拒绝。
-	// 空串不在删除集合（无 TTL/无成员）语义内，因此不会与 ErrNotFound 混淆。
+	// 契约把空 key 定义为**非法**，且读写路径**一致拒绝**：只拒写不拒读会留下
+	// "写不进去却读得到"的自相矛盾状态，调用方无从判断。各基座在实现里显式调用
+	// core.CheckKey（见 helper.go），故绕过 DB 适配层直接用 Provider 时同样成立。
+	// 空串不在"删除集合（无 TTL/无成员）"的语义内，因此不会与 ErrNotFound 混淆。
 	ErrInvalidKey = errors.New("kvdb: key must not be empty")
 )
 
@@ -241,8 +240,8 @@ type QueueProvider interface {
 	// QRange 只读返回 [start, stop] 索引区间内的元素，方向为**队头 → 队尾**，
 	// 索引 0 起、闭区间；负索引从末尾数（-1 为最后一个），与 ZRange 完全对称。
 	//
-	// 它补上了队列"按位置读"的能力：此前只能看两端（QFront/QBack）或破坏性地
-	// 取出（QPop/QPopBack），于是"要读全队列但不能改源"的场景（如迁移）无从下手。
+	// 与 QFront/QBack（只看两端）和 QPop/QPopBack（取出即改源）不同，本方法只读且
+	// 可按位置取，因此"要读全队列但不能改源"的场景（如迁移）用它即可。
 	// 区间越界按可用范围裁剪（与 ZRange 同规矩），不报错；空队列返回空切片。
 	QRange(ctx context.Context, name string, start, stop int64) ([][]byte, error)
 }

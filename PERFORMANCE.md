@@ -15,12 +15,11 @@ what actually completes** (ops/s; batch writes converted to per-item items/s). B
 `BenchmarkThroughput*` in `example/bench/throughput_test.go`, 8 goroutines, `-benchtime` setting
 the window.
 
-**Why not `ns/op`**: the write path coalesces and defers work (SQL group commit, SQLite WAL
-checkpoint piggybacking, LSM memtable flushing, jsonl buffer flushing, Batch-amortized commits,
-background compaction). Measuring one call serially and taking its reciprocal flattens all of
-that and misreads "absorbed by a buffer" as "fast to disk" — jsonl's buffered mode shows ~4.5 µs
-per `ns/op`, but that is only the cost of writing into a memory buffer. Only time-window metrics
-are used here; `ns/op` is auxiliary.
+The write path coalesces and defers work (SQL group commit, SQLite WAL checkpoint piggybacking,
+LSM memtable flushing, jsonl buffer flushing, Batch-amortized commits, background compaction), so
+a serial per-call `ns/op` flattens all of it and reads "absorbed by a buffer" as "fast to disk" —
+jsonl's buffered mode measures ~4.5 µs per `ns/op`, which is only the cost of writing into a
+memory buffer. Throughput therefore means windowed completed volume; `ns/op` is auxiliary.
 
 Three variables must be held fixed:
 
@@ -38,7 +37,7 @@ comparisons between backends. Bare `write(16B)+fsync` for reference: tmpfs 2–4
 fsync, only ~1.5× faster than 9p, so it is not in the fast tier. Note also that this repository
 itself lives on a drvfs (9p) mount of `G:\`; measure ext4 on a WSL root disk such as `~/test/tmp`.
 
-### 1.1 Durability modes (embedded backends share one `sync` switch)
+### 1.1 Durability modes
 
 | Backend | Default (fast) | `?sync=1` (durable) | Notes |
 |---|---|---|---|
@@ -190,8 +189,9 @@ cross-mode view is in §2.3.
   at read retention, and the levers are the same ones that cut write latency: batching and sharding.
 - **badger's mixed read is governed by the commit window, not write frequency**: with `sync=1` a
   commit costs 1.3–3 ms and readers queue behind it, dropping retention to 0.2–0.4% (while write
-  retention stays 91–98%, i.e. writes themselves are not slowed). The default mode removes this
-  entirely (reads ~76.4k, retention ~28%, on par with the other embedded backends).
+  retention stays 91–98%, i.e. writes themselves are not slowed). The coupling is a property of
+  `sync=1` only: in the default mode reads reach ~76.4k with ~28% retention, on par with the other
+  embedded backends.
 - Retention >100% (some sqlite modes) is scheduling and page-cache jitter in that mode's own
   pure-read baseline.
 
@@ -205,9 +205,9 @@ cross-mode view is in §2.3.
 | Batch(N) | N writes (1 lock acquisition) | 1 write+flush | **1 transaction** | **1 Batch** | **1 `Update` transaction** | **1 transaction** | **1 transaction** | 1 MULTI/EXEC | 1 pipeline |
 
 The bottleneck is usually **one durability point (fsync) per transaction**, not the number of
-statements. Adding `?sync=1` puts every commit of the embedded backends back on that
-bottleneck (the `sync=1` table in §2: 377–1.3k ops/s); the default mode removes it. Isolated
-same-machine experiment (MySQL, 300 single-statement increments):
+statements. With `?sync=1` every embedded commit pays it (the `sync=1` table in §2: 377–1.3k ops/s),
+whereas the default mode pays no fsync per commit. Isolated same-machine experiment (MySQL, 300
+single-statement increments):
 
 | Setting | Single-statement increment | 3-statement transaction |
 |---|---|---|
@@ -247,7 +247,7 @@ PostgreSQL behaves the same way (490 → 1280 op/s with `synchronous_commit=off`
 | Single-key counters | The SQL family serializes on row locks plus an fsync per commit — an inherent cost |
 | SSDB batch writes | No transactions; a pipeline failure may take partial effect (the value is in reducing round trips) |
 | Redis in-batch visibility | Not guaranteed (see README "Batch writes" and `Capabilities().BatchComposed`) |
-| Badger reads coupled to the commit window | With `?sync=1` a commit takes 1.3–3 ms and mixed-read retention is only 0.2–0.4%; **the default mode (no fsync) has eliminated this phenomenon** (read retention back to ~28%) |
+| Badger reads coupled to the commit window | Coupling exists only with `?sync=1`, where a commit takes 1.3–3 ms and mixed-read retention is 0.2–0.4%. In the default mode (no fsync) retention is ~28%, on par with the other embedded backends |
 | Durability cost of the default mode | Embedded backends do not fsync per operation by default: a process crash or power loss may lose the most recent acknowledged writes. Power-loss safety requires an explicit `?sync=1` (cost in the `sync=1` table in §2: 56–570× slower) |
 
 ## 6. Reproducing

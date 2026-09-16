@@ -82,7 +82,7 @@ func usage() {
   EXISTS key | INCR key [delta] | MGET key... | SCAN [start] [end] [limit]
   EXPIRE key ttl | EXPIREAT key at | TTL key
   QPUSH name value | QPUSHFRONT name value | QPOP name | QPOPBACK name
-  QSIZE name | QFRONT name | QBACK name
+  QSIZE name | QFRONT name | QBACK name | QRANGE name [start] [stop]
   ZSET name member score | ZGET name member | ZDEL name member | ZINCR name member [delta]
   ZSIZE name | ZRANK name member | ZRANGE name start stop
   CAPS | PING | HELP | QUIT
@@ -370,6 +370,35 @@ func (c *cli) dispatch(ctx context.Context, cmd string, a []string) int {
 			return 0
 		}
 		fmt.Fprintln(c.out, quote(v))
+	case "QRANGE":
+		if !need(1, "QRANGE name [start] [stop]") {
+			return 1
+		}
+		start, stop := int64(0), int64(-1)
+		if len(a) >= 2 {
+			s, err := c.int(a[1], "start")
+			if err != nil {
+				return 1
+			}
+			start = s
+		}
+		if len(a) >= 3 {
+			s, err := c.int(a[2], "stop")
+			if err != nil {
+				return 1
+			}
+			stop = s
+		}
+		items, err := c.db.QRange(ctx, a[0], start, stop)
+		if err != nil {
+			return c.errf("%v", err)
+		}
+		if len(items) == 0 {
+			fmt.Fprintln(c.out, "(empty)")
+		}
+		for i, v := range items {
+			fmt.Fprintf(c.out, "%d) %s\n", i, quote(v))
+		}
 	case "QSIZE":
 		if !need(1, "QSIZE name") {
 			return 1

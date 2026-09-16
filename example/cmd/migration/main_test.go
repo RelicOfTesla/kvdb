@@ -196,41 +196,93 @@ func TestMigrateZSet(t *testing.T) {
 	}
 }
 
-// TestMigrateQueueRequiresOptIn: 队列默认**跳过**（因为读全队列必须破坏源），
-// 加 -allow-queue-drain 后才搬运，且顺序与源一致。
-func TestMigrateQueueRequiresOptIn(t *testing.T) {
+// TestMigrateQueueReadOnly: 源支持 QRange 时，队列走**只读**搬运——
+// 数据进目标、**源不被改动**、顺序保持，且可重复执行。
+func TestMigrateQueueReadOnly(t *testing.T) {
 	ctx := context.Background()
-
-	// 默认：跳过，且源队列保持不动
 	src := memDB(t)
 	dst := memDB(t)
-	for _, v := range []string{"a", "b", "c"} {
+	for _, v := range []string{"a", "b", "c", "d", "e"} {
 		if err := src.QPush(ctx, "jobs", []byte(v)); err != nil {
 			t.Fatal(err)
 		}
 	}
+
+	// batchSize 故意设为 2，逼出多批读取的路径（5 条 -> 3 批）
+	m := &migrator{src: src, dst: dst,
+		opt: options{queues: []string{"jobs"}, batchSize: 2}, out: os.Stdout}
+	if err := m.queues(ctx); err != nil {
+		t.Fatalf("queues: %v", err)
+	}
+	if m.nQ != 5 {
+		t.Fatalf("应搬 5 条, got %d", m.nQ)
+	}
+	// 源必须**原封不动**（这是 QRange 相对 QPop 的核心价值）
+	if n, _ := src.QSize(ctx, "jobs"); n != 5 {
+		t.Fatalf("只读搬运后源队列应仍为 5, got %d", n)
+	}
+	if v, ok, _ := src.QFront(ctx, "jobs"); !ok || string(v) != "a" {
+		t.Fatalf("源队头应仍是 a, got %q,%v", v, ok)
+	}
+	// 目标顺序与源一致
+	for _, want := range []string{"a", "b", "c", "d", "e"} {
+		v, ok, err := dst.QPop(ctx, "jobs")
+		if err != nil || !ok || string(v) != want {
+			t.Fatalf("目标队列顺序 = %q,%v,%v; want %q", v, ok, err, want)
+		}
+	}
+
+	// 幂等：再搬一次，源仍不变（若用 QPop 则第二次已空）
+	dst2 := memDB(t)
+	m2 := &migrator{src: src, dst: dst2, opt: options{queues: []string{"jobs"}, batchSize: 2}, out: os.Stdout}
+	if err := m2.queues(ctx); err != nil {
+		t.Fatalf("queues(重复): %v", err)
+	}
+	if m2.nQ != 5 {
+		t.Fatalf("重复搬运应仍能读满 5 条（证明源未被动过）, got %d", m2.nQ)
+	}
+	if n, _ := src.QSize(ctx, "jobs"); n != 5 {
+		t.Fatalf("重复搬运后源仍应为 5, got %d", n)
+	}
+}
+
+// TestMigrateQueueDrainFallback: 源**不支持** QRange 时，默认跳过；
+// 显式 -allow-queue-drain 才用 QPop 搬运（会清空源），顺序保持。
+func TestMigrateQueueDrainFallback(t *testing.T) {
+	ctx := context.Background()
+
+	// 用一个**没有 QRange** 的队列实现来模拟"源基座不支持只读按位置读"：
+	// noQRangeQueue 实现了 QueueProvider 的全部方法，但 QRange 明确返回
+	// ErrUnsupported —— 与真实基座（如 SSDB）在前置探测时的表现一致。
+	newSrc := func(t *testing.T) kvdb.DB {
+		t.Helper()
+		db := kvdb.Wrap(&noQRangeProvider{m: map[string][]byte{}, q: map[string][][]byte{}})
+		for _, v := range []string{"a", "b", "c"} {
+			if err := db.QPush(ctx, "jobs", []byte(v)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return db
+	}
+
+	// 默认：跳过，源不动
+	src, dst := newSrc(t), memDB(t)
 	m := &migrator{src: src, dst: dst, opt: options{queues: []string{"jobs"}}, out: os.Stdout}
 	if err := m.queues(ctx); err != nil {
 		t.Fatalf("queues: %v", err)
 	}
 	if m.nQ != 0 {
-		t.Fatalf("默认不应搬运队列, got %d", m.nQ)
-	}
-	if n, _ := src.QSize(ctx, "jobs"); n != 3 {
-		t.Fatalf("默认模式下源队列不应被改动, got %d", n)
+		t.Fatalf("不支持 QRange 时应默认跳过, got %d", m.nQ)
 	}
 	if len(m.skipped) == 0 {
 		t.Fatal("应给出跳过原因")
 	}
-
-	// 显式允许：搬运且顺序一致（源队头 -> 目标入队顺序）
-	src2 := memDB(t)
-	dst2 := memDB(t)
-	for _, v := range []string{"a", "b", "c"} {
-		if err := src2.QPush(ctx, "jobs", []byte(v)); err != nil {
-			t.Fatal(err)
-		}
+	if n, _ := src.QSize(ctx, "jobs"); n != 3 {
+		t.Fatalf("跳过时源不应被改动, got %d", n)
 	}
+
+	// 显式允许：QPop 搬，顺序一致，源被清空
+	src2, dst2 := newSrc(t), memDB(t)
 	m2 := &migrator{src: src2, dst: dst2,
 		opt: options{queues: []string{"jobs"}, allowDrain: true}, out: os.Stdout}
 	if err := m2.queues(ctx); err != nil {
@@ -244,6 +296,9 @@ func TestMigrateQueueRequiresOptIn(t *testing.T) {
 		if err != nil || !ok || string(v) != want {
 			t.Fatalf("目标队列顺序 = %q,%v,%v; want %q", v, ok, err, want)
 		}
+	}
+	if n, _ := src2.QSize(ctx, "jobs"); n != 0 {
+		t.Fatalf("QPop 路径应清空源, got %d", n)
 	}
 }
 
@@ -365,3 +420,100 @@ func (p *kvOnlyProvider) ExpireAt(context.Context, string, int64) error {
 func (p *kvOnlyProvider) TTL(context.Context, string) (int64, bool, error) {
 	return -1, false, nil
 }
+
+// noQRangeProvider 是一个**不支持 QRange** 的最小基座，用来验证迁移的退路分支。
+// 它实现了 KvProvider + QueueProvider，但 QRange 返回 ErrUnsupported。
+type noQRangeProvider struct {
+	m map[string][]byte
+	q map[string][][]byte
+}
+
+func (p *noQRangeProvider) Set(_ context.Context, key string, value []byte) error {
+	p.m[key] = append([]byte(nil), value...)
+	return nil
+}
+func (p *noQRangeProvider) SetEx(ctx context.Context, key string, value []byte, ttl int64) error {
+	if ttl <= 0 {
+		return kvdb.ErrInvalidTTL
+	}
+	return p.Set(ctx, key, value)
+}
+func (p *noQRangeProvider) SetExAt(ctx context.Context, key string, value []byte, at int64) error {
+	if at <= 0 {
+		delete(p.m, key)
+		return nil
+	}
+	return p.Set(ctx, key, value)
+}
+func (p *noQRangeProvider) Get(_ context.Context, key string) ([]byte, bool, error) {
+	v, ok := p.m[key]
+	return v, ok, nil
+}
+func (p *noQRangeProvider) Del(_ context.Context, key string) error { delete(p.m, key); return nil }
+func (p *noQRangeProvider) Exists(_ context.Context, key string) (bool, error) {
+	_, ok := p.m[key]
+	return ok, nil
+}
+func (p *noQRangeProvider) Incr(context.Context, string, int64) (int64, error) {
+	return 0, kvdb.ErrNotInteger
+}
+func (p *noQRangeProvider) MGet(context.Context, ...string) (map[string][]byte, error) {
+	return map[string][]byte{}, nil
+}
+func (p *noQRangeProvider) Scan(context.Context, string, string, int) ([]kvdb.KeyValue, error) {
+	return nil, nil
+}
+func (p *noQRangeProvider) Expire(context.Context, string, int64) error      { return nil }
+func (p *noQRangeProvider) ExpireAt(context.Context, string, int64) error    { return nil }
+func (p *noQRangeProvider) TTL(context.Context, string) (int64, bool, error) { return -1, false, nil }
+
+func (p *noQRangeProvider) QPush(_ context.Context, name string, value []byte) error {
+	p.q[name] = append(p.q[name], append([]byte(nil), value...))
+	return nil
+}
+func (p *noQRangeProvider) QPushFront(_ context.Context, name string, value []byte) error {
+	p.q[name] = append([][]byte{append([]byte(nil), value...)}, p.q[name]...)
+	return nil
+}
+func (p *noQRangeProvider) QPop(_ context.Context, name string) ([]byte, bool, error) {
+	l := p.q[name]
+	if len(l) == 0 {
+		return nil, false, nil
+	}
+	v := l[0]
+	p.q[name] = l[1:]
+	return v, true, nil
+}
+func (p *noQRangeProvider) QPopBack(_ context.Context, name string) ([]byte, bool, error) {
+	l := p.q[name]
+	if len(l) == 0 {
+		return nil, false, nil
+	}
+	v := l[len(l)-1]
+	p.q[name] = l[:len(l)-1]
+	return v, true, nil
+}
+func (p *noQRangeProvider) QSize(_ context.Context, name string) (int64, error) {
+	return int64(len(p.q[name])), nil
+}
+func (p *noQRangeProvider) QFront(_ context.Context, name string) ([]byte, bool, error) {
+	l := p.q[name]
+	if len(l) == 0 {
+		return nil, false, nil
+	}
+	return l[0], true, nil
+}
+func (p *noQRangeProvider) QBack(_ context.Context, name string) ([]byte, bool, error) {
+	l := p.q[name]
+	if len(l) == 0 {
+		return nil, false, nil
+	}
+	return l[len(l)-1], true, nil
+}
+
+// QRange 明确不支持：验证迁移会退回"默认跳过 / 显式 drain"的分支。
+func (p *noQRangeProvider) QRange(context.Context, string, int64, int64) ([][]byte, error) {
+	return nil, kvdb.ErrUnsupported
+}
+
+var _ kvdb.QueueProvider = (*noQRangeProvider)(nil)

@@ -225,6 +225,38 @@ func TestCLIQueueAndZSet(t *testing.T) {
 	}
 }
 
+// TestCLIQRange: 队列按位置读取（只读），覆盖默认全量、区间与空队列。
+func TestCLIQRange(t *testing.T) {
+	tc := newTestCLI(t)
+	for _, line := range []string{
+		`QPUSH q a`, `QPUSH q b`, `QPUSH q c`, `QPUSH q d`, `QPUSH q e`,
+		`QRANGE q`,          // 默认 0..-1 = 全部
+		`QRANGE q 0 2`,      // 前三个
+		`QRANGE q -2 -1`,    // 后两个
+		`QRANGE q 3 1`,      // 空区间
+		`QRANGE empty 0 -1`, // 不存在的队列 -> (empty)
+	} {
+		if code := run(t, tc.cli, line); code != 0 {
+			t.Fatalf("%q 退出码 = %d", line, code)
+		}
+	}
+	// 只读校验：QRange 不应改动队列。注意 out() 会关闭管道并排空输出，
+	// 所以这条命令必须在取输出**之前**发。
+	if code := run(t, tc.cli, `QSIZE q`); code != 0 {
+		t.Fatal("QSIZE 失败")
+	}
+	got := tc.out()
+	for _, want := range []string{`"a"`, `"b"`, `"c"`, `"d"`, `"e"`, "(empty)"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("输出缺少 %q:\n%s", want, got)
+		}
+	}
+	// QSIZE 的输出里应含 5：队列条数未变，证明 QRange 是只读的
+	if !strings.Contains(got, "5") {
+		t.Fatalf("QRANGE 后队列应仍为 5 条; 实际输出:\n%s", got)
+	}
+}
+
 // TestCLINonPrintableIsHex 验证非可打印值以十六进制输出（不把二进制塞进终端）。
 func TestCLINonPrintableIsHex(t *testing.T) {
 	tc := newTestCLI(t)

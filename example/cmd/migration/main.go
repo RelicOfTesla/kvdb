@@ -15,10 +15,10 @@
 //     而不是重新计一个满 TTL）。目标写入用 Batch 分批提交，降低往返与 fsync 次数；
 //     目标不支持 Batch 时自动退回逐条写。
 //   - **ZSet**：ZRange 可完整枚举成员与分数，因此能**只读源**地搬运；用 -zsets 给名字。
-//   - **Queue**：SDK 没有"按索引读第 i 个元素"的接口，只能 QFront/QBack 看两端，
-//     要读全队列就必须 QPop（**破坏源**）。因此队列默认**不搬**，必须显式加
-//     -allow-queue-drain 表示"我知道这会清空源队列"。不加该开关时只报告跳过。
-//   - 除队列外，**默认只读源**：源上数据不会被删除，整次迁移可重复执行（幂等覆盖写）。
+//   - **Queue**：用 QRange 按位置**只读**搬运（分批），源不受影响，可重复执行。
+//     若源基座未实现 QRange（返回 ErrUnsupported），则只有显式加 -allow-queue-drain
+//     才会改用 QPop 逐条搬——那条路**会清空源队列**，故必须显式确认；不加则只报告跳过。
+//   - **默认只读源**：源上数据不会被删除，整次迁移可重复执行（幂等覆盖写）。
 //
 // 关于名字枚举：SDK 没有枚举队列名/zset 名的接口（只有按名的 QSize/ZSize），
 // 所以 Queue/ZSet 必须用 -queues / -zsets 显式给出，工具不会去"猜"有哪些。
@@ -42,12 +42,13 @@ import (
 
 func main() {
 	var (
-		from      = flag.String("from", "", "源基座 URI（必填）")
-		to        = flag.String("to", "", "目标基座 URI（必填）")
-		prefix    = flag.String("prefix", "", "只迁移该前缀的 KV key（空=全部）")
-		queues    = flag.String("queues", "", "要迁移的队列名，逗号分隔（SDK 无枚举接口，需显式给出）")
-		zsets     = flag.String("zsets", "", "要迁移的 zset 名，逗号分隔（同上）")
-		drainQ    = flag.Bool("allow-queue-drain", false, "允许用 QPop 搬运队列（会**清空源队列**）")
+		from   = flag.String("from", "", "源基座 URI（必填）")
+		to     = flag.String("to", "", "目标基座 URI（必填）")
+		prefix = flag.String("prefix", "", "只迁移该前缀的 KV key（空=全部）")
+		queues = flag.String("queues", "", "要迁移的队列名，逗号分隔（SDK 无枚举接口，需显式给出）")
+		zsets  = flag.String("zsets", "", "要迁移的 zset 名，逗号分隔（同上）")
+		drainQ = flag.Bool("allow-queue-drain", false,
+			"仅当源不支持 QRange 时，允许用 QPop 搬队列（**会清空源队列**）")
 		batchSize = flag.Int("batch", 500, "每批写入条目数")
 		dryRun    = flag.Bool("dry-run", false, "只统计，不写目标")
 		timeout   = flag.Duration("timeout", 0, "整体超时（0=不限）")
@@ -265,8 +266,11 @@ func (m *migrator) zsets(ctx context.Context) error {
 	return nil
 }
 
-// queues 搬运队列。SDK 无"按索引读取"接口，读全队列必须 QPop（破坏源），
-// 因此默认跳过；只有显式 -allow-queue-drain 才执行，并在输出里明确告知源已被清空。
+// queues 搬运队列。
+//
+// 首选 **QRange 只读**搬运：它按位置读队列且不改动源，因此迁移可重复执行。
+// 若源基座未实现 QRange（返回 ErrUnsupported），才考虑 -allow-queue-drain：
+// 那条路用 QPop 逐条取出，**会清空源队列**，故必须显式开关，且输出会明确标注。
 func (m *migrator) queues(ctx context.Context) error {
 	if len(m.opt.queues) == 0 {
 		return nil
@@ -282,37 +286,97 @@ func (m *migrator) queues(ctx context.Context) error {
 		if n == 0 {
 			continue
 		}
+		// 先试只读路径。
+		readOnly := true
+		if !m.opt.dryRun {
+			if _, err := m.src.QRange(ctx, name, 0, 0); errors.Is(err, core.ErrUnsupported) {
+				readOnly = false
+			} else if err != nil {
+				return fmt.Errorf("qrange %q: %w", name, err)
+			}
+		}
+		if readOnly {
+			if err := m.copyQueueReadOnly(ctx, name, n); err != nil {
+				return err
+			}
+			continue
+		}
+		// 源不支持 QRange：只有显式允许才走破坏性的 QPop 路径。
 		if !m.opt.allowDrain {
 			m.skipped = append(m.skipped, fmt.Sprintf(
-				"队列 %q 有 %d 个元素，已跳过：读全队列只能靠 QPop（会清空源）。"+
-					"确认可接受时加 -allow-queue-drain", name, n))
+				"队列 %q 有 %d 个元素，已跳过：该基座未实现 QRange（只读按位置读），"+
+					"只能靠 QPop 搬（会清空源）。确认可接受时加 -allow-queue-drain", name, n))
 			continue
 		}
-		if m.opt.dryRun {
-			m.nQ += n
-			fmt.Fprintf(m.out, "队列 %s: %d 个元素（dry-run，未搬运）\n", name, n)
-			continue
+		if err := m.drainQueue(ctx, name, n); err != nil {
+			return err
 		}
-		// QPop 是队列语义（队头出队），目标用 QPush 追加到队尾。
-		// 因此**顺序保持**：源上从队头到队尾的顺序，即目标上的入队顺序。
-		var moved int64
-		for {
-			v, ok, err := m.src.QPop(ctx, name)
-			if err != nil {
-				return fmt.Errorf("qpop %q（已搬 %d/%d，源队列已被部分清空）: %w", name, moved, n, err)
-			}
-			if !ok {
-				break
-			}
+	}
+	return nil
+}
+
+// copyQueueReadOnly 用 QRange 分批只读搬队列，源不受影响。
+func (m *migrator) copyQueueReadOnly(ctx context.Context, name string, n int64) error {
+	if m.opt.dryRun {
+		m.nQ += n
+		fmt.Fprintf(m.out, "队列 %s: %d 个元素（dry-run，未搬运）\n", name, n)
+		return nil
+	}
+	// 分批读，避免一次性把大队列全读进内存。
+	batch := int64(m.opt.batchSize)
+	if batch <= 0 {
+		batch = 500
+	}
+	var moved int64
+	for start := int64(0); start < n; start += batch {
+		stop := start + batch - 1
+		if stop >= n {
+			stop = n - 1
+		}
+		items, err := m.src.QRange(ctx, name, start, stop)
+		if err != nil {
+			return fmt.Errorf("qrange %q [%d,%d]: %w", name, start, stop, err)
+		}
+		if len(items) == 0 {
+			break // 读不到更多了（例如并发弹出），避免空转
+		}
+		// 按读到的顺序 QPush → 目标队尾，保持队头→队尾的顺序不变。
+		for _, v := range items {
 			if err := m.dst.QPush(ctx, name, v); err != nil {
-				// 元素已从源取出但没进目标 —— 必须报出来，否则是静默丢数据。
-				return fmt.Errorf("qpush %q（该元素已从源取出，未写入目标，请手工补回）: %w", name, err)
+				return fmt.Errorf("qpush %q（已搬 %d/%d；源未改动，可重跑）: %w", name, moved, n, err)
 			}
 			moved++
 		}
-		m.nQ += moved
-		fmt.Fprintf(m.out, "队列 %s: %d 个元素（**源队列已被清空**）\n", name, moved)
 	}
+	m.nQ += moved
+	fmt.Fprintf(m.out, "队列 %s: %d 个元素（只读搬运，源未改动）\n", name, moved)
+	return nil
+}
+
+// drainQueue 是 QRange 不可用时的退路：QPop 逐条取出。**会清空源队列**。
+func (m *migrator) drainQueue(ctx context.Context, name string, n int64) error {
+	if m.opt.dryRun {
+		m.nQ += n
+		fmt.Fprintf(m.out, "队列 %s: %d 个元素（dry-run，未搬运）\n", name, n)
+		return nil
+	}
+	var moved int64
+	for {
+		v, ok, err := m.src.QPop(ctx, name)
+		if err != nil {
+			return fmt.Errorf("qpop %q（已搬 %d/%d，源队列已被部分清空）: %w", name, moved, n, err)
+		}
+		if !ok {
+			break
+		}
+		if err := m.dst.QPush(ctx, name, v); err != nil {
+			// 元素已从源取出但没进目标 —— 必须报出来，否则是静默丢数据。
+			return fmt.Errorf("qpush %q（该元素已从源取出，未写入目标，请手工补回）: %w", name, err)
+		}
+		moved++
+	}
+	m.nQ += moved
+	fmt.Fprintf(m.out, "队列 %s: %d 个元素（**源队列已被清空**）\n", name, moved)
 	return nil
 }
 

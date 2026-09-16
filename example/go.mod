@@ -15,6 +15,7 @@ require (
 	github.com/RelicOfTesla/kvdb/jsonl v0.0.0 // indirect
 	github.com/RelicOfTesla/kvdb/leveldb v0.0.0 // indirect
 	github.com/RelicOfTesla/kvdb/mem v0.0.0 // indirect
+	github.com/RelicOfTesla/kvdb/mssql v0.0.0 // indirect
 	github.com/RelicOfTesla/kvdb/mysql v0.0.0 // indirect
 	github.com/RelicOfTesla/kvdb/pg v0.0.0 // indirect
 	github.com/RelicOfTesla/kvdb/redis v0.0.0 // indirect
@@ -28,6 +29,8 @@ require (
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-sql-driver/mysql v1.10.1 // indirect
+	github.com/golang-sql/civil v0.0.0-20220223132316-b832511892a9 // indirect
+	github.com/golang-sql/sqlexp v0.1.0 // indirect
 	github.com/golang/snappy v0.0.0-20180518054509-2e65f85255db // indirect
 	github.com/google/flatbuffers v25.2.10+incompatible // indirect
 	github.com/google/uuid v1.6.0 // indirect
@@ -37,6 +40,7 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
+	github.com/microsoft/go-mssqldb v1.8.2 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/redis/go-redis/v9 v9.22.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
@@ -47,6 +51,7 @@ require (
 	go.opentelemetry.io/otel/metric v1.41.0 // indirect
 	go.opentelemetry.io/otel/trace v1.41.0 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
+	golang.org/x/crypto v0.24.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.29.0 // indirect
@@ -65,6 +70,7 @@ replace (
 	github.com/RelicOfTesla/kvdb/jsonl => ../jsonl
 	github.com/RelicOfTesla/kvdb/leveldb => ../leveldb
 	github.com/RelicOfTesla/kvdb/mem => ../mem
+	github.com/RelicOfTesla/kvdb/mssql => ../mssql
 	github.com/RelicOfTesla/kvdb/mysql => ../mysql
 	github.com/RelicOfTesla/kvdb/pg => ../pg
 	github.com/RelicOfTesla/kvdb/redis => ../redis

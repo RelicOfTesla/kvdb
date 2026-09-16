@@ -57,6 +57,13 @@ type KvProvider interface {
 	// SetEx 写入 value 并设置 ttl 秒存活（对应 Redis SETEX / SSDB setx，
 	// 覆盖 key 既有 TTL）；ttl<=0 返回 ErrInvalidTTL。
 	SetEx(ctx context.Context, key string, value []byte, ttl int64) error
+	// SetExAt 写入 value，并让 key 在 at（unix 秒）过期——绝对时间版本，
+	// 对应 Redis SETEXAT（6.2+）。at 已是过去时间时不写入，而是**删除该 key**
+	//（与 Redis SETEXAT 对过去时间点的行为一致）。
+	//
+	// 与 SetEx(ttl) 的关系：SetEx(ttl) 等价于 SetExAt(Now().Unix()+ttl)，
+	// 区别只在"到期时刻由谁算"——跨进程/重启后要保持同一到期时刻时用本方法。
+	SetExAt(ctx context.Context, key string, value []byte, at int64) error
 
 	// Get 读取 key；ok=false 表示 key 不存在（含已过期）。
 	Get(ctx context.Context, key string) (value []byte, ok bool, err error)
@@ -82,6 +89,10 @@ type KvProvider interface {
 	// Expire 设置 key 的存活秒数（ttl>0）；key 不存在时不视为错误
 	// （基座按各自语义对齐：SSDB/Redis 均返回 ok）。
 	Expire(ctx context.Context, key string, ttl int64) error
+	// ExpireAt 让 key 在 at（unix 秒）过期——绝对时间版本，对应 Redis EXPIREAT。
+	// at 已是过去时间时**立即删除该 key**（与 Redis EXPIREAT 一致）；
+	// key 不存在时不视为错误。
+	ExpireAt(ctx context.Context, key string, at int64) error
 	// TTL 返回 key 剩余秒数与是否"存在有效 TTL"：
 	// ok=false 表示 key 不存在、无 TTL 或已过期（SSDB ttl 对缺失/无 TTL 均返回 -1，
 	// 各基座统一映射为 ok=false）；ok=true 时返回剩余秒数。

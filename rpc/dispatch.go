@@ -155,6 +155,16 @@ func (s *Server) routeKV(ctx context.Context, cmd string, args [][]byte) reply {
 		}
 		return fail2(s.prov.SetEx(ctx, string(args[0]), args[1], ttl))
 
+	case mSetExAt:
+		if len(args) != 3 {
+			return argErrReply(mSetExAt, "key", "value", "at")
+		}
+		at, err := decInt(args[2])
+		if err != nil {
+			return fail(err)
+		}
+		return fail2(s.prov.SetExAt(ctx, string(args[0]), args[1], at))
+
 	case mGet:
 		if len(args) != 1 {
 			return argErrReply(mGet, "key")
@@ -241,6 +251,16 @@ func (s *Server) routeKV(ctx context.Context, cmd string, args [][]byte) reply {
 			return fail(err)
 		}
 		return fail2(s.prov.Expire(ctx, string(args[0]), ttl))
+
+	case mExpireAt:
+		if len(args) != 2 {
+			return argErrReply(mExpireAt, "key", "at")
+		}
+		at, err := decInt(args[1])
+		if err != nil {
+			return fail(err)
+		}
+		return fail2(s.prov.ExpireAt(ctx, string(args[0]), at))
 
 	case mTTL:
 		if len(args) != 1 {

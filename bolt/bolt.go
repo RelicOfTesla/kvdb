@@ -437,6 +437,19 @@ func kvDelTx(tx *bolt.Tx, key string) error {
 	return tx.Bucket(bTTL).Delete([]byte(key))
 }
 
+// kvExpireAtTx 把 key 的到期时刻设为 at（unix 秒）；at 已过去则删除该 key
+// （与 Redis EXPIREAT 一致）。key 不存在/已过期时不处理（不视为错误）。
+func kvExpireAtTx(tx *bolt.Tx, key string, at int64, now int64) error {
+	k := []byte(key)
+	if tx.Bucket(bKV).Get(k) == nil || ttlExpired(tx, k, now) {
+		return nil
+	}
+	if at <= now {
+		return kvDelTx(tx, key)
+	}
+	return tx.Bucket(bTTL).Put(k, be64(uint64(at)))
+}
+
 // kvExpireTx 设置 TTL；key 不存在**或已过期**时按不存在处理（不"复活"过期键）。
 func kvExpireTx(tx *bolt.Tx, key string, ttl int64, now int64) error {
 	if ttl <= 0 {
@@ -755,6 +768,21 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 	return p.update(func(tx *bolt.Tx) error { return kvSetExTx(tx, key, value, ttl) })
 }
 
+// SetExAt 写入 value 并让 key 在 at（unix 秒）过期；at 已过去则删除该 key。
+func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int64) error {
+	_ = ctx
+	return p.update(func(tx *bolt.Tx) error {
+		now := core.NowUnix()
+		if at <= now {
+			return kvDelTx(tx, key)
+		}
+		if err := tx.Bucket(bKV).Put([]byte(key), value); err != nil {
+			return err
+		}
+		return tx.Bucket(bTTL).Put([]byte(key), be64(uint64(at)))
+	})
+}
+
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	_ = ctx
 	var out []byte
@@ -856,6 +884,12 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	_ = ctx
 	return p.update(func(tx *bolt.Tx) error { return kvExpireTx(tx, key, ttl, core.NowUnix()) })
+}
+
+// ExpireAt 让 key 在 at（unix 秒）过期；at 已过去则立即删除。
+func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
+	_ = ctx
+	return p.update(func(tx *bolt.Tx) error { return kvExpireAtTx(tx, key, at, core.NowUnix()) })
 }
 
 func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {

@@ -100,7 +100,7 @@ const DefaultSyncInterval = time.Second
 //	fsync 周期 1000ms（DefaultSyncInterval）
 //
 // 于是默认档的丢失边界是：**进程崩溃丢最后 500ms 内未 flush 的写**
-//（已 flush 的在 OS 页缓存里，进程崩溃不丢）；**机器掉电丢最后 1000ms 内未
+// （已 flush 的在 OS 页缓存里，进程崩溃不丢）；**机器掉电丢最后 1000ms 内未
 // fsync 的写**。两个周期都是真周期（Open 起跑、回调自我重排），不是"空闲才
 // 触发"——否则持续写入会不断推后到期时间，等于永不落盘。
 //
@@ -681,6 +681,21 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 	return p.mem.SetEx(ctx, key, value, ttl)
 }
 
+// SetExAt 写入 value 并让 key 在 at（unix 秒）过期；at 已过去则删除该 key。
+// 日志里记录的本就是绝对到期时刻，因此这里直接把 at 写进去即可——这也是
+// jsonl 用绝对戳记录过期时间的好处：回放不受"何时重放"影响。
+func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.writeCheck(); err != nil {
+		return err
+	}
+	if err := p.appendOp(encOp(op{Op: opSetEx, At: at}, key, "", value)); err != nil {
+		return err
+	}
+	return p.mem.SetExAt(ctx, key, value, at)
+}
+
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	if p.closed.Load() {
 		return nil, false, core.ErrClosed
@@ -755,6 +770,19 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 		return err
 	}
 	return p.mem.Expire(ctx, key, ttl)
+}
+
+// ExpireAt 让 key 在 at（unix 秒）过期；at 已过去则立即删除。
+func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.writeCheck(); err != nil {
+		return err
+	}
+	if err := p.appendOp(encOp(op{Op: opExpire, At: at}, key, "", nil)); err != nil {
+		return err
+	}
+	return p.mem.ExpireAt(ctx, key, at)
 }
 
 func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {

@@ -446,6 +446,23 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 	})
 }
 
+// SetExAt 写入 value 并让 key 在 at（unix 秒）过期；at 已过去则删除该 key。
+func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int64) error {
+	_ = ctx
+	return p.update("setexat", func(txn *badgerdb.Txn) error {
+		if at <= core.NowUnix() {
+			if err := txn.Delete(kvKey(key)); err != nil {
+				return err
+			}
+			return txn.Delete(ttlKey(key))
+		}
+		if err := txn.Set(kvKey(key), value); err != nil {
+			return err
+		}
+		return txn.Set(ttlKey(key), be64(uint64(at)))
+	})
+}
+
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	_ = ctx
 	var (
@@ -631,6 +648,26 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 			return err // 不存在或已过期都按不存在处理：不复活过期键
 		}
 		return txn.Set(ttlKey(key), be64(uint64(exp)))
+	})
+}
+
+// ExpireAt 让 key 在 at（unix 秒）过期；at 已过去则立即删除该 key。
+// key 不存在/已过期时不处理（不视为错误）。
+func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
+	_ = ctx
+	now := core.NowUnix()
+	return p.update("expireat", func(txn *badgerdb.Txn) error {
+		live, err := kvLive(txn, key, now)
+		if err != nil || !live {
+			return err
+		}
+		if at <= now {
+			if err := txn.Delete(kvKey(key)); err != nil {
+				return err
+			}
+			return txn.Delete(ttlKey(key))
+		}
+		return txn.Set(ttlKey(key), be64(uint64(at)))
 	})
 }
 

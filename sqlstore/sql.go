@@ -627,6 +627,32 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 	return nil
 }
 
+// SetExAt 写入 value 并让 key 在 at（unix 秒）过期；at 已过去则删除该 key。
+// expire_at 列本就是绝对秒，因此直接把 at 写进去。
+func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int64) error {
+	defer p.writeLock()()
+	if err := p.check(); err != nil {
+		return err
+	}
+	if err := p.checkLen("setexat", key); err != nil {
+		return err
+	}
+	if at <= core.NowUnix() {
+		if _, err := p.db.ExecContext(ctx, p.st.kvDel, bs(key)); err != nil {
+			return fmt.Errorf("sqlstore: setexat: %w", err)
+		}
+		return nil
+	}
+	args := []any{bs(key), value, at}
+	if p.hasNumCol {
+		args = append(args, numProjection(value))
+	}
+	if _, err := p.db.ExecContext(ctx, p.st.kvSetEx, args...); err != nil {
+		return fmt.Errorf("sqlstore: setexat: %w", err)
+	}
+	return nil
+}
+
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	if err := p.check(); err != nil {
 		return nil, false, err
@@ -859,6 +885,29 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	// 参数：新过期时间、key、当前秒（用于把"已过期 = 不存在"写进 WHERE，不复活过期键）。
 	if _, err := p.db.ExecContext(ctx, p.st.kvExpire, core.AddTTL(now, ttl), bs(key), now); err != nil {
 		return fmt.Errorf("sqlstore: expire: %w", err)
+	}
+	return nil
+}
+
+// ExpireAt 让 key 在 at（unix 秒）过期；at 已过去则立即删除该 key。
+// key 不存在/已过期时不处理（无匹配行即不生效，不复活过期键）。
+func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
+	defer p.writeLock()()
+	if err := p.check(); err != nil {
+		return err
+	}
+	if err := p.checkLen("expireat", key); err != nil {
+		return err
+	}
+	now := core.NowUnix()
+	if at <= now {
+		if _, err := p.db.ExecContext(ctx, p.st.kvDel, bs(key)); err != nil {
+			return fmt.Errorf("sqlstore: expireat: %w", err)
+		}
+		return nil
+	}
+	if _, err := p.db.ExecContext(ctx, p.st.kvExpire, at, bs(key), now); err != nil {
+		return fmt.Errorf("sqlstore: expireat: %w", err)
 	}
 	return nil
 }

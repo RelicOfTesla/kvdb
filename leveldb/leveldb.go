@@ -377,6 +377,23 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 	return p.write(&b, "setex")
 }
 
+// SetExAt 写入 value 并让 key 在 at（unix 秒）过期；at 已过去则删除该 key。
+func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int64) error {
+	_ = ctx
+	if err := p.check(); err != nil {
+		return err
+	}
+	var b gldb.Batch
+	if at <= core.NowUnix() {
+		b.Delete(kvKey(key))
+		b.Delete(ttlKey(key))
+		return p.write(&b, "setexat")
+	}
+	b.Put(kvKey(key), value)
+	b.Put(ttlKey(key), be64(uint64(at)))
+	return p.write(&b, "setexat")
+}
+
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	_ = ctx
 	if err := p.check(); err != nil {
@@ -573,6 +590,36 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	var b gldb.Batch
 	b.Put(ttlKey(key), be64(uint64(core.AddTTL(now, ttl))))
 	return p.write(&b, "expire")
+}
+
+// ExpireAt 让 key 在 at（unix 秒）过期；at 已过去则立即删除该 key。
+// key 不存在/已过期时不处理（不视为错误）。
+func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
+	_ = ctx
+	if err := p.check(); err != nil {
+		return err
+	}
+	now := core.NowUnix()
+	ok, err := p.db.Has(kvKey(key), nil)
+	if err != nil {
+		return fmt.Errorf("leveldb: expireat: %w", err)
+	}
+	if !ok {
+		return nil
+	}
+	if expired, err := p.ttlExpiredAt(key, now); err != nil {
+		return err
+	} else if expired {
+		return nil
+	}
+	var b gldb.Batch
+	if at <= now {
+		b.Delete(kvKey(key))
+		b.Delete(ttlKey(key))
+		return p.write(&b, "expireat")
+	}
+	b.Put(ttlKey(key), be64(uint64(at)))
+	return p.write(&b, "expireat")
 }
 
 func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {

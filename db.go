@@ -82,6 +82,10 @@ func (a *adapter) SetEx(ctx context.Context, key string, value []byte, ttl int64
 	return a.p.SetEx(ctx, key, value, ttl)
 }
 
+func (a *adapter) SetExAt(ctx context.Context, key string, value []byte, at int64) error {
+	return a.p.SetExAt(ctx, key, value, at)
+}
+
 func (a *adapter) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	return a.p.Get(ctx, key)
 }
@@ -108,6 +112,10 @@ func (a *adapter) Scan(ctx context.Context, start, end string, limit int) ([]cor
 
 func (a *adapter) Expire(ctx context.Context, key string, ttl int64) error {
 	return a.p.Expire(ctx, key, ttl)
+}
+
+func (a *adapter) ExpireAt(ctx context.Context, key string, at int64) error {
+	return a.p.ExpireAt(ctx, key, at)
 }
 
 func (a *adapter) TTL(ctx context.Context, key string) (int64, bool, error) {

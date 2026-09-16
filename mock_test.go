@@ -84,6 +84,23 @@ func (f *fakeKV) SetEx(ctx context.Context, key string, value []byte, ttl int64)
 	return f.Set(ctx, key, value)
 }
 
+// SetExAt / ExpireAt：与真实基座契约一致——at 已是过去时间时删除该 key
+// （与 Redis SETEXAT / EXPIREAT 一致），不报错。
+func (f *fakeKV) SetExAt(ctx context.Context, key string, value []byte, at int64) error {
+	if at <= core.NowUnix() {
+		delete(f.data, key)
+		return nil
+	}
+	return f.Set(ctx, key, value)
+}
+
+func (f *fakeKV) ExpireAt(_ context.Context, key string, at int64) error {
+	if at <= core.NowUnix() {
+		delete(f.data, key)
+	}
+	return nil
+}
+
 func (f *fakeKV) Del(_ context.Context, key string) error {
 	delete(f.data, key)
 	return nil

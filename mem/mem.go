@@ -116,6 +116,25 @@ func (p *Provider) setExLocked(key string, value []byte, ttl int64, now int64) {
 	p.kv[key] = &entry{val: append([]byte(nil), value...), exp: core.AddTTL(now, ttl)}
 }
 
+// SetExAt 写入 value 并让 key 在 at（unix 秒）过期。
+// at 已是过去时间时删除该 key（与 Redis SETEXAT 一致）。
+func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int64) error {
+	_ = ctx
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.checkOpen(); err != nil {
+		return err
+	}
+	now := core.NowUnix()
+	if at <= now {
+		delete(p.kv, key)
+		return nil
+	}
+	p.sweepLocked(now)
+	p.kv[key] = &entry{val: append([]byte(nil), value...), exp: at}
+	return nil
+}
+
 // sweepLocked 物理删除已过期的 kv 条目并清理空容器，调用方需持有 p.mu。
 // 读路径在 RLock 下不得改写 map（见 lookup 注释），因此回收挂在产生 TTL
 // 的写路径上按间隔节流执行；纯读负载不产生新的过期条目，无需回收。
@@ -289,6 +308,27 @@ func (p *Provider) expireLocked(key string, ttl int64, now int64) {
 	if e, ok := p.lookup(key, now, true); ok {
 		e.exp = core.AddTTL(now, ttl)
 	}
+}
+
+// ExpireAt 让 key 在 at（unix 秒）过期；at 已过去则立即删除。
+// key 不存在时不视为错误（与 Expire 一致）。
+func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
+	_ = ctx
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.checkOpen(); err != nil {
+		return err
+	}
+	now := core.NowUnix()
+	if at <= now {
+		delete(p.kv, key)
+		return nil
+	}
+	p.sweepLocked(now)
+	if e, ok := p.lookup(key, now, true); ok {
+		e.exp = at
+	}
+	return nil
 }
 
 func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {

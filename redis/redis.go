@@ -159,6 +159,33 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 	return nil
 }
 
+// SetExAt 写入 value 并让 key 在 at（unix 秒）过期；at 已过去则删除该 key。
+//
+// Redis 的 SET 没有"带绝对到期时刻"的写法（EXAT 自 6.2 起，但 go-redis 的
+// SetArgs 未暴露），因此用 SET + EXPIREAT 两条命令、放在一次 pipeline 里发出，
+// 保证两者之间不会被其他客户端的写入插进来。注意这仍是**两条命令**：
+// Redis 的 MULTI/EXEC 不做命令级回滚，若 EXPIREAT 失败，SET 的结果会保留
+// （与 Batch 的既有说明一致）。
+func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int64) error {
+	if err := p.check(); err != nil {
+		return err
+	}
+	key = p.pfx.kv + key
+	if at <= core.NowUnix() {
+		if err := p.rd.Del(ctx, key).Err(); err != nil {
+			return fmt.Errorf("redis: setexat: %w", err)
+		}
+		return nil
+	}
+	pipe := p.rd.TxPipeline()
+	pipe.Set(ctx, key, string(value), 0)
+	pipe.ExpireAt(ctx, key, time.Unix(at, 0))
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("redis: setexat: %w", err)
+	}
+	return nil
+}
+
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	if err := p.check(); err != nil {
 		return nil, false, err
@@ -301,6 +328,18 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	}
 	if err := p.rd.Expire(ctx, key, secondsDuration(ttl)).Err(); err != nil {
 		return fmt.Errorf("redis: expire: %w", err)
+	}
+	return nil
+}
+
+// ExpireAt 让 key 在 at（unix 秒）过期；at 已过去则立即删除。
+// 直接用 Redis 原生 EXPIREAT：过去时间点由服务端立即删除该 key。
+func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
+	if err := p.check(); err != nil {
+		return err
+	}
+	if err := p.rd.ExpireAt(ctx, p.pfx.kv+key, time.Unix(at, 0)).Err(); err != nil {
+		return fmt.Errorf("redis: expireat: %w", err)
 	}
 	return nil
 }

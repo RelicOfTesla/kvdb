@@ -368,6 +368,19 @@ func (s *storeOnlyStub) SetEx(ctx context.Context, key string, value []byte, ttl
 	}
 	return s.Set(ctx, key, value)
 }
+func (s *storeOnlyStub) SetExAt(ctx context.Context, key string, value []byte, at int64) error {
+	if at <= core.NowUnix() {
+		delete(s.kv, key)
+		return nil
+	}
+	return s.Set(ctx, key, value)
+}
+func (s *storeOnlyStub) ExpireAt(_ context.Context, key string, at int64) error {
+	if at <= core.NowUnix() {
+		delete(s.kv, key)
+	}
+	return nil
+}
 func (s *storeOnlyStub) Get(_ context.Context, key string) ([]byte, bool, error) {
 	v, ok := s.kv[key]
 	return v, ok, nil

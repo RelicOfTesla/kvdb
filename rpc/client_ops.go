@@ -25,6 +25,11 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 	return p.callErr(ctx, mSetEx, []byte(key), value, encInt(ttl))
 }
 
+// SetExAt 写入并设置绝对到期时刻（unix 秒）。
+func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int64) error {
+	return p.callErr(ctx, mSetExAt, []byte(key), value, encInt(at))
+}
+
 // Get 读取 key。
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	st, payload, err := p.call(ctx, []byte(mGet), []byte(key))
@@ -118,6 +123,11 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 // Expire 设置 TTL。
 func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	return p.callErr(ctx, mExpire, []byte(key), encInt(ttl))
+}
+
+// ExpireAt 设置绝对到期时刻（unix 秒）。
+func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
+	return p.callErr(ctx, mExpireAt, []byte(key), encInt(at))
 }
 
 // TTL 读取剩余秒数。

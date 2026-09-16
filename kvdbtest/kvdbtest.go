@@ -382,6 +382,57 @@ func TestKV(t *testing.T, db kvdb.DB) {
 		t.Fatal(err)
 	}
 
+	// SetExAt / ExpireAt：绝对到期时刻（对应 Redis SETEXAT / EXPIREAT）
+	now := core.NowUnix()
+	if err := db.SetExAt(ctx, "at1", []byte("av"), now+40); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok, _ := db.Get(ctx, "at1"); !ok || string(v) != "av" {
+		t.Fatalf("SetExAt 后 Get = %q,%v", v, ok)
+	}
+	if secs, has, err := db.TTL(ctx, "at1"); err != nil || !has || secs <= 0 || secs > 40 {
+		t.Fatalf("SetExAt 后 TTL = %d,%v,%v", secs, has, err)
+	}
+	// 绝对时刻不受"写入时点"影响：把它改成更晚的绝对时刻，剩余秒数应随之变大
+	if err := db.SetExAt(ctx, "at1", []byte("av"), now+80); err != nil {
+		t.Fatal(err)
+	}
+	if secs, has, _ := db.TTL(ctx, "at1"); !has || secs <= 40 {
+		t.Fatalf("SetExAt 改晚后 TTL 应变大, got %d,%v", secs, has)
+	}
+	// at 已是过去时间 -> 删除该 key（与 Redis SETEXAT 一致）
+	if err := db.SetExAt(ctx, "at1", []byte("gone"), now-1); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := db.Get(ctx, "at1"); ok {
+		t.Fatal("SetExAt 过去时间点应删除 key")
+	}
+
+	// ExpireAt：key 存在 -> 设置绝对到期；不存在 -> 不报错
+	if err := db.Set(ctx, "at2", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ExpireAt(ctx, "at2", now+30); err != nil {
+		t.Fatal(err)
+	}
+	if secs, has, _ := db.TTL(ctx, "at2"); !has || secs <= 0 || secs > 30 {
+		t.Fatalf("ExpireAt 后 TTL = %d,%v", secs, has)
+	}
+	// 过去时间点 -> 立即删除
+	if err := db.ExpireAt(ctx, "at2", now-1); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := db.Get(ctx, "at2"); ok {
+		t.Fatal("ExpireAt 过去时间点应删除 key")
+	}
+	// 不存在的 key：不视为错误（与 Expire 一致）
+	if err := db.ExpireAt(ctx, "at-absent", now+30); err != nil {
+		t.Fatalf("ExpireAt 对不存在的 key 不应报错: %v", err)
+	}
+	if err := db.Del(ctx, "at1"); err != nil {
+		t.Fatal(err)
+	}
+
 	// 无 TTL 的 key：TTL ok=false
 	if _, has, err := db.TTL(ctx, "noexpire"); err != nil || has {
 		t.Fatalf("TTL 无过期 key = %v,%v", has, err)

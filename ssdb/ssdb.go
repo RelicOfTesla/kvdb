@@ -460,6 +460,38 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 	return nil
 }
 
+// SetExAt 写入 value 并让 key 在 at（unix 秒）过期；at 已过去则删除该 key。
+//
+// 同 ExpireAt：SSDB 只有相对秒数命令，这里在客户端换算成剩余秒数再下发。
+func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int64) error {
+	if err := p.check(); err != nil {
+		return err
+	}
+	key = p.k(key)
+	if key == "" {
+		return fmt.Errorf("ssdb: setxat: key must not be empty")
+	}
+	rem := at - core.NowUnix()
+	if rem <= 0 {
+		st, _, err := p.do(ctx, "del", key)
+		if err != nil {
+			return err
+		}
+		if st != "ok" {
+			return fmt.Errorf("ssdb: setxat: status %q", st)
+		}
+		return nil
+	}
+	st, _, err := p.do(ctx, "setx", key, string(value), strconv.FormatInt(rem, 10))
+	if err != nil {
+		return err
+	}
+	if st != "ok" {
+		return fmt.Errorf("ssdb: setxat: status %q", st)
+	}
+	return nil
+}
+
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	if err := p.check(); err != nil {
 		return nil, false, err
@@ -622,6 +654,37 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	}
 	if st != "ok" {
 		return fmt.Errorf("ssdb: expire: status %q", st)
+	}
+	return nil
+}
+
+// ExpireAt 让 key 在 at（unix 秒）过期；at 已过去则立即删除该 key。
+//
+// SSDB 没有绝对时间命令（只有相对秒数的 expire），因此在客户端换算成剩余
+// 秒数再下发；at 已过去时改为删除该 key（与 Redis EXPIREAT 一致）。
+// 换算依据本地时钟，与 SSDB 服务端时钟若有偏差会等量反映在到期时刻上。
+func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
+	if err := p.check(); err != nil {
+		return err
+	}
+	key = p.k(key)
+	rem := at - core.NowUnix()
+	if rem <= 0 {
+		st, _, err := p.do(ctx, "del", key)
+		if err != nil {
+			return err
+		}
+		if st != "ok" {
+			return fmt.Errorf("ssdb: expireat: status %q", st)
+		}
+		return nil
+	}
+	st, _, err := p.do(ctx, "expire", key, strconv.FormatInt(rem, 10))
+	if err != nil {
+		return err
+	}
+	if st != "ok" {
+		return fmt.Errorf("ssdb: expireat: status %q", st)
 	}
 	return nil
 }

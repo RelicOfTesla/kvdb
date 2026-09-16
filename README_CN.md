@@ -23,577 +23,308 @@ n, err := db.Incr(ctx, "visits", 1)
 
 ## 特性
 
-- **11 个内置基座**，同一套 API：`mem` / `jsonl` / `bolt` / `leveldb` / `badger` / `sqlite` / `mysql` / `pg` / `mssql` / `redis` / `ssdb`
-- **能力可选、按需探测**：KV 必选；Queue / ZSet / Batch / 生命周期为可选能力，
-  未实现时返回 `ErrUnsupported`，可用 `Capabilities()` 探测
-- **注册表默认空**：用哪个基座就 `import _` 哪个包，根包与mod不引入任何驱动依赖
-- **接口化返回**：`kvdb.Open` 返回接口 `DB`，业务可窄依赖 `KvProvider` 等子接口，便于 mock
-- **批量写**：一批操作映射到各基座原生机制（事务 / MULTI/EXEC / 流水线 / 单次 flush）
-- **字节 ↔ 泛型辅助**：`Enc` / `Dec` / `D` / `DMust` 支持标量与结构体（默认 JSON，编解码可替换），标量编码与 `Incr` 互操作。`D` 原值透传 `ok` 与 `err`；`DMust` 只看 `err`
-- **本地变远程（c/s）**：`rpc` 把任一基座暴露成服务端，客户端用同一组接口访问；
-  客户端**不感知服务端底座**，自带 c/s 认证（明文 / 挑战-响应）与可选 TLS，协议编解码可替换
-- **Go 1.27.1+ 可选薄壳**：`kvdb.Typed(store)` 提供 `db.Get[T](...)`/`db.Set(ctx, k, v)` 读写泛型方法（构建约束隔离）
-- 纯 Go 依赖，无 CGO
+- **11 个内置基座、同一套 API**：`mem` / `jsonl` / `bolt` / `leveldb` / `badger` / `sqlite` /
+  `mysql` / `pg` / `mssql` / `redis` / `ssdb`
+- **可选能力、按需探测**：KV 必选；Queue / ZSet / Batch / Close 为可选，未实现时返回
+  `ErrUnsupported`，可经 `Capabilities()` 探测
+- **默认空注册表**：用到哪个基座就 `import _` 哪个；根包不引入任何驱动依赖
+- **接口化返回**：`kvdb.Open` 返回接口 `DB`，业务可只依赖子接口（如 `KvProvider`），便于 mock
+- **批量写**：映射到各基座的原生机制（事务 / MULTI-EXEC / 流水线 / 一次 flush）
+- **字节 ↔ 泛型辅助**：`Enc` / `Dec` / `D` / `DMust`；标量编码与 `Incr` 互操作
+- **本地变远程**：任一基座可作 RPC 服务端；客户端不感知底座，含认证（明文 / 挑战）与可选 TLS，codec 可替换
+- **可选 Go 1.27.1+ 类型化薄壳**：`kvdb.Typed(store)` 提供泛型读写方法
+- **纯 Go、无 CGO**
 
-**每个基座是独立模块**，各自声明所需的最低 Go 版本——只用 `mem` / `jsonl` / `ssdb`
-的项目不会被 SQL / Redis 驱动的版本要求抬高：
+| 模块 | 最低 Go |
+|---|---|
+| `kvdb`（根，含 `core`/`kvdbtest`）、`mem`、`jsonl`、`sqlstore`、`mssql` | 1.18 |
+| `ssdb`、`leveldb`、`rpc` | 1.19 |
+| `badger` | 1.24（Badger v4 自身声明 `go 1.24.0`） |
+| `bolt`、`sqlite`、`mysql`、`pg`、`redis`、`all`、`example` | 1.25（驱动/传递依赖决定） |
 
-| 模块 | 最低 Go | 说明 |
-|---|---|---|
-| `kvdb`（根，含 `core` / `kvdbtest`） | 1.18 | 零第三方依赖 |
-| `kvdb/mem`、`kvdb/jsonl` | 1.18 | 仅标准库 |
-| `kvdb/sqlstore` | 1.18 | 仅标准库（`database/sql` 抽象） |
-| `kvdb/ssdb`、`kvdb/leveldb` | 1.19 | 用到 `atomic.Bool` / `atomic.Pointer[T]` |
-| `kvdb/badger` | 1.24 | Badger v4 自身声明 `go 1.24.0` |
-| `kvdb/bolt`、`kvdb/sqlite`、`kvdb/mysql`、`kvdb/pg`、`kvdb/redis` | 1.25 | 由驱动及其传递依赖决定（如 `golang.org/x/sys` 要求 1.25） |
-| `kvdb/mssql` | 1.18 | `go-mssqldb` v1.8.2（更新的驱动线 v1.9+ 要求 `go 1.25`；本模块保持 1.18 基线与根包对齐） |
-| `kvdb/rpc` | 1.19 | 仅标准库 + 根包：**零第三方依赖**（客户端尤其重要） |
-| `kvdb/all`、`kvdb/example` | 1.25 | 聚合了上述模块（`example` 内含 `rpcdemo`、`cmd/cli`、`cmd/migration`，以及独立的 `bench` 模块） |
-
-版本按各模块**依赖图里最大的 `go` 指令**取（`go list -m -f '{{.GoVersion}}' all`），
-不是照抄直接依赖的声明值。
-
-实测：Go 1.20 的消费方只 import `kvdb/mem` 可正常构建运行，依赖闭包为空（不产生
-go.sum）。
+版本取各模块依赖图中**最大的 `go` 指令**（`go list -m -f '{{.GoVersion}}' all`）。根包、
+`mem`、`jsonl`、`rpc` 仅需标准库——只引入 `kvdb/mem` 的项目依赖闭包为空。
 
 ## 引入方式
 
 ```bash
 go get github.com/RelicOfTesla/kvdb        # 根包
-go get github.com/RelicOfTesla/kvdb/mem    # 按需引入各基座模块
+go get github.com/RelicOfTesla/kvdb/mem    # 各基座按需拉取
 ```
 
-```go
-import (
-    "github.com/RelicOfTesla/kvdb"
-    _ "github.com/RelicOfTesla/kvdb/sqlite"   // 按需接入基座
-)
-```
+根包不依赖任何驱动——用到哪个基座就引入哪个（见「快速开始」）。
 
 ## 快速开始
 
 ```go
 import (
-    "context"
-
     "github.com/RelicOfTesla/kvdb"
-    _ "github.com/RelicOfTesla/kvdb/sqlite"  // 只接入 sqlite；或 _ .../all 一次接入全部
+    _ "github.com/RelicOfTesla/kvdb/sqlite"   // 接入单个基座；_ .../all 则一次接入全部
 )
 
-ctx := context.Background()
-db, err := kvdb.Open(ctx, "sqlite://./data.db")
-if err != nil {
-    log.Fatal(err)
-}
+db, _ := kvdb.Open(ctx, "sqlite://./data.db")
 defer db.Close()
 
-// KV
 db.Set(ctx, "user:1", []byte("alice"))
 v, ok, _ := db.Get(ctx, "user:1")
-db.SetEx(ctx, "session", []byte("token"), 1800) // 写入并设置 TTL
+db.SetEx(ctx, "session", []byte("token"), 1800)
 n, _ := db.Incr(ctx, "visits", 1)
-pairs, _ := db.Scan(ctx, "user:", "user;", 100) // 闭区间：":" 的下一字节是 ";"
+pairs, _ := db.Scan(ctx, "user:", "user;", 100)   // 闭区间
 
-// Queue（可选能力）
-db.QPush(ctx, "jobs", []byte("job-1"))
+db.QPush(ctx, "jobs", []byte("job-1"))            // Queue / ZSet 为可选能力
 job, ok, _ := db.QPop(ctx, "jobs")
-
-// ZSet（可选能力）
 db.ZSet(ctx, "rank", "alice", 90)
 top, _ := db.ZRange(ctx, "rank", 0, -1)
 ```
 
-URI 一览（同一基座 = 同一 scheme 或同一 `sqlstore` 味，合并成组展示；各包也提供等价的直接构造函数，如 `sqlite.Open`）：
-
-```
-mem://
-jsonl://./data.jsonl?sync=1        # 缺省 flush 每 500ms、fsync 每 1s；sync=1 逐操作 flush+fsync（掉电不丢）
-jsonl://./data.jsonl?each_flush=1  # 逐操作 flush（fsync 仍按周期）；flush_interval/sync_interval 可调周期
-
-# ---- SQL 基座（同 sqlstore 基座，仅 scheme 与 DSN 形态不同；table_prefix 通用） ----
-sqlite://./data.db?sync=1          # 缺省 NORMAL（不逐提交 fsync，与其他本地基座一致）；sync=1 用 FULL（掉电不丢）
-mysql://user:pass@host:3306/dbname?parseTime=true&table_prefix=app_
-pg://user:pass@host:5432/dbname?sslmode=disable&table_prefix=app_
-mssql://sa:pass@host:1433?database=dbname&encrypt=disable&table_prefix=app_   # 其余 query 参数照传 go-mssqldb
-
-bolt://./data.bolt?sync=1&sync_interval=1s   # 缺省不逐提交 fsync，但按 sync_interval 周期落盘（缺省 1s）；sync=1 逐提交 fsync
-leveldb://./data.dir?sync=1&cache=8&wb=4     # 目录型存储；默认不 fsync，sync=1 逐提交 fsync；cache/wb 单位 MiB
-badger://./data.dir?sync=1&cache=64&memtable=64   # 目录型存储；默认不 fsync，sync=1 逐提交 fsync；cache/memtable 单位 MiB
-redis://:password@host:6379/0?key_prefix=app:   # 键命名空间前缀
-ssdb://[user:pass@]host:8888?key_prefix=app:   # SSDB 无 namespace，用逻辑前缀隔离；带 user:pass 为认证写法（server.auth 开启时；OpenWithConfig 亦支持在线 Auth）
-rpc://host:7788?auth=challenge&password=s3cret   # 连 RPC 服务端（详见「本地变远程」）
-```
-
-**与其他应用共用一套存储时用前缀隔离**：`sqlite/mysql/pg/mssql` 的 `Config.TablePrefix`
-给四张表和二级索引加前缀；`redis` 的 `Config.KeyPrefix` 派生 `<pfx>kv:` /
-`<pfx>q:` / `<pfx>z:` 三段；`ssdb` 的 `Config.KeyPrefix` 给三类数据的键名加逻辑
-前缀（读回时自动剥除，`Scan` 也夹在该前缀内）。默认值即当前布局，不配则不变。
-
-完整演示见 [`example/main.go`](example/main.go)。
+完整示例见 [`example/main.go`](example/main.go)。
 
 ## 内置基座
 
-| 基座 | 子包 | KV | Queue | ZSet | 说明 |
-|---|---|---|---|---|---|
-| 纯内存 | `mem` | ✅ | ✅ | ✅ | 不落盘，测试/缓存 |
-| JSONL 日志 | `jsonl` | ✅ | ✅ | ✅ | append-only WAL，打开时回放，支持 `Compact()`；单进程内嵌 |
-| BoltDB | `bolt` | ✅ | ✅ | ✅ | bbolt 单文件 B+tree（纯 Go）；每写一次事务提交，批写整批一次提交 |
-| LevelDB | `leveldb` | ✅ | ✅ | ✅ | syndtr/goleveldb LSM-tree（纯 Go）；批写收进单个 Batch 原子提交 |
-| Badger | `badger` | ✅ | ✅ | ✅ | dgraph-io/badger LSM-tree（纯 Go）；有 MVCC 事务，批写整批一个 `Update` 提交，**批内可见** |
-| SQLite | `sqlite` | ✅ | ✅ | ✅ | 纯 Go 驱动（modernc），无 CGO |
-| MySQL | `mysql` | ✅ | ✅ | ✅ | 共享 `sqlstore` |
-| PostgreSQL | `pg` | ✅ | ✅ | ✅ | 共享 `sqlstore` |
-| SQL Server | `mssql` | ✅ | ✅ | ✅ | 共享 `sqlstore`；upsert 走 `MERGE`，行锁 `WITH (UPDLOCK, HOLDLOCK)`，分页 `OFFSET/FETCH NEXT`；无 `RETURNING`，Incr 走事务路径 |
-| Redis | `redis` | ✅ | ✅ | ✅ | String / List / Sorted Set 原生映射 |
-| SSDB | `ssdb` | ✅ | ✅ | ✅ | 原生文本协议客户端，连接池 + 认证 |
-| RPC | `rpc` | ✅ | ✅ | ✅ | 连远端 kvdb 服务端；能力随服务端底座，客户端不感知底座 |
+同一套 API 覆盖 11 个基座；URI 列即 scheme 参考。SQL 系用 `?table_prefix=` 加前缀，
+`redis`/`ssdb` 用 `?key_prefix=`（逻辑前缀，读回时剥除，`Scan` 也限定其中）；不配置即当前布局。
 
-导入路径为 `github.com/RelicOfTesla/kvdb/<子包>`，另有聚合包 `.../all`。
+| 基座 | 包 | KV/Queue/ZSet | URI 与要点 |
+|---|---|---|---|
+| 内存 | `mem` | ✅✅✅ | `mem://` — 不持久化，测试/缓存用 |
+| JSONL 日志 | `jsonl` | ✅✅✅ | `jsonl://./d.jsonl` — 追加写 WAL，打开时回放，可 `Compact()`；缺省 flush 500ms + fsync 1s，`?sync=1` 逐操作，`?each_flush=1` 逐操作 flush |
+| BoltDB | `bolt` | ✅✅✅ | `bolt://./d.bolt` — 单文件 B+tree；缺省不逐提交 fsync、按 `?sync_interval=1s` 周期落盘，`?sync=1` 逐提交 |
+| LevelDB | `leveldb` | ✅✅✅ | `leveldb://./d.dir` — LSM；`?sync=1` 逐提交，`?cache`/`?wb` 单位 MiB |
+| Badger | `badger` | ✅✅✅ | `badger://./d.dir` — 带 MVCC 的 LSM；`?sync=1` 逐提交，`?cache`/`?memtable` 单位 MiB |
+| SQLite | `sqlite` | ✅✅✅ | `sqlite://./d.db` — 纯 Go 驱动（无 CGO）；缺省 NORMAL，`?sync=1` 即 FULL |
+| MySQL | `mysql` | ✅✅✅ | `mysql://user:pass@h:3306/db?parseTime=true` |
+| PostgreSQL | `pg` | ✅✅✅ | `pg://user:pass@h:5432/db?sslmode=disable` |
+| SQL Server | `mssql` | ✅✅✅ | `mssql://sa:pass@h:1433?database=db&encrypt=disable` |
+| Redis | `redis` | ✅✅✅ | `redis://:pass@h:6379/0` — 原生 String/List/Sorted Set |
+| SSDB | `ssdb` | ✅✅✅ | `ssdb://[user:pass@]h:8888` — 原生文本协议客户端，带连接池 |
+| RPC | `rpc` | ✅✅✅ | `rpc://h:7788?auth=challenge&password=…` — 客户端不感知底座 |
+
+四个 SQL 基座共用 `sqlstore`；导入路径为 `github.com/RelicOfTesla/kvdb/<pkg>`
+（另有聚合包 `.../all`）。
 
 ## 能力模型
 
-`kvdb.Open` / `kvdb.Wrap` 返回接口 `DB`，它由若干能力接口组合而成，具体适配器
-为非导出实现：
+`kvdb.Open` / `kvdb.Wrap` 返回接口 `DB`，它内嵌各能力接口（`KvProvider` 必选，另有
+`QueueProvider` / `ZSetProvider` / `Batcher` / `Closer`）与 `Capabilities() core.Caps`。
+具体适配器不导出。
+
+未实现的能力调用返回 `ErrUnsupported`，因此先探测：
 
 ```go
-type DB interface {
-    KvProvider      // KV（必选能力）
-    QueueProvider   // 队列
-    ZSetProvider    // sorted set
-    Batcher         // db.Batch(ctx, fn)
-    Closer          // Close
-    Capabilities() core.Caps   // 实际具备的能力
-}
+c := db.Capabilities()     // c.Queue / c.ZSet / c.Batch / c.BatchComposed
 ```
 
-- 基座未实现的能力：调用返回 `ErrUnsupported`，先用 `Capabilities()` 探测可避免。
-  `core.Caps` 是结构体（新增能力不改签名）：
+`Caps` 是结构体，新增能力不改签名。`BatchComposed` 是真实的、非强制的能力差异：在同一
+事务/同一把锁内逐条应用者为 `true`（`mem`/`jsonl`/`bolt`/`badger`/`sqlite`/`mysql`/`pg`），
+而 LevelDB 的 Batch、Redis 的 MULTI/EXEC、SSDB 的流水线在提交前读不到未提交内容，为
+`false`——据此分支，或把互相依赖的操作拆到不同批次。
 
-```go
-c := db.Capabilities()
-c.Queue, c.ZSet, c.Batch           // 是否实现对应接口
-c.BatchComposed                    // 批内后续操作能否看到本批前序效果
-```
-
-- **批内可见性是可感知、非强制的能力**：同一批内多条操作涉及同一 key / 队列 /
-  zset 成员时，终值取决于基座机制。在同一事务或同一把锁内逐条应用的基座
-  （`mem` / `jsonl` / `bolt` / `badger` / `sqlite` / `mysql` / `pg`）为 `true`；
-  LevelDB 的 Batch、Redis 的 MULTI/EXEC、SSDB 的流水线在提交前读不到未提交内容，
-  为 `false`。需要确定性组合时，先探测再决定，或直接把相互依赖的操作拆批。
-- **窄依赖**：业务函数只需声明用到的能力接口，测试里实现对应方法即可，无需实现整个 `DB`：
+只依赖用到的接口（测试桩便只需实现对应方法）：
 
 ```go
 func touch(ctx context.Context, store kvdb.KvProvider, key string) (int64, error) {
-    return store.Incr(ctx, key, 1)   // 真实基座与 mock 均可传入
+    return store.Incr(ctx, key, 1)
 }
 ```
 
-- `kvdb.Unwrap(db)` 可取回适配器背后的基座（非适配器实现返回 nil）。
+`kvdb.Unwrap(db)` 取出适配器背后的基座（非适配器返回 nil）。
 
 ## 批量写
 
-一批操作一次提交，显著降低往返与持久化开销：
+整批一次提交，降低往返与持久化开销：
 
 ```go
 err := db.Batch(ctx, func(b *kvdb.Batch) error {
     b.Set("k", value)
     b.QPush("jobs", payload)
     b.ZIncr("rank", "alice", 1)
-    return nil        // 返回 nil 才提交；返回错误或收集期校验失败则整批不生效
+    return nil   // 仅 nil 提交；收集期出错则整批不生效
 })
 ```
 
-- 设计为「共享收集器 + 基座只实现提交」：基座实现 `ApplyBatch(ctx, ops)`，
-  各基座映射到原生机制（SQL = 一个事务、Redis = 一次 MULTI/EXEC、SSDB = 一次
-  流水线、jsonl = 一次 flush、mem = 单次持锁）。
-- 批内只允许**无条件写**（Set/SetEx/Del/Expire/QPush/QPushFront/ZSet/ZDel/ZIncr）；
-  `Incr`/`QPop` 依赖键的当前状态、需先校验再提交，混入会破坏整批原子性，需单独调用。
-- 原子性：MySQL/SQLite/PG（事务）、Redis（MULTI/EXEC）、mem/jsonl（进程内）
-  在提交失败时整批不生效；**SSDB 无事务**，流水线失败可能部分生效（其价值在减少往返）。
+基座只需实现 `ApplyBatch(ctx, ops)` 并映射到各自原生机制（一次 SQL 事务、一次 Redis
+MULTI/EXEC、一次 SSDB 流水线、一次 jsonl flush、mem 一次持锁）。批内**只允许无条件写**
+（`Set/SetEx/Del/Expire/QPush/QPushFront/ZSet/ZDel/ZIncr`）；`Incr`/`QPop` 依赖当前状态，
+必须单独调用。原子性：事务型与进程内基座失败即整批不生效，而 **SSDB 无事务**，
+流水线失败可能部分生效。
 
 ## 字节 ↔ T 辅助
 
 ```go
-type User struct {
-    ID   int64    `json:"id"`
-    Name string   `json:"name"`
-    Tags []string `json:"tags"`
-}
-
-// 写：内联编码
-db.Set(ctx, "n", kvdb.Enc(int64(42)))     // 标量 -> 十进制文本
+db.Set(ctx, "n", kvdb.Enc(int64(42)))     // 标量 -> 十进制文本（与 Incr 互操作）
 db.Set(ctx, "u", kvdb.Enc(User{ID: 7}))   // 结构体 -> JSON
 
-// 读：D 合并 Get/QPop 的 (val, ok, err) 三返回值，ok 与 err 都原值透传
-//（缺失时 ok=false 且 err=nil）
-n, ok, err := kvdb.D[int64](db.Get(ctx, "n"))
+// D 合并 Get/QPop 的 (val, ok, err)，两者都原值透传（缺失 => ok=false, err=nil）
 u, ok, err := kvdb.D[User](db.Get(ctx, "u"))
-v, ok, err := kvdb.D[string](db.QPop(ctx, "jobs"))
-
-// 需要"缺失即错误"时自行判断：
-//   if err != nil { return err }   // IO / 解析错误
-//   if !ok { return kvdb.ErrNotFound }
-
-// panic 变体：只看 err（忽略 ok，缺失返回零值）
-n := kvdb.DMust[int64](db.Get(ctx, "n"))
+n := kvdb.DMust[int64](db.Get(ctx, "n"))  // panic 变体：只看 err（缺失返回零值）
 raw, err := kvdb.Dec[User](b)
 ```
 
-编码规则：
+| 类型 | 编码 |
+|---|---|
+| 整数、float、string、bool | 文本（与 `Incr` 互操作） |
+| `[]byte` | 恒等（不经 JSON/base64） |
+| 结构体、切片、映射、指针等 | `Marshal`（默认 JSON） |
 
-| 类型 | 编码 | 说明 |
-|---|---|---|
-| 整数（含 `~` 别名）、float、string、bool | 文本 | 与 `Incr` 互操作（`Enc(int64)` → 十进制） |
-| `[]byte` | 恒等 | 不经过 JSON/base64 |
-| 结构体、切片、映射、指针、接口等 | `Marshal`（默认 JSON） | 支持嵌套结构体与 `json` tag；未导出字段忽略 |
+`kvdb.Marshal` / `kvdb.Unmarshal` 是包级变量，可在 init 中整体替换（msgpack / protobuf /
+gob）；标量路径不受影响。`Enc` 编码失败会 panic——需要处理错误请直接调 `Marshal`。
 
-**编解码可替换**：`kvdb.Marshal` / `kvdb.Unmarshal` 是包级变量，默认 JSON，
-可在 init 中换成 msgpack / protobuf / gob 等；标量路径不受影响。
+### Go 1.27.1+：`TypedStore` 薄壳
 
-```go
-func init() {
-    kvdb.Marshal = msgpack.Marshal
-    kvdb.Unmarshal = msgpack.Unmarshal
-}
-```
-
-注意 `Enc` 对编码失败会 panic（不返回 error）；需要错误处理时直接调用 `Marshal`。
-
-### Go 1.27.1+：`TypedStore` 薄壳（读写都走类型参数）
-
-`TypedStore` 与 `StoreProvider`（`KvProvider + QueueProvider + ZSetProvider`）
-一一对照——泛型壳只依赖这一个接口，不要求 `Batch`/`Close`：
+`TypedStore` 只包 `StoreProvider`（`KvProvider + QueueProvider + ZSetProvider`），
+不要求 `Batch`/`Close`：
 
 ```go
-tdb := kvdb.Typed(db)                      // db 满足 kvdb.StoreProvider 即可
+tdb := kvdb.Typed(db)                      // db 只需满足 kvdb.StoreProvider
 u, err := tdb.Get[User](ctx, "user:1")     // = kvdb.D[User](db.Get(ctx, "user:1"))
 err = tdb.Set(ctx, "user:1", u)            // = db.Set(ctx, "user:1", kvdb.Enc(u))
-err = tdb.SetEx(ctx, "sess", s, 3600)
 n, err := tdb.Get[int64](ctx, "visits")    // 标量走文本编码，与 Incr 互操作
-job, err := tdb.QPush(ctx, "jobs", j)      // 队列写也是泛型
 ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 ```
 
-- **写**：`Set[T]` / `SetEx[T]` / `QPush[T]` / `QPushFront[T]`，编码 `Enc[T]`；
-- **读**：`Get[T]` / `MGet[T]` / `QPop[T]` / `QPopBack[T]` / `QFront[T]` / `QBack[T]`，
-  以及非泛型的 `QRange`（队列元素本身就是原始字节）；
-  解码 `Dec[T]`/`D[T]`，空/缺失折算为 `ErrNotFound`。它们各有一个 `…OK` 变体
-  （`GetOK` / `QPopOK` / `QPopBackOK` / `QFrontOK` / `QBackOK`），**保留 `ok` 原值**：
-  `ok=false` 且 `err=nil`；
-- `T = []byte` 时与直接调用基座方法**完全等价**（`Enc` 对 `[]byte` 恒等透传）；
-- **批写**：`tdb.BatchT(ctx, func(b kvdb.TypedBatch) error {...})`——收集时即编码，
-  **同一批可混装多种类型**（`b.Set("cnt", 42)` 与 `b.Set("u:1", u)` 并存）；
-  `Del`/`Expire`/`ZSet` 等经内嵌 `*Batch` 直接可用；
-- 泛型方法会遮蔽同名方法，**`TypedStore` 不满足 `StoreProvider`**（签名不同），
-  需要原始接口时用 `tdb.StoreProvider`；参数是 `StoreProvider`（不含 Batch/Close），
-  因此 `kvdb.Typed(db)` 对 `kvdb.Open` 的返回值同样可用；
-- 版本与门禁：方法级类型参数自 Go 1.27 起支持，实现在带 `//go:build go1.27` 的文件中
+写为 `Set[T]` / `SetEx[T]` / `QPush[T]` / `QPushFront[T]`（`Enc[T]` 编码）；读为
+`Get[T]` / `MGet[T]` / `QPop[T]` / `QPopBack[T]` / `QFront[T]` / `QBack[T]`，另有非泛型的
+`QRange`（队列元素本身就是原始字节），解码用 `Dec[T]`/`D[T]`；缺失折算为 `ErrNotFound`，
+每个读方法都有 `…OK` 变体（`GetOK` / `QPopOK` / …）**保留 `ok`**（`ok=false`、`err=nil`）。
+`T = []byte` 时与直接调用基座完全等价。`tdb.BatchT(ctx, func(b kvdb.TypedBatch) error {...})`
+在收集时编码，**同一批可混装多种类型**；`Del`/`Expire`/`ZSet` 经内嵌 `*Batch` 仍可用。
+泛型方法会遮蔽同名方法，故 `TypedStore` **不满足** `StoreProvider`（用 `tdb.StoreProvider`）。
+由 `//go:build go1.27` 门禁。
 
 ## 扩展：自定义基座
 
-实现 `core.KvProvider`（KV 必选）+ 可选能力接口，注册后即可经 `kvdb.Open` 使用：
+实现 `core.KvProvider`（必选）与所需可选能力接口，注册后即可经 `kvdb.Open` 使用：
 
 ```go
 type myStore struct{ /* ... */ }
 
 func (m *myStore) Set(ctx context.Context, key string, value []byte) error { /* ... */ }
-// ... 其余 KV 方法；可选再实现 core.QueueProvider / core.ZSetProvider / core.BatchProvider
+// ... 其余 KV 方法；可选实现 core.QueueProvider / core.ZSetProvider / core.BatchProvider
 
 func init() {
     kvdb.MustRegister("mybase", func(ctx context.Context, u *url.URL) (core.KvProvider, error) {
         return &myStore{}, nil
     })
 }
-// 业务侧 import _ "your/module/mybase"，随后 kvdb.Open(ctx, "mybase://...") 即可用
+// 使用方：import _ "your/module/mybase"，随后 kvdb.Open(ctx, "mybase://...")
 ```
 
-`kvdb.Register` 返回重复/空 scheme 错误；`kvdb.Schemes()` 列出已注册 scheme。
-`FullProvider` 用于整体声明"KV + Queue + ZSet + Batch + Close"全部能力。
+`kvdb.Register` 在 scheme 重复或为空时报错；`kvdb.Schemes()` 列出已注册项；
+`FullProvider` 一次性声明"KV + Queue + ZSet + Batch + Close"整套能力。
 
 ## 本地变远程（RPC / c-s）
 
-把任一基座放到服务端，客户端经网络用**同一组接口**访问它——用于跨进程/跨机隔离、
-把嵌入式基座（jsonl/bolt/sqlite…）变成可供多个消费者共享的服务。
+任一基座放在服务端，客户端经**同一套接口**通过网络访问——用于跨进程/跨机隔离，或把
+嵌入式基座变成多消费方共享的服务。
 
 ```go
-// 服务端：选一个底座即可（server 侧 import 对应基座包或 .../all）
+// 服务端：选一个底座（import 对应基座包，或 .../all）
 srv, err := rpc.NewServer(ctx, rpc.ServerConfig{
-    Addr:     ":7788",
-    Backend:  "jsonl://./data.jsonl",   // 换成 bolt/sqlite/mysql/ssdb… 客户端都不用改
-    Auth:     rpc.AuthChallenge,
-    Password: "s3cret",
+    Addr: ":7788", Backend: "jsonl://./data.jsonl",   // 换成 bolt/sqlite/mysql/ssdb…
+    Auth: rpc.AuthChallenge, Password: "s3cret",
 })
 go srv.Serve(ctx)
 
-// 客户端：不 import 任何基座，也无需知道对端是什么
+// 客户端：不 import 任何基座，也不需要知道对端是什么
 db, err := kvdb.Open(ctx, "rpc://127.0.0.1:7788?auth=challenge&password=s3cret")
 defer db.Close()
-db.Set(ctx, "k", []byte("v"))           // KV / Queue / ZSet / Batch 全部可用
+db.Set(ctx, "k", []byte("v"))           // KV / Queue / ZSet / Batch 都可用
 ```
 
-也可直接跑现成的服务端命令：
+也可直接跑现成的服务端命令：`go run ./example/rpcdemo -addr :7788 -backend jsonl://./data.jsonl -auth challenge -password s3cret`
 
-```bash
-go run ./example/rpcdemo -addr :7788 -backend jsonl://./data.jsonl -auth challenge -password s3cret
-```
-
-要点：
-
-- **客户端不感知底座**：`rpc` 实现的是 `core.FullProvider`，与本地基座同一组接口。
-  连的是 jsonl 还是 mysql，客户端代码完全一致；换底座只改服务端一个参数。
-- **`rpc` 模块零第三方依赖**（仅标准库 + 根包），客户端侧只引入 `kvdb` + `kvdb/rpc`。
-- **能力如实透传**：`db.Capabilities()` 报告的正是**服务端底座**的能力，含
-  `BatchComposed`——不会因为套了一层 RPC 而"变强"。
-- **哨兵错误原样过线**：各有独立 wire 状态，故客户端仍可用 `errors.Is` 正常判等
+- **客户端不感知底座**：`rpc` 实现 `core.FullProvider`，无论对端是 jsonl 还是 mysql，客户端
+  代码完全相同；换底座只改服务端一个参数。`rpc` 模块（尤其客户端）**零第三方依赖**。
+- **能力与错误如实透传**：`Capabilities()` 报告的正是**服务端底座**的能力（不会因为套了
+  一层 RPC 而"变强"）；哨兵错误各有独立 wire 状态，故客户端仍可用 `errors.Is` 判等
   （完整清单见 `core` 包文档）。
-- **批写一次往返**：`db.Batch(...)` 整批发给服务端，由底座一次提交；批内可见性
-  取决于底座本身（与本地直连一致）。
-- **生命周期边界**：客户端 `Close()` 只关自己的连接，不会关掉服务端基座。
+- **批写一次往返**；批内可见性取决于底座本身。客户端 `Close()` 只关自己的连接，不会关掉
+  服务端基座。
 
-### 认证（c/s 协议自己的认证，与底座 auth 无关）
+### 认证、TLS、codec
 
-| 模式 | URI 参数 | 说明 |
+认证是 **c/s 协议自己的**（mysql 密码这类底座凭据由服务端负责，客户端不感知）：
+
+| 模式 | URI | 说明 |
 |---|---|---|
-| 无认证 | `auth=none`（默认） | 本机/内网裸奔 |
-| 明文 | `auth=plain&password=…` | 口令直接发送；**默认不打开**，仅在已有 TLS/unix socket 时用 |
-| 挑战-响应 | `auth=challenge&password=…` | 服务端下发一次性 nonce，客户端回 `HMAC-SHA256(password, nonce)`；**口令不上线**，且重放无效。需要认证时选它 |
+| 无认证（缺省） | `auth=none` | 本机/内网裸奔 |
+| 明文 | `auth=plain&password=…` | 口令上线；默认关闭，仅限已套 TLS 时使用 |
+| 挑战 | `auth=challenge&password=…` | 服务端下发一次性 nonce，客户端回 `HMAC-SHA256(password, nonce)`；口令不上线 |
 
-口令也可写在 userinfo 里：`rpc://:s3cret@host:7788?auth=challenge`。
-给了口令却没写 `auth=` 会直接报错，避免"以为加密了其实没开"。
-
-> 这里是**传输层**的认证。底座自身的认证（如 mysql 用户口令、ssdb `server.auth`）
-> 由服务端在连接底座时处理，客户端不承担也不应感知。
-
-### TLS
-
-标准 `crypto/tls`，**同一端口按服务端配置切换**（给证书即 TLS，不给即明文）：
+TLS 为标准 `crypto/tls`，由服务端配置决定同一端口是否启用（给了证书即 TLS）：
 
 ```bash
-rpc://host:7788?tls=1&ca=./ca.pem                                  # 校验服务端
-rpc://host:7788?tls=1&ca=./ca.pem&cert=./c.pem&key=./c.key         # 双向 TLS
-rpc://host:7788?tls=1&server_name=kvdb.internal
-rpc://host:7788?tls=1&insecure=1                                   # 跳过校验，仅测试
+rpc://h:7788?tls=1&ca=./ca.pem                            # 校验服务端
+rpc://h:7788?tls=1&ca=./ca.pem&cert=./c.pem&key=./c.key   # 双向 TLS
+rpc://h:7788?tls=1&insecure=1                             # 仅测试
 ```
 
-给了 TLS 参数却没写 `tls=1` 会报错；用明文连 TLS 端口会失败，**不会静默降级**。
+配置错误一律明确失败：写了 password 却没写 `auth=`、写了 TLS 参数却没写 `tls=1`、
+明文连 TLS 端口，都会立刻报错——**不会静默降级**。
 
-### 协议与 codec
-
-默认使用一套**仿 Redis（RESP2）**的报文格式，因此抓包可读、也能用 `nc` 手测：
-
-```
-$ nc 127.0.0.1 7788
-$3
-SET
-*2
-$1
-k
-$1
-v
-
-:1
-+ok
-
-```
-
-编解码抽象成 `rpc/codec.Codec`，可整体替换；内置 `resp`（默认）与 `binary`
-（uvarint 长度前缀，省掉文本转义）。两端必须装配同一个：
-
-```go
-rpc.ServerConfig{Codec: rpc.CodecBinary}
-rpc.Config{Codec: rpc.CodecBinary}          // 或 URI 加 ?codec=binary
-```
-
-连接建立时双方会交换 codec 名称，不一致立即报错（而不是互等到超时）。
-
-### 其他可用参数
-
-| 参数 | 说明 |
-|---|---|
-| `pool=N` | 客户端连接池大小（默认 8）。单连接一次只跑一条命令，并发靠多连接 |
-| `codec=resp\|binary` | 报文编解码 |
-| `max-conns`（服务端） | 最大并发连接数 |
+codec 抽象在 `rpc/codec.Codec`：`resp`（默认，仿 RESP2，可用 `nc` 手测）、`binary`
+（uvarint 长度前缀）、`textproto`（SSDB 风格记录，**不与 SSDB 互通**）。两端必须一致，
+不一致在握手即失败。其他参数：`pool=N`（客户端连接池，缺省 8）、`max-conns`（服务端）。
 
 ## 兼容性
 
 | 依赖 | 已验证版本 |
 |---|---|
-| MySQL | 5.6.51、8.0.46 |
-| PostgreSQL | 9.6、10、12、16 |
+| MySQL | 5.6.51, 8.0.46 |
+| PostgreSQL | 9.6, 10, 12, 16 |
 | SQL Server | 2022（mcr.microsoft.com/mssql/server） |
-| SQLite | modernc.org/sqlite（纯 Go，需 3.35+ 支持 `RETURNING`） |
+| SQLite | modernc.org/sqlite（纯 Go，`RETURNING` 需 3.35+） |
 | Redis | 7.x |
 | SSDB | 原生协议，支持 `server.auth` |
 
-SQLite 采用纯 Go 驱动（modernc），吞吐与 CGO 驱动相当，不引入 CGO 依赖。
-
 ## 性能
 
-> 完整实测数据、各基座成本模型与选型建议见 **[PERFORMANCE_CN.md](PERFORMANCE_CN.md)**。
+完整实测数据、成本模型与选型建议见 **[PERFORMANCE_CN.md](PERFORMANCE_CN.md)**。
+口径：固定时间窗内压满并发负载，统计实际完成量（ops/s）。决定选型的五条：
 
-口径：**固定时间窗内跑满并发负载、统计实际完成量**（ops/s）。要点：
-
-- **缺省档不逐提交 fsync，`?sync=1` 才要断电安全**：同一真实 ext4 上，`sync=1` 比缺省档
-  慢 29–940×。**"要不要 sync=1"比"选哪个基座"影响更大**，选型时应先定档位。
-- **写瓶颈通常是每个事务一次 fsync**，而非语句条数：本环境裸 fsync 为
-  tmpfs 2–4 µs、ext4(vhdx) ~2.5 ms、drvfs(9p) 3.8–5.5 ms。
-- **批写收益随提交成本缩放**：缺省档 2.2–6.0×（bolt 达 18.8×，因它每写必开事务）；
-  `sync=1` 档高达 39–86×。
-- **同 key 热点在 SQL 上明显掉档**：mysql 多 key 428 vs 同 key 119 ops/s（3.6×）、
-  pg 2.2k vs 647（3.4×）。计数器请分散 key 或改批写。
-- **服务端基座**：redis 批写收益最大（39×），ssdb 因无事务只有 2.6×。
-- **读写混合下读会被写压掉**：`mem`/`jsonl` 共用全局锁，高写频率时读只剩纯读的 5–9%；
-  服务端基座则读写互不阻塞（各保留 ~44–63%）。见下方主表的混合读写列。
-- 两个独立杠杆：**改用批写**、以及放宽部署侧持久化（MySQL
-  `innodb_flush_log_at_trx_commit=2`、PostgreSQL `synchronous_commit=off`，
-  会缩短崩溃恢复窗口，需自行确认可接受）。
-- 复测：`cd bench && KVDB_BENCH_URI=<uri> go test -run '^$' -bench Throughput -benchtime 3s`
-
-### 主表：ext4 + 缺省档（选型看这一张）
-
-真实块设备（ext4/WSL vhdx）、各基座缺省档（不逐提交 fsync）。8 goroutine、时间窗
-`-benchtime 2s`、统计实际完成量。`MGet条目` / `批写条目` 为折算到条目级的 items/s；
-`Incr多key` 各写者独立 key，`Incr同key` 全部打同一个计数器。
-
-`混合读` / `混合写` 来自混合负载基准（8 goroutine 中一半持续读 64-key 热集、一半写
-独立 key）；`读保留率` = 混合读 ÷ 该基座纯读 Get。
-
-| 基座 | Set | Get | Incr多key | Incr同key | QPush | MGet条目 | 批写条目 | 混合读 | 混合写 | 读保留率 |
-|---|---|---|---|---|---|---|---|---|---|---
-| jsonl | ~353.6k | ~10.0M | ~190.1k | ~242.2k | ~639.3k | ~14.1M | ~454.7k | ~474k | ~105k | 5% |
-| bolt | ~25.2k | ~591.1k | ~22.9k | ~26.9k | ~20.9k | ~2.6M | ~473.8k | ~170k | ~13.5k | 27% |
-| leveldb | ~164.6k | ~1.0M | ~111.8k | ~122.4k | ~111.8k | ~1.0M | ~354.2k | ~98.7k | ~52.4k | 11% |
-| badger | ~81.8k | ~274.4k | ~63.5k | ~34.0k | ~64.7k | ~608.2k | ~493.8k | ~76.4k | ~49.7k | 28% |
-| sqlite | ~12.6k | ~62.9k | ~5.0k | ~5.8k | ~5.5k | ~450.9k | ~37.6k | ~40.1k | ~5.8k | 64% |
-
-**参照系（不同介质/部署，不与主表直接比较）**
-
-| 基座 | 介质 | Set | Get | Incr多key | Incr同key | QPush | MGet条目 | 批写条目 | 混合读 | 混合写 | 读保留率 |
-|---|---|---|---|---|---|---|---|---|---|---|---
-| mem | 无 IO | ~775k | ~8.4M | ~825k | ~3.0M | ~2.85M | ~14.8M | ~1.48M | ~783k | ~251k | 9% |
-| redis | 容器 ext4 | ~12.7k | ~12.4k | ~14.9k | ~13.4k | ~13.2k | ~256.4k | ~497.2k | ~7.1k | ~7.0k | 57% |
-| ssdb | 容器 ext4 | ~8.0k | ~7.6k | ~7.7k | ~7.9k | ~8.2k | ~137.4k | ~20.6k | ~3.7k | ~3.5k | 48% |
-| mysql 8.0 | 容器 ext4 | ~718 | ~5.3k | ~428 | ~119 | ~400 | ~95.6k | ~4.6k | ~2.9k | ~453 | 55% |
-| pg 16 | 容器 ext4 | ~2.4k | ~9.9k | ~2.2k | ~647 | ~1.4k | ~185.7k | ~8.8k | ~5.3k | ~1.4k | 54% |
-
-### 其余介质与档位矩阵
-
-主表只覆盖"ext4 + 缺省档"，其余组合如下（换介质或换档位即换了比较基准）：
-
-**`?sync=1`（逐提交 fsync）@ ext4**：只有写路径受影响，读与主表相同。
-
-| 基座 | Set | QPush | 相对缺省档慢 |
-|---|---|---|---|
-| jsonl | ~377 | ~410 | ~940× |
-| bolt | ~449 | ~464 | ~56× |
-| leveldb | ~1.3k | ~1.3k | ~128× |
-| badger | ~748 | ~736 | ~109× |
-| sqlite | ~440 | — | ~29× |
-
-**结论**
-
-- **"要不要 `sync=1`"比"选哪个基座"影响更大**：缺省档把 fsync 从写热路径摘掉后，
-  嵌入式写吞吐提升 1–2 个数量级；需要掉电不丢时 `sync=1` 的吞吐只有 ~377–1.3k ops/s，
-  此时应优先用 `Batch` 摊薄提交。
-- **读路径几乎不受介质影响**（leveldb Get 各档均 ~1.0M、badger ~272–298k），
-  写路径跨介质差 2–3 个数量级。
-- **服务端基座读吞吐低于嵌入式**（redis Get ~12.4k vs bolt ~590k），瓶颈是网络往返；
-  但它天然"缺省即耐久"，无需在速度与安全间二选一。
-- **同 key 热点在 SQL 上掉档最明显**：mysql 多 key 428 → 同 key 119（3.6×）、
-  pg 2.2k → 647（3.4×）。计数器请分散 key 或改批写。
-- **读写混合**：服务端基座读写互不阻塞（各保留 ~44–63%）；`mem`/`jsonl` 因共用全局锁，
-  高写频率下读只剩纯读的 5–9%。`badger` 的读保留率由"写提交窗口"决定——`?sync=1` 时
-  一次提交要 1.3–3 ms，读保留率只剩 0.2–0.4%，缺省档已消除该现象。
-- 两个独立杠杆：**改用批写**、以及放宽部署侧持久化（MySQL
-  `innodb_flush_log_at_trx_commit=2`、PostgreSQL `synchronous_commit=off`，
-  会缩短崩溃恢复窗口，需自行确认可接受）。
-- 复测：`cd bench && KVDB_BENCH_URI=<uri> go test -run '^$' -bench Throughput -benchtime 3s`
-
-> 各基座成本模型（每操作做了什么）与更长的分析见 **[PERFORMANCE_CN.md](PERFORMANCE_CN.md)**。
-
-
+- **先定持久化档位，再挑基座**：缺省档不逐提交 fsync；真实 ext4 上 `?sync=1` 慢
+  **29–940×**。同一介质同一基座，这个杠杆的作用大于"选哪个基座"。
+- **写瓶颈通常就是"每提交一次 fsync"**，而非语句条数，因此**批写收益随提交成本放大**：
+  缺省档 2.2–6.0×（bolt 达 18.8×，因为它每次写都开事务），`?sync=1` 档 39–86×。
+- **同 key 热点对 SQL 系伤害明显**（mysql 多 key 428 vs 同 key 119；pg 2.2k vs 647）：
+  把计数器打散到多个 key，或改用批写。
+- **混合读写时 `mem`/`jsonl` 的读被压到纯读的 5–9%**（共用全局锁）；服务端基座的读写
+  互不阻塞（各自保留 ~44–63%）。
+- 复测：`cd example/bench && KVDB_BENCH_URI=<uri> go test -run '^$' -bench Throughput -benchtime 3s`
 
 ## 测试
 
-**每个模块独立**，`go test ./...` 只覆盖当前模块；跑全部模块用：
+各模块独立，故 `go test ./...` 只覆盖当前模块：
 
 ```bash
-# 跑全部模块（. 开头的目录都是本地脚手架，不属于仓库）
-for m in $(find . -name go.mod -not -path './.*'); do
-    (cd "$(dirname "$m")" && go test ./...) || exit 1
-done
+for m in $(find . -name go.mod -not -path './.*'); do (cd "$(dirname "$m")" && go test ./...) || exit 1; done
 ```
 
-单模块跑法（跨模块依赖由各 go.mod 的 replace 解析，无需工作区文件）：
+容器型基座在未设置 DSN 时跳过（容器均绑定回环地址）：`KVDB_TEST_MYSQL_DSN`、
+`KVDB_TEST_PG_DSN`、`KVDB_TEST_MSSQL_DSN`、`KVDB_TEST_REDIS_ADDR`、`KVDB_TEST_SSDB_ADDR`、
+`KVDB_TEST_SSDB_AUTH_ADDR`/`_PASS`。
 
-```bash
-cd mem    && go test ./...     # 本地基座 + 进程内替身（miniredis、假 SSDB）
-cd sqlite && go test ./...
-cd rpc    && go test ./...     # RPC：合同用例跨 RPC、三种认证、TLS、codec、多种真实底座
-```
-
-真实基座用例默认跳过，设置对应环境变量后启用（端口按需调整，避免与本地服务冲突）：
-
-```bash
-# 测试容器只绑回环地址，避免弱口令测试服务暴露到局域网。
-docker run -d --name kvdb-mysql -p 127.0.0.1:3306:3306 -e MYSQL_ROOT_PASSWORD=pw -e MYSQL_DATABASE=kvdb_test mysql:8.0
-docker run -d --name kvdb-pg    -p 127.0.0.1:5432:5432 -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=kvdb_test postgres:16-alpine
-docker run -d --name kvdb-redis -p 127.0.0.1:6379:6379 redis:7-alpine
-
-KVDB_TEST_MYSQL_DSN='root:pw@tcp(127.0.0.1:3306)/kvdb_test' \
-KVDB_TEST_PG_DSN='postgres://postgres:pw@127.0.0.1:5432/kvdb_test?sslmode=disable' \
-KVDB_TEST_REDIS_ADDR=127.0.0.1:6379 \
-  go test ./...          # 在对应基座模块目录内执行
-```
-
-| 环境变量 | 用途 |
-|---|---|
-| `KVDB_TEST_MYSQL_DSN` | MySQL DSN（专用测试库，用例前会 DROP 本 SDK 的表） |
-| `KVDB_TEST_PG_DSN` | PostgreSQL DSN（同上） |
-| `KVDB_TEST_REDIS_ADDR` | Redis 地址（用例使用独立 DB 并清空） |
-| `KVDB_TEST_SSDB_ADDR` | SSDB 地址（用例前 flushdb） |
-| `KVDB_TEST_SSDB_AUTH_ADDR` / `KVDB_TEST_SSDB_AUTH_PASS` | 启用 `server.auth` 的 SSDB 实例 |
-
-所有基座共用根模块内 `kvdbtest` 的合同用例（一文件一主题：harness / kv / queue / zset /
-batch / ttl / scan / ownership / namespace / lifecycle / incr）。该套件断言**各基座行为
-一致**，仅当 `Capabilities()` 显式声明差异时才分支（`Queue` / `ZSet` / `Batch` /
-`BatchComposed` / `IncrWraps`）——因此任何**未声明**的分歧都会表现为用例失败。
-SSDB 另用进程内假服务器交叉验证线协议编码。
-
-根模块的注册表/编解码用例用一个**测试桩**（`stub_test.go` 注册的 `stub://`）验证
-"注册表默认空 + 显式接入"语义，因此根模块自身零第三方依赖；真实基座的"import 即
-自注册"由各基座模块自己的用例覆盖（如 `mem/registry_test.go`）。
+各基座共用 `kvdbtest` 的合同用例（一文件一主题）。该套件断言**各基座行为一致**，仅当
+`Capabilities()` 显式声明差异时才分支——因此任何**未声明**的分歧都会表现为失败；SSDB 另用
+进程内假服务器交叉验证线协议编码。
 
 ## 目录结构
 
-**每个子目录是一个独立 Go 模块**（各有 go.mod；跨模块依赖用 require + replace
+**每个子目录是一个独立 Go 模块**（各有 `go.mod`；跨模块依赖用 `require` + `replace`
 指向同级目录，保证每个模块单独可 build / test / tidy）：
 
 ```
-core/                  契约：KvProvider / Queue- / ZSet- / BatchProvider / Closer / FullProvider
-  provider.go            接口、哨兵错误、能力声明
-  helper.go              各基座显式调用的共享辅助（CheckKey、AddTTL…）
-  clock.go               可注入的时钟（core.Now）
-provider.go            Open 与契约再导出
-db.go                  DB 接口与默认适配器（adapter）
-batch.go               Batch 收集器与 DB.Batch 分发
-bytes.go               Enc / Dec / D / DMust 字节编解码
-registry.go            Register / MustRegister / Schemes
-kvdbtest/              跨基座共享合同用例，**一文件一主题**（harness / kv / queue / zset /
-                       batch / ttl / scan / ownership / namespace / lifecycle / incr）；
-                       供各基座模块测试引用
-all/                   聚合注册包：import _ 即接入全部内置基座
-mem/ jsonl/ bolt/ leveldb/ badger/ sqlite/ mysql/ pg/ mssql/ redis/ ssdb/
-                       各基座实现（各自独立模块）
-rpc/                   RPC 客户端与服务端（独立模块，零第三方依赖）
-rpc/codec/             报文编解码抽象 + RESP（默认）/ binary / textproto
-sqlstore/              MySQL / SQLite / PG / MSSQL 共享的 database/sql 实现（方言参数化）
-example/               可运行的演示与工具
-  rpcdemo/               RPC 服务端命令（import .../all）
-  cmd/cli/               类 redis-cli 的命令行客户端
-  cmd/migration/         跨基座数据迁移
-  bench/                 基准测试（独立模块，import .../all）
+core/                  契约：接口、哨兵错误、能力声明、共享辅助
+kvdbtest/              跨基座共享合同用例，一文件一主题
+mem/ jsonl/ bolt/ leveldb/ badger/ sqlite/ mysql/ pg/ mssql/ redis/ ssdb/   各基座模块
+rpc/                   RPC 客户端与服务端（+ rpc/codec：RESP / binary / textproto）
+sqlstore/              sqlite/mysql/pg/mssql 共享的 database/sql 实现
+all/                   聚合注册包（import _ 即接入全部基座）
+example/               rpcdemo（RPC 服务端）、cmd/cli、cmd/migration、bench
 ```
+
+根包文件：`provider.go`（Open 与再导出）、`db.go`（DB 接口与适配器）、`batch.go`、
+`bytes.go`、`registry.go`。
 
 ## License
 

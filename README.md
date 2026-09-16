@@ -25,423 +25,260 @@ n, err := db.Incr(ctx, "visits", 1)
 
 ## Features
 
-- **11 built-in backends**, one single API: `mem` / `jsonl` / `bolt` / `leveldb` / `badger` / `sqlite` / `mysql` / `pg` / `mssql` / `redis` / `ssdb`
-- **Optional, probed-on-demand capabilities**: KV is mandatory; Queue / ZSet / Batch / lifecycle are optional capabilities,
-  returning `ErrUnsupported` when unimplemented, and probeable via `Capabilities()`
-- **Empty registry by default**: use a backend and `import _` its package; the root package and mod pull in no driver dependencies
-- **Interface-based returns**: `kvdb.Open` returns the interface `DB`, so business code can depend narrowly on sub-interfaces such as `KvProvider`, which eases mocking
-- **Batched writes**: a batch of operations maps onto each backend's native mechanism (transaction / MULTI/EXEC / pipeline / a single flush)
-- **Bytes ↔ generic helpers**: `Enc` / `Dec` / `D` / `DMust` support scalars and structs (JSON by default, codec replaceable); scalar encoding interoperates with `Incr`. `D` passes `ok`/`err` through untouched; `DMust` inspects only `err`
-- **Local becomes remote (c/s)**: `rpc` exposes any backend as a server, and the client accesses it through the same set of interfaces;
-  the client is **unaware of the server's underlying backend**, and comes with c/s authentication (plaintext / challenge-response) plus optional TLS, with a replaceable protocol codec
-- **Optional Go 1.27.1+ thin shell**: `kvdb.Typed(store)` provides the generic read/write methods `db.Get[T](...)` / `db.Set(ctx, k, v)` (isolated by build constraints)
-- Pure Go dependencies, no CGO
+- **11 built-in backends, one API**: `mem` / `jsonl` / `bolt` / `leveldb` / `badger` / `sqlite` /
+  `mysql` / `pg` / `mssql` / `redis` / `ssdb`
+- **Optional, probed capabilities**: KV is mandatory; Queue / ZSet / Batch / Close are optional and
+  report `ErrUnsupported` when absent, probeable via `Capabilities()`
+- **Empty registry by default**: `import _` the backend you use; the root package pulls in no driver
+- **Interface-based returns**: `kvdb.Open` returns `DB`, so business code can depend narrowly on
+  sub-interfaces such as `KvProvider` (eases mocking)
+- **Batched writes** mapped onto each backend's native mechanism (transaction / MULTI-EXEC / pipeline / one flush)
+- **Bytes ↔ generic helpers**: `Enc` / `Dec` / `D` / `DMust`; scalar encoding interoperates with `Incr`
+- **Local becomes remote**: any backend as an RPC server; the client is backend-unaware, with
+  authentication (plaintext / challenge) and optional TLS, and a replaceable codec
+- **Optional Go 1.27.1+ typed shell**: `kvdb.Typed(store)` adds generic read/write methods
+- **Pure Go, no CGO**
 
-**Each backend is an independent module**, declaring its own minimum required Go version — a
-project that only uses `mem` / `jsonl` / `ssdb` will not have its version requirement raised
-by the SQL / Redis drivers:
+| Module | Min Go |
+|---|---|
+| `kvdb` (root, incl. `core`/`kvdbtest`), `mem`, `jsonl`, `sqlstore`, `mssql` | 1.18 |
+| `ssdb`, `leveldb`, `rpc` | 1.19 |
+| `badger` | 1.24 (Badger v4 declares `go 1.24.0`) |
+| `bolt`, `sqlite`, `mysql`, `pg`, `redis`, `all`, `example` | 1.25 (driver / transitive deps) |
 
-| Module | Min Go | Notes |
-|---|---|---|
-| `kvdb` (root, including `core` / `kvdbtest`) | 1.18 | Zero third-party dependencies |
-| `kvdb/mem`, `kvdb/jsonl` | 1.18 | Standard library only |
-| `kvdb/sqlstore` | 1.18 | Standard library only (the `database/sql` abstraction) |
-| `kvdb/ssdb`, `kvdb/leveldb` | 1.19 | Uses `atomic.Bool` / `atomic.Pointer[T]` |
-| `kvdb/badger` | 1.24 | Badger v4 itself declares `go 1.24.0` |
-| `kvdb/bolt`, `kvdb/sqlite`, `kvdb/mysql`, `kvdb/pg`, `kvdb/redis` | 1.25 | Determined by the driver and its transitive dependencies (e.g. `golang.org/x/sys` requires 1.25) |
-| `kvdb/mssql` | 1.18 | `go-mssqldb` v1.8.2 (newer driver lines v1.9+ require `go 1.25`; this module keeps the 1.18 baseline to align with the root package) |
-| `kvdb/rpc` | 1.19 | Standard library + root package only: **zero third-party dependencies** (especially important for the client) |
-| `kvdb/all`, `kvdb/example` | 1.25 | Aggregates the modules above (`example` also carries `rpcdemo`, `cmd/cli`, `cmd/migration`, and the standalone `bench` module) |
-
-Versions are taken as the **largest `go` directive in each module's dependency graph**
-(`go list -m -f '{{.GoVersion}}' all`), not copied from the declared value of a direct
-dependency.
-
-Measured: a Go 1.20 consumer importing only `kvdb/mem` builds and runs normally, with an
-empty dependency closure (no go.sum is produced).
+Taken as the largest `go` directive in each module's dependency graph
+(`go list -m -f '{{.GoVersion}}' all`). The root package, `mem`, `jsonl` and `rpc` need only the
+standard library: a project importing just `kvdb/mem` builds with an empty dependency closure.
 
 ## Installation
 
 ```bash
 go get github.com/RelicOfTesla/kvdb        # root package
-go get github.com/RelicOfTesla/kvdb/mem    # pull in each backend module as needed
+go get github.com/RelicOfTesla/kvdb/mem    # each backend is fetched as needed
 ```
 
-```go
-import (
-    "github.com/RelicOfTesla/kvdb"
-    _ "github.com/RelicOfTesla/kvdb/sqlite"   // wire in the backend as needed
-)
-```
+The root package has no driver dependencies — import the backend you use (see Quick start).
 
 ## Quick start
 
 ```go
 import (
-    "context"
-
     "github.com/RelicOfTesla/kvdb"
-    _ "github.com/RelicOfTesla/kvdb/sqlite"  // wire in sqlite only; or _ .../all to wire in everything at once
+    _ "github.com/RelicOfTesla/kvdb/sqlite"   // wire in one backend, or _ .../all for everything
 )
 
-ctx := context.Background()
-db, err := kvdb.Open(ctx, "sqlite://./data.db")
-if err != nil {
-    log.Fatal(err)
-}
+db, _ := kvdb.Open(ctx, "sqlite://./data.db")
 defer db.Close()
 
-// KV
 db.Set(ctx, "user:1", []byte("alice"))
 v, ok, _ := db.Get(ctx, "user:1")
-db.SetEx(ctx, "session", []byte("token"), 1800) // write and set a TTL
+db.SetEx(ctx, "session", []byte("token"), 1800)
 n, _ := db.Incr(ctx, "visits", 1)
-pairs, _ := db.Scan(ctx, "user:", "user;", 100) // closed interval: the byte after ":" is ";"
+pairs, _ := db.Scan(ctx, "user:", "user;", 100)   // closed interval
 
-// Queue (optional capability)
-db.QPush(ctx, "jobs", []byte("job-1"))
+db.QPush(ctx, "jobs", []byte("job-1"))            // Queue / ZSet are optional capabilities
 job, ok, _ := db.QPop(ctx, "jobs")
-
-// ZSet (optional capability)
 db.ZSet(ctx, "rank", "alice", 90)
 top, _ := db.ZRange(ctx, "rank", 0, -1)
 ```
 
-URI overview (same backend = same scheme or the same `sqlstore` flavor, shown as one merged
-group; each package also offers an equivalent direct constructor, such as `sqlite.Open`):
-
-```
-mem://
-jsonl://./data.jsonl?sync=1        # default flush every 500ms, fsync every 1s; sync=1 does flush+fsync per operation (nothing lost on power failure)
-jsonl://./data.jsonl?each_flush=1  # flush per operation (fsync still periodic); flush_interval/sync_interval tune the periods
-
-# ---- SQL 基座（同 sqlstore 基座，仅 scheme 与 DSN 形态不同；table_prefix 通用） ----
-sqlite://./data.db?sync=1          # default NORMAL (no fsync per commit, consistent with other local backends); sync=1 uses FULL (nothing lost on power failure)
-mysql://user:pass@host:3306/dbname?parseTime=true&table_prefix=app_
-pg://user:pass@host:5432/dbname?sslmode=disable&table_prefix=app_
-mssql://sa:pass@host:1433?database=dbname&encrypt=disable&table_prefix=app_   # 其余 query 参数照传 go-mssqldb
-
-bolt://./data.bolt?sync=1&sync_interval=1s   # by default no fsync per commit, but data is written out periodically per sync_interval (1s by default); sync=1 fsyncs per commit
-leveldb://./data.dir?sync=1&cache=8&wb=4     # directory-based storage; no fsync by default, sync=1 fsyncs per commit; cache/wb are in MiB
-badger://./data.dir?sync=1&cache=64&memtable=64   # directory-based storage; no fsync by default, sync=1 fsyncs per commit; cache/memtable are in MiB
-redis://:password@host:6379/0?key_prefix=app:   # key namespace prefix
-ssdb://[user:pass@]host:8888?key_prefix=app:   # SSDB has no namespace; isolate with a logical prefix; with user:pass = the auth style (when server.auth is on; OpenWithConfig also supports online Auth)
-rpc://host:7788?auth=challenge&password=s3cret   # connect to an RPC server (see "Local becomes remote" for details)
-```
-
-**Use prefix isolation when sharing one storage with other applications**: `TablePrefix` in
-`sqlite/mysql/pg/mssql`'s `Config` prefixes the four tables and secondary indexes; `KeyPrefix` in
-`redis`'s `Config` derives the three segments `<pfx>kv:` / `<pfx>q:` / `<pfx>z:`; `KeyPrefix`
-in `ssdb`'s `Config` prefixes the key names of the three data kinds logically (stripped
-automatically on read-back, and `Scan` is confined to that prefix too). The defaults are the
-current layout, and stay unchanged when unconfigured.
-
-See [`example/main.go`](example/main.go) for a complete demo.
+A complete demo is in [`example/main.go`](example/main.go).
 
 ## Built-in backends
 
-| Backend | Package | KV | Queue | ZSet | Notes |
-|---|---|---|---|---|---|
-| In-memory | `mem` | ✅ | ✅ | ✅ | No persistence, for tests/caching |
-| JSONL log | `jsonl` | ✅ | ✅ | ✅ | append-only WAL, replayed on open, supports `Compact()`; single-process embedded |
-| BoltDB | `bolt` | ✅ | ✅ | ✅ | bbolt single-file B+tree (pure Go); commits one transaction per write, and one commit for a whole batch |
-| LevelDB | `leveldb` | ✅ | ✅ | ✅ | syndtr/goleveldb LSM-tree (pure Go); batched writes go into a single Batch committed atomically |
-| Badger | `badger` | ✅ | ✅ | ✅ | dgraph-io/badger LSM-tree (pure Go); has MVCC transactions, a batch is one `Update` commit, **visible within the batch** |
-| SQLite | `sqlite` | ✅ | ✅ | ✅ | Pure Go driver (modernc), no CGO |
-| MySQL | `mysql` | ✅ | ✅ | ✅ | Shares `sqlstore` |
-| PostgreSQL | `pg` | ✅ | ✅ | ✅ | Shares `sqlstore` |
-| SQL Server | `mssql` | ✅ | ✅ | ✅ | Shares `sqlstore`; upsert via `MERGE`, row lock `WITH (UPDLOCK, HOLDLOCK)`, pagination `OFFSET/FETCH NEXT`; Incr takes the transactional path (no `RETURNING`) |
-| Redis | `redis` | ✅ | ✅ | ✅ | Native String / List / Sorted Set mapping |
-| SSDB | `ssdb` | ✅ | ✅ | ✅ | Native text protocol client, connection pool + authentication |
-| RPC | `rpc` | ✅ | ✅ | ✅ | Connects to a remote kvdb server; capabilities follow the server's backend, and the client is unaware of it |
+One API over 11 backends; the URI column doubles as the scheme reference. For the SQL family,
+`?table_prefix=` prefixes the tables and indexes; `redis`/`ssdb` take `?key_prefix=` (a logical
+prefix, stripped on read-back, with `Scan` confined to it). Unconfigured means the current layout.
 
-The import path is `github.com/RelicOfTesla/kvdb/<package>`, plus the aggregate package `.../all`.
+| Backend | Package | KV/Queue/ZSet | URI and notes |
+|---|---|---|---|
+| In-memory | `mem` | ✅✅✅ | `mem://` — no persistence, for tests/caching |
+| JSONL log | `jsonl` | ✅✅✅ | `jsonl://./d.jsonl` — append-only WAL replayed on open, `Compact()`; flush 500ms + fsync 1s by default, `?sync=1` per-op, `?each_flush=1` per-op flush |
+| BoltDB | `bolt` | ✅✅✅ | `bolt://./d.bolt` — single-file B+tree; no per-commit fsync, periodic flush (`?sync_interval=1s`), `?sync=1` per-commit |
+| LevelDB | `leveldb` | ✅✅✅ | `leveldb://./d.dir` — LSM; `?sync=1` per-commit, `?cache`/`?wb` in MiB |
+| Badger | `badger` | ✅✅✅ | `badger://./d.dir` — LSM with MVCC; `?sync=1` per-commit, `?cache`/`?memtable` in MiB |
+| SQLite | `sqlite` | ✅✅✅ | `sqlite://./d.db` — pure Go driver (no CGO); NORMAL by default, `?sync=1` = FULL |
+| MySQL | `mysql` | ✅✅✅ | `mysql://user:pass@h:3306/db?parseTime=true` |
+| PostgreSQL | `pg` | ✅✅✅ | `pg://user:pass@h:5432/db?sslmode=disable` |
+| SQL Server | `mssql` | ✅✅✅ | `mssql://sa:pass@h:1433?database=db&encrypt=disable` |
+| Redis | `redis` | ✅✅✅ | `redis://:pass@h:6379/0` — native String/List/Sorted Set |
+| SSDB | `ssdb` | ✅✅✅ | `ssdb://[user:pass@]h:8888` — native text protocol client with pooling |
+| RPC | `rpc` | ✅✅✅ | `rpc://h:7788?auth=challenge&password=…` — client is backend-unaware |
+
+All four SQL backends share `sqlstore`; import path is `github.com/RelicOfTesla/kvdb/<package>`
+(plus the aggregate `.../all`).
 
 ## Capability model
 
-`kvdb.Open` / `kvdb.Wrap` return the interface `DB`, which is composed of several capability
-interfaces; the concrete adapter is an unexported implementation:
+`kvdb.Open` / `kvdb.Wrap` return the interface `DB`, which embeds the capability interfaces
+(`KvProvider` mandatory, plus `QueueProvider` / `ZSetProvider` / `Batcher` / `Closer`) and
+`Capabilities() core.Caps`. The concrete adapter is unexported.
+
+An unimplemented capability returns `ErrUnsupported`, so probe first:
 
 ```go
-type DB interface {
-    KvProvider      // KV (mandatory capability)
-    QueueProvider   // queue
-    ZSetProvider    // sorted set
-    Batcher         // db.Batch(ctx, fn)
-    Closer          // Close
-    Capabilities() core.Caps   // capabilities actually present
-}
+c := db.Capabilities()     // c.Queue / c.ZSet / c.Batch / c.BatchComposed
 ```
 
-- Capabilities a backend does not implement: calls return `ErrUnsupported`; probing with
-  `Capabilities()` first avoids that.
-  `core.Caps` is a struct (adding a capability does not change signatures):
+`Caps` is a struct, so adding a capability never changes signatures. `BatchComposed` is a real,
+non-mandatory difference: backends applying ops one by one inside one transaction or lock
+(`mem`/`jsonl`/`bolt`/`badger`/`sqlite`/`mysql`/`pg`) are `true`, while LevelDB's Batch, Redis's
+MULTI/EXEC and SSDB's pipeline cannot read uncommitted content, so they are `false` — probe it,
+or split interdependent operations into separate batches.
 
-```go
-c := db.Capabilities()
-c.Queue, c.ZSet, c.Batch           // whether the corresponding interfaces are implemented
-c.BatchComposed                    // whether later operations in a batch can see earlier effects of the same batch
-```
-
-- **In-batch visibility is a perceptible, non-mandatory capability**: when several operations
-  in the same batch touch the same key / queue / zset member, the final value depends on the
-  backend's mechanism. Backends that apply operations one by one within the same transaction
-  or the same lock (`mem` / `jsonl` / `bolt` / `badger` / `sqlite` / `mysql` / `pg`) are `true`;
-  LevelDB's Batch, Redis's MULTI/EXEC, and SSDB's pipeline cannot read uncommitted content
-  before commit, so they are `false`. When deterministic composition is needed, probe first
-  and then decide, or simply split interdependent operations into separate batches.
-- **Narrow dependencies**: a business function only needs to declare the capability interfaces it uses, and tests only need to implement the corresponding methods, not the whole `DB`:
+Depend only on the interfaces you use (a mock then implements just those methods):
 
 ```go
 func touch(ctx context.Context, store kvdb.KvProvider, key string) (int64, error) {
-    return store.Incr(ctx, key, 1)   // both a real backend and a mock can be passed in
+    return store.Incr(ctx, key, 1)
 }
 ```
 
-- `kvdb.Unwrap(db)` retrieves the backend behind an adapter (returns nil for non-adapter implementations).
+`kvdb.Unwrap(db)` returns the backend behind an adapter (nil if it is not an adapter).
 
 ## Batched writes
 
-A batch of operations commits in one go, significantly reducing round trips and persistence overhead:
+One commit for the whole batch, cutting round trips and persistence overhead:
 
 ```go
 err := db.Batch(ctx, func(b *kvdb.Batch) error {
     b.Set("k", value)
     b.QPush("jobs", payload)
     b.ZIncr("rank", "alice", 1)
-    return nil        // only nil commits; an error or a validation failure during collection leaves the whole batch without effect
+    return nil   // only nil commits; an error during collection voids the whole batch
 })
 ```
 
-- Designed as "a shared collector + backends implementing only the commit": a backend implements `ApplyBatch(ctx, ops)`,
-  and each backend maps it onto its native mechanism (SQL = one transaction, Redis = one MULTI/EXEC, SSDB = one
-  pipeline, jsonl = one flush, mem = holding the lock once).
-- Only **unconditional writes** are allowed inside a batch (Set/SetEx/Del/Expire/QPush/QPushFront/ZSet/ZDel/ZIncr);
-  `Incr`/`QPop` depend on the key's current state and require validation before commit, so mixing them in would break the
-  batch's atomicity and they must be called separately.
-- Atomicity: MySQL/SQLite/PG (transactions), Redis (MULTI/EXEC), mem/jsonl (in-process)
-  leave the whole batch without effect when the commit fails; **SSDB has no transactions**, so a
-  pipeline failure may take partial effect (its value lies in reducing round trips).
+Backends implement just `ApplyBatch(ctx, ops)` and map it onto their native mechanism (one SQL
+transaction, one Redis MULTI/EXEC, one SSDB pipeline, one jsonl flush, one lock acquisition in
+`mem`). Only **unconditional writes** are allowed — `Set/SetEx/Del/Expire/QPush/QPushFront/ZSet/
+ZDel/ZIncr`; `Incr`/`QPop` depend on current state and must be called separately. Atomicity:
+transactional and in-process backends void the batch on failure, while **SSDB has no
+transactions**, so a pipeline failure may take partial effect.
 
 ## Bytes ↔ T helpers
 
 ```go
-type User struct {
-    ID   int64    `json:"id"`
-    Name string   `json:"name"`
-    Tags []string `json:"tags"`
-}
-
-// Write: inline encoding
-db.Set(ctx, "n", kvdb.Enc(int64(42)))     // scalar -> decimal text
+db.Set(ctx, "n", kvdb.Enc(int64(42)))     // scalar -> decimal text (Incr-compatible)
 db.Set(ctx, "u", kvdb.Enc(User{ID: 7}))   // struct -> JSON
 
-// Read: D merges the (val, ok, err) three return values of Get/QPop.
-// Both ok and err pass through as-is: a missing key gives ok=false, err=nil.
-n, ok, err := kvdb.D[int64](db.Get(ctx, "n"))
+// D merges the (val, ok, err) of Get/QPop; both pass through as-is (missing => ok=false, err=nil)
 u, ok, err := kvdb.D[User](db.Get(ctx, "u"))
-v, ok, err := kvdb.D[string](db.QPop(ctx, "jobs"))
-
-// Treat "missing" as an error yourself when that is what you want:
-//   if err != nil { return err }   // IO / parse error
-//   if !ok { return kvdb.ErrNotFound }
-
-// panic variant: only inspects err (ok is ignored, so a missing key yields the zero value)
-n := kvdb.DMust[int64](db.Get(ctx, "n"))
+n := kvdb.DMust[int64](db.Get(ctx, "n"))  // panic variant: inspects err only (missing => zero value)
 raw, err := kvdb.Dec[User](b)
 ```
 
-Encoding rules:
+| Type | Encoding |
+|---|---|
+| integers, float, string, bool | text (interoperates with `Incr`) |
+| `[]byte` | identity (no JSON/base64) |
+| structs, slices, maps, pointers… | `Marshal` (JSON by default) |
 
-| Type | Encoding | Notes |
-|---|---|---|
-| integers (including `~` aliases), float, string, bool | text | interoperates with `Incr` (`Enc(int64)` → decimal) |
-| `[]byte` | identity | does not go through JSON/base64 |
-| structs, slices, maps, pointers, interfaces, etc. | `Marshal` (JSON by default) | supports nested structs and `json` tags; unexported fields are ignored |
+`kvdb.Marshal` / `kvdb.Unmarshal` are swappable package variables (msgpack / protobuf / gob);
+the scalar path is unaffected. `Enc` panics on an encoding failure — call `Marshal` to handle it.
 
-**The codec is replaceable**: `kvdb.Marshal` / `kvdb.Unmarshal` are package-level variables,
-JSON by default, and can be swapped in init for msgpack / protobuf / gob and the like; the
-scalar path is unaffected.
+### Go 1.27.1+: the `TypedStore` shell
 
-```go
-func init() {
-    kvdb.Marshal = msgpack.Marshal
-    kvdb.Unmarshal = msgpack.Unmarshal
-}
-```
-
-Note that `Enc` panics on an encoding failure (it returns no error); call `Marshal` directly when
-error handling is needed.
-
-### Go 1.27.1+: the `TypedStore` shell (read and write both via type parameters)
-
-`TypedStore` corresponds one-to-one with `StoreProvider` (`KvProvider + QueueProvider + ZSetProvider`)
-— the generic shell depends on this one interface only, and does not require `Batch`/`Close`:
+`TypedStore` wraps `StoreProvider` (`KvProvider + QueueProvider + ZSetProvider`) only — it needs
+neither `Batch` nor `Close`:
 
 ```go
 tdb := kvdb.Typed(db)                      // db only needs to satisfy kvdb.StoreProvider
 u, err := tdb.Get[User](ctx, "user:1")     // = kvdb.D[User](db.Get(ctx, "user:1"))
 err = tdb.Set(ctx, "user:1", u)            // = db.Set(ctx, "user:1", kvdb.Enc(u))
-err = tdb.SetEx(ctx, "sess", s, 3600)
 n, err := tdb.Get[int64](ctx, "visits")    // scalars use text encoding, interoperating with Incr
-job, err := tdb.QPush(ctx, "jobs", j)      // queue writes are generic too
 ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 ```
 
-- **Writes**: `Set[T]` / `SetEx[T]` / `QPush[T]` / `QPushFront[T]`, encoded with `Enc[T]`;
-- **Reads**: `Get[T]` / `MGet[T]` / `QPop[T]` / `QPopBack[T]` / `QFront[T]` / `QBack[T]`,
-  and the non-generic `QRange` (queue elements are raw bytes);
-  decoded with `Dec[T]`/`D[T]`; empty/missing is folded into `ErrNotFound`. Each of them has an
-  `…OK` variant (`GetOK` / `QPopOK` / `QPopBackOK` / `QFrontOK` / `QBackOK`) that **preserves the
-  `ok` value** instead: `ok=false` with `err=nil`;
-- when `T = []byte` it is **exactly equivalent** to calling the backend method directly (`Enc` passes `[]byte` through by identity);
-- **Batched writes**: `tdb.BatchT(ctx, func(b kvdb.TypedBatch) error {...})` — encoding happens at collection time,
-  and **one batch may mix several types** (`b.Set("cnt", 42)` coexisting with `b.Set("u:1", u)`);
-  `Del`/`Expire`/`ZSet` and the like remain directly available through the embedded `*Batch`;
-- generic methods shadow same-named methods, so **`TypedStore` does not satisfy `StoreProvider`** (different signatures);
-  use `tdb.StoreProvider` when the original interface is needed; the parameter is `StoreProvider` (excluding Batch/Close),
-  so `kvdb.Typed(db)` works just as well on the value returned by `kvdb.Open`;
-- version and gating: method-level type parameters have been supported since Go 1.27, and the implementation lives in a file carrying `//go:build go1.27`
+Writes are `Set[T]` / `SetEx[T]` / `QPush[T]` / `QPushFront[T]` (encoded with `Enc[T]`); reads are
+`Get[T]` / `MGet[T]` / `QPop[T]` / `QPopBack[T]` / `QFront[T]` / `QBack[T]` plus the non-generic
+`QRange` (queue elements are raw bytes), decoded with `Dec[T]`/`D[T]`; a missing entry folds to
+`ErrNotFound`, and each read has an `…OK` variant (`GetOK` / `QPopOK` / …) that preserves
+`ok` instead (`ok=false`, `err=nil`). With `T = []byte` it is exactly equivalent to calling the
+backend directly. `tdb.BatchT(ctx, func(b kvdb.TypedBatch) error {...})` encodes at collection
+time and **one batch may mix types**; `Del`/`Expire`/`ZSet` remain available via the embedded
+`*Batch`. The generic methods shadow same-named ones, so `TypedStore` does **not** satisfy
+`StoreProvider` (use `tdb.StoreProvider`). Gated by `//go:build go1.27`.
 
 ## Extending: custom backends
 
-Implement `core.KvProvider` (mandatory for KV) plus optional capability interfaces, and once
-registered it can be used through `kvdb.Open`:
+Implement `core.KvProvider` (mandatory) plus any optional capability interfaces, register it, and
+`kvdb.Open` can use it:
 
 ```go
-type                   myStore struct{ /* ... */ }
+type myStore struct{ /* ... */ }
 
-func                   (m *myStore) Set(ctx context.Context, key string, value []byte) error { /* ... */ }
-//                     ... the remaining KV methods; optionally also implement core.QueueProvider / core.ZSetProvider / core.BatchProvider
+func (m *myStore) Set(ctx context.Context, key string, value []byte) error { /* ... */ }
+// ... remaining KV methods; optionally core.QueueProvider / core.ZSetProvider / core.BatchProvider
 
-func                   init() {
+func init() {
     kvdb.MustRegister("mybase", func(ctx context.Context, u *url.URL) (core.KvProvider, error) {
         return &myStore{}, nil
     })
 }
-//                     On the business side, import _ "your/module/mybase", then kvdb.Open(ctx, "mybase://...") works
+// consumer: import _ "your/module/mybase", then kvdb.Open(ctx, "mybase://...")
 ```
 
-`kvdb.Register` returns an error on a duplicate or empty scheme; `kvdb.Schemes()` lists the
-registered schemes. `FullProvider` is used to declare the full "KV + Queue + ZSet + Batch + Close"
-capability set all at once.
+`kvdb.Register` errors on a duplicate or empty scheme; `kvdb.Schemes()` lists what is registered;
+`FullProvider` declares the whole "KV + Queue + ZSet + Batch + Close" set at once.
 
 ## Local to remote (RPC client/server)
 
-Put any backend on the server side, and the client accesses it over the network through **the
-same set of interfaces** — useful for cross-process/cross-machine isolation, and for turning
-embedded backends (jsonl/bolt/sqlite…) into a service shared by multiple consumers.
+Put any backend on the server side and the client reaches it over the network through **the same
+interfaces** — for cross-process/machine isolation, or to turn an embedded backend into a shared
+service.
 
 ```go
-//                     Server: just pick a backend (the server side imports the corresponding backend package or .../all)
-srv,                   err := rpc.NewServer(ctx, rpc.ServerConfig{
-    Addr:     ":7788",
-    Backend:  "jsonl://./data.jsonl",   // switch to bolt/sqlite/mysql/ssdb… and the client needs no change
-    Auth:     rpc.AuthChallenge,
-    Password: "s3cret",
+// Server: pick a backend (imports that backend package, or .../all)
+srv, err := rpc.NewServer(ctx, rpc.ServerConfig{
+    Addr: ":7788", Backend: "jsonl://./data.jsonl",   // change to bolt/sqlite/mysql/ssdb…
+    Auth: rpc.AuthChallenge, Password: "s3cret",
 })
-go                     srv.Serve(ctx)
+go srv.Serve(ctx)
 
-//                     Client: imports no backend at all, and needs no knowledge of what the peer is
-db,                    err := kvdb.Open(ctx, "rpc://127.0.0.1:7788?auth=challenge&password=s3cret")
-defer                  db.Close()
-db.Set(ctx,            "k", []byte("v"))           // KV / Queue / ZSet / Batch are all available
+// Client: imports no backend and needs no knowledge of the peer
+db, err := kvdb.Open(ctx, "rpc://127.0.0.1:7788?auth=challenge&password=s3cret")
+defer db.Close()
+db.Set(ctx, "k", []byte("v"))           // KV / Queue / ZSet / Batch all available
 ```
 
-You can also just run the ready-made server command:
+Or run the ready-made server: `go run ./example/rpcdemo -addr :7788 -backend jsonl://./data.jsonl -auth challenge -password s3cret`
 
-```bash
-go                     run ./example/rpcdemo -addr :7788 -backend jsonl://./data.jsonl -auth challenge -password s3cret
-```
+- **Client is backend-unaware**: `rpc` implements `core.FullProvider`, so client code is identical
+  whatever the peer runs; switching backends changes one server-side parameter. The `rpc` module
+  (and the client in particular) has **zero third-party dependencies**.
+- **Capabilities and errors pass through faithfully**: `Capabilities()` reports the *server*
+  backend's set (never "stronger" for having an RPC layer), and sentinel errors keep their identity
+  so `errors.Is` still works (see the `core` package docs for the list).
+- **One batch = one round trip**; in-batch visibility is the backend's own semantics. The client's
+  `Close()` closes only its connection, not the server's backend.
 
-Key points:
+### Authentication, TLS, codec
 
-- **The client is unaware of the backend**: `rpc` implements `core.FullProvider`, the same set of
-  interfaces as the local backends. Whether it is connected to jsonl or mysql, the client code is
-  identical; switching backends changes only one server-side parameter.
-- **The `rpc` module has zero third-party dependencies** (only the standard library + the root
-  package), and the client side pulls in only `kvdb` + `kvdb/rpc`.
-- **Capabilities pass through faithfully**: what `db.Capabilities()` reports is exactly the
-  capability of the **server-side backend**, including `BatchComposed` — and it does not
-  "become stronger" just because an RPC layer was wrapped around it.
-- **Sentinel errors survive the round trip**: each has its own wire status, so on the client they
-  can still be compared with `errors.Is` (see the `core` package docs for the full list).
-- **A batch write is one round trip**: `db.Batch(...)` sends the whole batch to the server, and the
-  backend commits it once; visibility within the batch depends on the backend itself (the same as
-  a local direct connection).
-- **Lifecycle boundary**: the client's `Close()` only closes its own connection and does not close
-  the server-side backend.
+Authentication is the **c/s protocol's own** (backend credentials such as a mysql password are the
+server's business, invisible to the client):
 
-### Authentication (the c/s protocol's own auth, unrelated to backend auth)
-
-| Mode | URI parameter | Notes |
+| Mode | URI | Notes |
 |---|---|---|
-| No authentication | `auth=none` (default) | Bare on localhost/intranet |
-| Plaintext | `auth=plain&password=…` | The password is sent directly; **off by default**, use it only when TLS/unix socket is already in place |
-| Challenge-response | `auth=challenge&password=…` | The server issues a one-time nonce, and the client replies with `HMAC-SHA256(password, nonce)`; **the password never goes on the wire**, and replays are ineffective. Choose this when authentication is needed |
+| none (default) | `auth=none` | Bare on localhost/intranet |
+| plaintext | `auth=plain&password=…` | Password on the wire; off by default, use only behind TLS |
+| challenge | `auth=challenge&password=…` | Server nonce + `HMAC-SHA256(password, nonce)`; the password never goes on the wire |
 
-The password can also be written in the userinfo: `rpc://:s3cret@host:7788?auth=challenge`.
-Supplying a password without writing `auth=` is an immediate error, avoiding the case of
-"thinking it is encrypted when it is not".
-
-> This is **transport-layer** authentication. The backend's own authentication (such as a mysql
-> user password or ssdb `server.auth`) is handled by the server when connecting to the backend,
-> and the client neither bears it nor should be aware of it.
-
-### TLS
-
-Standard `crypto/tls`, **switched on the same port according to the server configuration**
-(give a certificate and it is TLS, give none and it is plaintext):
+TLS is standard `crypto/tls`, switched on the same port by server config (certificate ⇒ TLS):
 
 ```bash
-rpc://host:7788?tls=1&ca=./ca.pem                                  # verify the server
-rpc://host:7788?tls=1&ca=./ca.pem&cert=./c.pem&key=./c.key         # mutual TLS
-rpc://host:7788?tls=1&server_name=kvdb.internal
-rpc://host:7788?tls=1&insecure=1                                   # skip verification, testing only
+rpc://h:7788?tls=1&ca=./ca.pem                            # verify the server
+rpc://h:7788?tls=1&ca=./ca.pem&cert=./c.pem&key=./c.key   # mutual TLS
+rpc://h:7788?tls=1&insecure=1                             # testing only
 ```
 
-Supplying TLS parameters without writing `tls=1` is an error; connecting to a TLS port in
-plaintext fails, and **there is no silent downgrade**.
+Wrong configuration fails loudly: a password without `auth=`, TLS params without `tls=1`, or
+plaintext against a TLS port are all immediate errors — **there is no silent downgrade**.
 
-### Protocol and codec
-
-By default a **Redis-like (RESP2)** wire format is used, so packet captures are readable and it
-can also be hand-tested with `nc`:
-
-```
-$                      nc 127.0.0.1 7788
-$3
-SET
-*2
-$1
-k
-$1
-v
-
-:1
-+ok
-
-```
-
-Encoding and decoding are abstracted into `rpc/codec.Codec` and can be replaced wholesale; built
-in are `resp` (default) and `binary` (uvarint length prefix, skipping text escaping). Both ends
-must be equipped with the same one:
-
-```go
-rpc.ServerConfig{Codec: rpc.CodecBinary}
-rpc.Config{Codec:      rpc.CodecBinary}          // or add ?codec=binary to the URI
-```
-
-When a connection is established the two sides exchange codec names, and a mismatch is an
-immediate error (rather than the two sides waiting for each other until timeout).
-
-### Other parameters
-
-| Parameter | Notes |
-|---|---|
-| `pool=N` | Client connection pool size (default 8). A single connection runs only one command at a time, so concurrency relies on multiple connections |
-| `codec=resp\|binary` | Message encoding/decoding |
-| `max-conns` (server side) | Maximum number of concurrent connections |
+Codecs live behind `rpc/codec.Codec`: `resp` (default, RESP2-like and hand-testable with `nc`),
+`binary` (uvarint length prefix), `textproto` (SSDB-style records, not SSDB-interoperable). Both
+ends must match; a mismatch fails at handshake. Other parameters: `pool=N` (client connection
+pool, default 8), `max-conns` (server side).
 
 ## Compatibility
 
@@ -454,197 +291,58 @@ immediate error (rather than the two sides waiting for each other until timeout)
 | Redis | 7.x |
 | SSDB | Native protocol, supports `server.auth` |
 
-SQLite uses a pure Go driver (modernc); throughput is on par with the CGO driver, with no CGO
-dependency introduced.
-
 ## Performance
 
-> For the complete measured data, the cost model of each backend, and selection advice, see **[PERFORMANCE.md](PERFORMANCE.md)**.
+Full measured data, cost model and selection advice: **[PERFORMANCE.md](PERFORMANCE.md)**.
+Method: saturate a fixed time window with concurrent load and count what actually completes
+(ops/s). The five points that drive most decisions:
 
-Basis: **run a saturated concurrent load within a fixed time window and count the actual
-completed volume** (ops/s). Key points:
-
-- **The default mode does not fsync per commit; only `?sync=1` asks for power-loss safety**: on the
-  same real ext4, `sync=1` is 29–940× slower than the default mode. **"Whether to use sync=1"
-  matters more than "which backend to choose"**, so the mode should be decided first when selecting.
-- **The write bottleneck is usually one fsync per transaction**, not the number of statements: in
-  this environment a bare fsync is 2–4 µs on tmpfs, ~2.5 ms on ext4(vhdx), and 3.8–5.5 ms on
-  drvfs(9p).
-- **Batch-write gains scale with commit cost**: 2.2–6.0× in the default mode (bolt reaches 18.8×,
-  because it opens a transaction on every write); as high as 39–86× in the `sync=1` mode.
-- **Same-key hot spots drop noticeably on SQL**: mysql multi-key 428 vs same-key 119 ops/s (3.6×),
-  pg 2.2k vs 647 (3.4×). Spread counters across keys or switch to batch writes.
-- **Server backends**: redis has the largest batch-write gain (39×), while ssdb has only 2.6×
-  because it has no transactions.
-- **Under mixed read/write, reads are squeezed out by writes**: `mem`/`jsonl` share a global lock,
-  so at high write frequency reads are left with only 5–9% of pure reads; server backends, by
-  contrast, do not block reads and writes against each other (each retaining ~44–63%). See the
-  mixed read/write columns of the main table below.
-- Two independent levers: **switching to batch writes**, and relaxing deployment-side durability
-  (MySQL `innodb_flush_log_at_trx_commit=2`, PostgreSQL `synchronous_commit=off`, which shortens
-  the crash-recovery window and needs your own confirmation that it is acceptable).
-- Re-measure: `cd bench && KVDB_BENCH_URI=<uri> go test -run '^$' -bench Throughput -benchtime 3s`
-
-### Main table: ext4 + default mode (the one to read when choosing)
-
-Real block device (ext4/WSL vhdx), default mode of each backend (no fsync per commit). 8
-goroutines, time window `-benchtime 2s`, counting the actual completed volume. `MGet items` /
-`Batch items` are items/s converted to the entry level; in `Incr multi-key` each writer uses an
-independent key, while in `Incr same-key` all of them hit the same counter.
-
-`Mixed read` / `Mixed write` come from the mixed-load benchmark (of 8 goroutines, half
-continuously read a 64-key hot set and half write independent keys); `Read retention` = mixed
-read ÷ that backend's pure-read Get.
-
-| Backend | Set | Get | Incr multi-key | Incr same-key | QPush | MGet items | Batch items | Mixed read | Mixed write | Read retention |
-|---|---|---|---|---|---|---|---|---|---|---
-| jsonl | ~353.6k | ~10.0M | ~190.1k | ~242.2k | ~639.3k | ~14.1M | ~454.7k | ~474k | ~105k | 5% |
-| bolt | ~25.2k | ~591.1k | ~22.9k | ~26.9k | ~20.9k | ~2.6M | ~473.8k | ~170k | ~13.5k | 27% |
-| leveldb | ~164.6k | ~1.0M | ~111.8k | ~122.4k | ~111.8k | ~1.0M | ~354.2k | ~98.7k | ~52.4k | 11% |
-| badger | ~81.8k | ~274.4k | ~63.5k | ~34.0k | ~64.7k | ~608.2k | ~493.8k | ~76.4k | ~49.7k | 28% |
-| sqlite | ~12.6k | ~62.9k | ~5.0k | ~5.8k | ~5.5k | ~450.9k | ~37.6k | ~40.1k | ~5.8k | 64% |
-
-**Reference frame (different media/deployments, not directly comparable to the main table)**
-
-| Backend | Medium | Set | Get | Incr multi-key | Incr same-key | QPush | MGet items | Batch items | Mixed read | Mixed write | Read retention |
-|---|---|---|---|---|---|---|---|---|---|---|---
-| mem | No IO | ~775k | ~8.4M | ~825k | ~3.0M | ~2.85M | ~14.8M | ~1.48M | ~783k | ~251k | 9% |
-| redis | Container ext4 | ~12.7k | ~12.4k | ~14.9k | ~13.4k | ~13.2k | ~256.4k | ~497.2k | ~7.1k | ~7.0k | 57% |
-| ssdb | Container ext4 | ~8.0k | ~7.6k | ~7.7k | ~7.9k | ~8.2k | ~137.4k | ~20.6k | ~3.7k | ~3.5k | 48% |
-| mysql 8.0 | Container ext4 | ~718 | ~5.3k | ~428 | ~119 | ~400 | ~95.6k | ~4.6k | ~2.9k | ~453 | 55% |
-| pg 16 | Container ext4 | ~2.4k | ~9.9k | ~2.2k | ~647 | ~1.4k | ~185.7k | ~8.8k | ~5.3k | ~1.4k | 54% |
-
-### Other media and mode matrix
-
-The main table covers only "ext4 + default mode"; the remaining combinations are as follows
-(changing the medium or the mode changes the comparison baseline):
-
-**`?sync=1` (fsync per commit) @ ext4**: only the write path is affected; reads are the same as in
-the main table.
-
-| Backend | Set | QPush | Slower than default mode |
-|---|---|---|---|
-| jsonl | ~377 | ~410 | ~940× |
-| bolt | ~449 | ~464 | ~56× |
-| leveldb | ~1.3k | ~1.3k | ~128× |
-| badger | ~748 | ~736 | ~109× |
-| sqlite | ~440 | — | ~29× |
-
-**Conclusions**
-
-- **"Whether to use `sync=1`" matters more than "which backend to choose"**: once the default mode
-  takes fsync off the write hot path, embedded write throughput rises by 1–2 orders of magnitude;
-  when power-loss durability is required, `sync=1` throughput is only ~377–1.3k ops/s, and at that
-  point `Batch` should be preferred to amortize commits.
-- **The read path is barely affected by the medium** (leveldb Get is ~1.0M in every mode, badger
-  ~272–298k), while the write path differs by 2–3 orders of magnitude across media.
-- **Server backends have lower read throughput than embedded ones** (redis Get ~12.4k vs bolt
-  ~590k); the bottleneck is the network round trip. But they are naturally "durable by default",
-  with no need to choose between speed and safety.
-- **Same-key hot spots degrade most visibly on SQL**: mysql multi-key 428 → same-key 119 (3.6×),
-  pg 2.2k → 647 (3.4×). Spread counters across keys or switch to batch writes.
-- **Mixed read/write**: server backends do not block reads and writes against each other (each
-  retaining ~44–63%); `mem`/`jsonl` share a global lock, so at high write frequency reads are left
-  with only 5–9% of pure reads. `badger`'s read retention is determined by its "write commit
-  window" — with `?sync=1` one commit takes 1.3–3 ms and read retention drops to only 0.2–0.4%,
-  a phenomenon the default mode has already eliminated.
-- Two independent levers: **switching to batch writes**, and relaxing deployment-side durability
-  (MySQL `innodb_flush_log_at_trx_commit=2`, PostgreSQL `synchronous_commit=off`, which shortens
-  the crash-recovery window and needs your own confirmation that it is acceptable).
-- Re-measure: `cd bench && KVDB_BENCH_URI=<uri> go test -run '^$' -bench Throughput -benchtime 3s`
-
-> For the cost model of each backend (what each operation actually does) and a longer analysis,
-> see **[PERFORMANCE.md](PERFORMANCE.md)**.
-
-
+- **Decide the durability mode before the backend**: the default mode does not fsync per commit;
+  on real ext4, `?sync=1` is **29–940× slower**. Same medium, same backend — this lever dominates
+  backend choice. (How to pick: `?sync=1` only when a power loss must not lose acknowledged writes.)
+- **The write bottleneck is normally one fsync per commit**, not the statement count, so
+  **batch writes scale with commit cost**: 2.2–6.0× in the default mode (bolt 18.8×, as it opens a
+  transaction per write) and 39–86× with `?sync=1`.
+- **Same-key hot spots hurt the SQL family** (mysql 428 multi-key vs 119 same-key; pg 2.2k vs 647):
+  spread counters across keys, or batch.
+- **Under mixed read/write, `mem`/`jsonl` reads are squeezed to 5–9% of pure reads** (shared global
+  lock); server backends do not block the two directions against each other (~44–63% each).
+- Re-measure: `cd example/bench && KVDB_BENCH_URI=<uri> go test -run '^$' -bench Throughput -benchtime 3s`
 
 ## Testing
 
-**Each module is independent**, and `go test ./...` covers only the current module; to run all
-modules:
+Each module is independent, so `go test ./...` covers only the current one:
 
 ```bash
-#                      Run all modules (directories starting with . are local scaffolding, not part of the repository)
-for                    m in $(find . -name go.mod -not -path './.*'); do
-    (cd "$(dirname "$m")" && go test ./...) || exit 1
-done
+for m in $(find . -name go.mod -not -path './.*'); do (cd "$(dirname "$m")" && go test ./...) || exit 1; done
 ```
 
-Running a single module (cross-module dependencies are resolved by each go.mod's replace, with no
-workspace file needed):
+Container-backed backends skip unless their DSN is set (bound to loopback for safety):
+`KVDB_TEST_MYSQL_DSN`, `KVDB_TEST_PG_DSN`, `KVDB_TEST_MSSQL_DSN`, `KVDB_TEST_REDIS_ADDR`,
+`KVDB_TEST_SSDB_ADDR`, `KVDB_TEST_SSDB_AUTH_ADDR`/`_PASS`.
 
-```bash
-cd                     mem    && go test ./...     # local backends + in-process stand-ins (miniredis, fake SSDB)
-cd                     sqlite && go test ./...
-cd                     rpc    && go test ./...     # RPC: contract cases across RPC, three auth modes, TLS, codec, several real backends
-```
-
-Real-backend cases are skipped by default and enabled after setting the corresponding environment
-variables (adjust ports as needed to avoid clashing with local services):
-
-```bash
-#                      Test containers bind only to the loopback address, so weak-password test services are not exposed to the LAN.
-docker                 run -d --name kvdb-mysql -p 127.0.0.1:3306:3306 -e MYSQL_ROOT_PASSWORD=pw -e MYSQL_DATABASE=kvdb_test mysql:8.0
-docker                 run -d --name kvdb-pg    -p 127.0.0.1:5432:5432 -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=kvdb_test postgres:16-alpine
-docker                 run -d --name kvdb-redis -p 127.0.0.1:6379:6379 redis:7-alpine
-
-KVDB_TEST_MYSQL_DSN='root:pw@tcp(127.0.0.1:3306)/kvdb_test' \
-KVDB_TEST_PG_DSN='postgres://postgres:pw@127.0.0.1:5432/kvdb_test?sslmode=disable' \
-KVDB_TEST_REDIS_ADDR=127.0.0.1:6379 \
-  go test ./...          # run inside the directory of the corresponding backend module
-```
-
-| Environment variable | Purpose |
-|---|---|
-| `KVDB_TEST_MYSQL_DSN` | MySQL DSN (a dedicated test database; the SDK's tables are DROPped before the cases) |
-| `KVDB_TEST_PG_DSN` | PostgreSQL DSN (same as above) |
-| `KVDB_TEST_REDIS_ADDR` | Redis address (the cases use a separate DB and clear it) |
-| `KVDB_TEST_SSDB_ADDR` | SSDB address (flushdb before the cases) |
-| `KVDB_TEST_SSDB_AUTH_ADDR` / `KVDB_TEST_SSDB_AUTH_PASS` | An SSDB instance with `server.auth` enabled |
-
-All backends share the contract cases in `kvdbtest` (root module, one file per topic: harness /
-kv / queue / zset / batch / ttl / scan / ownership / namespace / lifecycle / incr). The suite
-asserts **identical behaviour across backends** except where `Capabilities()` declares a
-difference (`Queue` / `ZSet` / `Batch` / `BatchComposed` / `IncrWraps`), so an undeclared
-divergence shows up as a failure. SSDB additionally uses an in-process fake server to
-cross-validate the wire-protocol encoding.
-
-The root module's registry/codec cases use a **test stub** (the `stub://` registered in
-`stub_test.go`) to verify the "empty registry by default + explicit opt-in" semantics, so the root
-module itself has zero third-party dependencies; the "import means self-registration" of real
-backends is covered by each backend module's own cases (such as `mem/registry_test.go`).
+All backends share the contract cases in `kvdbtest` (one file per topic). The suite asserts
+**identical behaviour** except where `Capabilities()` declares a difference, so an undeclared
+divergence fails; SSDB additionally cross-validates the wire encoding against an in-process fake
+server.
 
 ## Repository layout
 
-**Each subdirectory is an independent Go module** (each has its own go.mod; cross-module
-dependencies use require + replace pointing at the sibling directory, so that every module can be
-built / tested / tidied on its own):
+**Each subdirectory is an independent Go module** (own `go.mod`; cross-module deps use
+`require` + `replace` to the sibling path, so each builds/tests/tidies alone):
 
 ```
-core/                  Contract: KvProvider / Queue- / ZSet- / BatchProvider / Closer / FullProvider
-  provider.go            Interfaces, sentinel errors, capability declaration
-  helper.go              Shared helpers that backends call explicitly (CheckKey, AddTTL…)
-  clock.go               Injectable time source (core.Now)
-provider.go            Open and contract re-exports
-db.go                  DB interface and the default adapter
-batch.go               Batch collector and DB.Batch dispatch
-bytes.go               Enc / Dec / D / DMust byte encoding and decoding
-registry.go            Register / MustRegister / Schemes
-kvdbtest/              Contract cases shared across backends, one file per topic
-                       (harness / kv / queue / zset / batch / ttl / scan / ownership /
-                        namespace / lifecycle / incr); referenced by backend module tests
-all/                   Aggregating registration package: import _ to pull in all built-in backends
-mem/ jsonl/ bolt/ leveldb/ badger/ sqlite/ mysql/ pg/ mssql/ redis/ ssdb/
-                       Backend implementations (each an independent module)
-rpc/                   RPC client and server (independent module, zero third-party dependencies)
-rpc/codec/             Message codec abstraction + RESP (default) / binary / textproto
-sqlstore/              The database/sql implementation shared by MySQL / SQLite / PG / MSSQL
-example/               Runnable demos and tools
-  rpcdemo/               RPC server command (imports .../all)
-  cmd/cli/               redis-cli-style command-line client
-  cmd/migration/         Cross-backend data migration
-  bench/                 Benchmarks (independent module, imports .../all)
+core/         Contract: interfaces, sentinel errors, capability declaration, shared helpers
+kvdbtest/     Contract cases shared across backends, one file per topic
+mem/ jsonl/ bolt/ leveldb/ badger/ sqlite/ mysql/ pg/ mssql/ redis/ ssdb/   backend modules
+rpc/          RPC client and server (+ rpc/codec: RESP / binary / textproto)
+sqlstore/     shared database/sql implementation behind sqlite/mysql/pg/mssql
+all/          aggregating registration package (import _ to wire in every backend)
+example/      rpcdemo (RPC server), cmd/cli, cmd/migration, bench
 ```
+
+Root-package files: `provider.go` (Open + re-exports), `db.go` (DB interface and adapter),
+`batch.go`, `bytes.go`, `registry.go`.
 
 ## License
 

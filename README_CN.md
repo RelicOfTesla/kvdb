@@ -3,7 +3,7 @@
 [English](README.md) | **中文**
 
 以 **Redis 命令语义为原型**的 Go 持久化适配器 SDK：对外提供统一的
-**KV + Queue + ZSet** 接口，底层可插拔切换不同持久化基座（内存 / 文件日志 /
+**KV + Queue + ZSet** 接口，底层可插拔切换不同持久化基座（内存 / jsonl /
 SQL / Redis / SSDB / BoltDB），并内置批量写与字节编解码辅助。
 
 ```go
@@ -22,7 +22,7 @@ n, err := db.Incr(ctx, "visits", 1)
 - **注册表默认空**：用哪个基座就 `import _` 哪个包，根包与mod不引入任何驱动依赖
 - **接口化返回**：`kvdb.Open` 返回接口 `DB`，业务可窄依赖 `KvProvider` 等子接口，便于 mock
 - **批量写**：一批操作映射到各基座原生机制（事务 / MULTI/EXEC / 流水线 / 单次 flush）
-- **字节 ↔ 泛型辅助**：`B` / `P` / `D` / `DMust` 支持标量与结构体（默认 JSON，编解码可替换），标量编码与 `Incr` 互操作
+- **字节 ↔ 泛型辅助**：`Enc` / `Dec` / `D` / `DMust` 支持标量与结构体（默认 JSON，编解码可替换），标量编码与 `Incr` 互操作。`D` 原值透传 `ok` 与 `err`；`DMust` 只看 `err`
 - **本地变远程（c/s）**：`rpc` 把任一基座暴露成服务端，客户端用同一组接口访问；
   客户端**不感知服务端底座**，自带 c/s 认证（明文 / 挑战-响应）与可选 TLS，协议编解码可替换
 - **Go 1.27.1+ 可选薄壳**：`kvdb.Typed(store)` 提供 `db.Get[T](...)`/`db.Set(ctx, k, v)` 读写泛型方法（构建约束隔离）
@@ -211,24 +211,29 @@ type User struct {
 }
 
 // 写：内联编码
-db.Set(ctx, "n", kvdb.B(int64(42)))     // 标量 -> 十进制文本
-db.Set(ctx, "u", kvdb.B(User{ID: 7}))   // 结构体 -> JSON
+db.Set(ctx, "n", kvdb.Enc(int64(42)))     // 标量 -> 十进制文本
+db.Set(ctx, "u", kvdb.Enc(User{ID: 7}))   // 结构体 -> JSON
 
-// 读：D 合并 Get/QPop 的 (val, ok, err) 三返回值（缺失 -> ErrNotFound）
-n, err := kvdb.D[int64](db.Get(ctx, "n"))
-u, err := kvdb.D[User](db.Get(ctx, "u"))
-v, err := kvdb.D[string](db.QPop(ctx, "jobs"))
+// 读：D 合并 Get/QPop 的 (val, ok, err) 三返回值，ok 与 err 都原值透传
+//（缺失时 ok=false 且 err=nil）
+n, ok, err := kvdb.D[int64](db.Get(ctx, "n"))
+u, ok, err := kvdb.D[User](db.Get(ctx, "u"))
+v, ok, err := kvdb.D[string](db.QPop(ctx, "jobs"))
 
-// panic 变体 / 单值解码
+// 需要"缺失即错误"时自行判断：
+//   if err != nil { return err }   // IO / 解析错误
+//   if !ok { return kvdb.ErrNotFound }
+
+// panic 变体：只看 err（忽略 ok，缺失返回零值）
 n := kvdb.DMust[int64](db.Get(ctx, "n"))
-raw, err := kvdb.P[User](b)
+raw, err := kvdb.Dec[User](b)
 ```
 
 编码规则：
 
 | 类型 | 编码 | 说明 |
 |---|---|---|
-| 整数（含 `~` 别名）、float、string、bool | 文本 | 与 `Incr` 互操作（`B(int64)` → 十进制） |
+| 整数（含 `~` 别名）、float、string、bool | 文本 | 与 `Incr` 互操作（`Enc(int64)` → 十进制） |
 | `[]byte` | 恒等 | 不经过 JSON/base64 |
 | 结构体、切片、映射、指针、接口等 | `Marshal`（默认 JSON） | 支持嵌套结构体与 `json` tag；未导出字段忽略 |
 
@@ -242,7 +247,7 @@ func init() {
 }
 ```
 
-注意 `B` 对编码失败会 panic（不返回 error）；需要错误处理时直接调用 `Marshal`。
+注意 `Enc` 对编码失败会 panic（不返回 error）；需要错误处理时直接调用 `Marshal`。
 
 ### Go 1.27.1+：`TypedStore` 薄壳（读写都走类型参数）
 
@@ -252,18 +257,19 @@ func init() {
 ```go
 tdb := kvdb.Typed(db)                      // db 满足 kvdb.StoreProvider 即可
 u, err := tdb.Get[User](ctx, "user:1")     // = kvdb.D[User](db.Get(ctx, "user:1"))
-err = tdb.Set(ctx, "user:1", u)            // = db.Set(ctx, "user:1", kvdb.B(u))
+err = tdb.Set(ctx, "user:1", u)            // = db.Set(ctx, "user:1", kvdb.Enc(u))
 err = tdb.SetEx(ctx, "sess", s, 3600)
 n, err := tdb.Get[int64](ctx, "visits")    // 标量走文本编码，与 Incr 互操作
 job, err := tdb.QPush(ctx, "jobs", j)      // 队列写也是泛型
 ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 ```
 
-- **写**：`Set[T]` / `SetEx[T]` / `QPush[T]` / `QPushFront[T]`，编码 `B[T]`；
-- **读**：`Get[T]` / `GetOK[T]` / `MGet[T]` / `QPop[T]` / `QPopBack[T]` /
-  `QFront[T]` / `QBack[T]`，解码 `P[T]`/`D[T]`，缺失 key 返回 `ErrNotFound`
-  （`GetOK` 保留 `ok` 语义）；
-- `T = []byte` 时与直接调用基座方法**完全等价**（`B` 对 `[]byte` 恒等透传）；
+- **写**：`Set[T]` / `SetEx[T]` / `QPush[T]` / `QPushFront[T]`，编码 `Enc[T]`；
+- **读**：`Get[T]` / `MGet[T]` / `QPop[T]` / `QPopBack[T]` / `QFront[T]` / `QBack[T]`，
+  解码 `Dec[T]`/`D[T]`，空/缺失折算为 `ErrNotFound`。它们各有一个 `…OK` 变体
+  （`GetOK` / `QPopOK` / `QPopBackOK` / `QFrontOK` / `QBackOK`），**保留 `ok` 原值**：
+  `ok=false` 且 `err=nil`；
+- `T = []byte` 时与直接调用基座方法**完全等价**（`Enc` 对 `[]byte` 恒等透传）；
 - **批写**：`tdb.BatchT(ctx, func(b kvdb.TypedBatch) error {...})`——收集时即编码，
   **同一批可混装多种类型**（`b.Set("cnt", 42)` 与 `b.Set("u:1", u)` 并存）；
   `Del`/`Expire`/`ZSet` 等经内嵌 `*Batch` 直接可用；
@@ -600,7 +606,7 @@ core/                  契约：KvProvider / Queue- / ZSet- / BatchProvider / Cl
 provider.go            Open 与契约再导出
 db.go                  DB 接口与默认适配器（adapter）
 batch.go               Batch 收集器与 DB.Batch 分发
-bytes.go               B / P / D / DMust 字节编解码
+bytes.go               Enc / Dec / D / DMust 字节编解码
 registry.go            Register / MustRegister / Schemes
 kvdbtest/              跨基座共享合同用例（公开包，供各基座模块测试引用）
 all/                   聚合注册包：import _ 即接入全部内置基座

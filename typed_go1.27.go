@@ -26,13 +26,13 @@ import (
 //
 //	tdb := kvdb.Typed(store)                  // store 需满足 kvdb.StoreProvider
 //	u, err := tdb.Get[User](ctx, "user:1")    // = kvdb.D[User](store.Get(ctx, "user:1"))
-//	err = tdb.Set(ctx, "user:1", u)           // = store.Set(ctx, "user:1", kvdb.B(u))
+//	err = tdb.Set(ctx, "user:1", u)           // = store.Set(ctx, "user:1", kvdb.Enc(u))
 //	n, err := tdb.Get[int64](ctx, "visits")   // 标量走文本编码，与 Incr 互操作
 //	job, err := tdb.QPop[string](ctx, "jobs")
 //
-// 编码/解码沿用 B/P/D 的规则与可替换的 Marshal/Unmarshal（见 bytes.go）：
-// 写方向一律 B[T]，读方向一律 P[T]/D[T]，因此 `T = []byte` 时行为与直接调用
-// 基座方法完全一致（B 对 []byte 原样透传，见 bytes.go），不引入额外拷贝语义。
+// 编码/解码沿用 Enc/Dec/D 的规则与可替换的 Marshal/Unmarshal（见 bytes.go）：
+// 写方向一律 Enc[T]，读方向一律 Dec[T]/D[T]，因此 `T = []byte` 时行为与直接调用
+// 基座方法完全一致（Enc 对 []byte 原样透传，见 bytes.go），不引入额外拷贝语义。
 //
 // 注意：带类型参数的方法（Get/GetOK/MGet/Set/SetEx/QPop/...）会遮蔽内嵌接口的
 // 同名方法，因此 TypedStore 不满足 StoreProvider（签名不同）。这是刻意取舍：
@@ -54,34 +54,38 @@ func Typed(p StoreProvider) TypedStore { return TypedStore{StoreProvider: p} }
 //
 // 类型参数在调用点由实参推出（tdb.Set(ctx, "k", u) 即 T=User），也可显式指定。
 func (t TypedStore) Set[T any](ctx context.Context, key string, value T) error {
-	return t.StoreProvider.Set(ctx, key, B(value))
+	return t.StoreProvider.Set(ctx, key, Enc(value))
 }
 
 // SetEx 编码 value 并写入，同时设置 ttl 秒存活（覆盖既有 TTL）。
 func (t TypedStore) SetEx[T any](ctx context.Context, key string, value T, ttl int64) error {
-	return t.StoreProvider.SetEx(ctx, key, B(value), ttl)
+	return t.StoreProvider.SetEx(ctx, key, Enc(value), ttl)
 }
 
 // ---- KV：读 ----
 
-// Get 读取 key 并解码为 T；key 不存在或已过期返回 ErrNotFound。
-func (t TypedStore) Get[T any](ctx context.Context, key string) (T, error) {
-	return D[T](t.StoreProvider.Get(ctx, key))
+// mustExist 把 D 的 (T, ok, err) 收敛为 (T, error)：ok=false 视为 ErrNotFound。
+// 这是"缺失即错误"的形态，供不带 OK 后缀的读方法使用。
+func mustExist[T any](v T, ok bool, err error) (T, error) {
+	if err != nil {
+		return v, err
+	}
+	if !ok {
+		var zero T
+		return zero, ErrNotFound
+	}
+	return v, nil
 }
 
-// GetOK 与 Get 相同，但保留 ok 语义：key 不存在时 ok=false 且 err=nil。
+// Get 读取 key 并解码为 T；key 不存在或已过期返回 ErrNotFound。
+// 需要区分"缺失"与"出错"时用 GetOK。
+func (t TypedStore) Get[T any](ctx context.Context, key string) (T, error) {
+	return mustExist(D[T](t.StoreProvider.Get(ctx, key)))
+}
+
+// GetOK 与 Get 相同，但**保留 ok 原值**：key 不存在时 ok=false 且 err=nil。
 func (t TypedStore) GetOK[T any](ctx context.Context, key string) (T, bool, error) {
-	val, ok, err := t.StoreProvider.Get(ctx, key)
-	if err != nil || !ok {
-		var zero T
-		return zero, false, err
-	}
-	v, err := P[T](val)
-	if err != nil {
-		var zero T
-		return zero, false, err
-	}
-	return v, true, nil
+	return D[T](t.StoreProvider.Get(ctx, key))
 }
 
 // MGet 批量读取并解码；不存在的 key 不出现在结果中。
@@ -92,7 +96,7 @@ func (t TypedStore) MGet[T any](ctx context.Context, keys ...string) (map[string
 	}
 	out := make(map[string]T, len(raw))
 	for k, b := range raw {
-		v, err := P[T](b)
+		v, err := Dec[T](b)
 		if err != nil {
 			return nil, fmt.Errorf("kvdb: MGet %q: %w", k, err)
 		}
@@ -105,39 +109,60 @@ func (t TypedStore) MGet[T any](ctx context.Context, keys ...string) (map[string
 
 // QPush 编码 value 并追加到队尾。
 func (t TypedStore) QPush[T any](ctx context.Context, name string, value T) error {
-	return t.StoreProvider.QPush(ctx, name, B(value))
+	return t.StoreProvider.QPush(ctx, name, Enc(value))
 }
 
 // QPushFront 编码 value 并插入到队头。
 func (t TypedStore) QPushFront[T any](ctx context.Context, name string, value T) error {
-	return t.StoreProvider.QPushFront(ctx, name, B(value))
+	return t.StoreProvider.QPushFront(ctx, name, Enc(value))
 }
 
 // ---- Queue：读 ----
 
 // QPop 取出并解码队头；队列为空返回 ErrNotFound。
+// 需要区分"空队列"与"出错"时用 QPopOK。
 func (t TypedStore) QPop[T any](ctx context.Context, name string) (T, error) {
+	return mustExist(D[T](t.StoreProvider.QPop(ctx, name)))
+}
+
+// QPopOK 与 QPop 相同，但**保留 ok 原值**：队列为空时 ok=false 且 err=nil。
+func (t TypedStore) QPopOK[T any](ctx context.Context, name string) (T, bool, error) {
 	return D[T](t.StoreProvider.QPop(ctx, name))
 }
 
 // QPopBack 取出并解码队尾；队列为空返回 ErrNotFound。
 func (t TypedStore) QPopBack[T any](ctx context.Context, name string) (T, error) {
+	return mustExist(D[T](t.StoreProvider.QPopBack(ctx, name)))
+}
+
+// QPopBackOK 与 QPopBack 相同，但**保留 ok 原值**。
+func (t TypedStore) QPopBackOK[T any](ctx context.Context, name string) (T, bool, error) {
 	return D[T](t.StoreProvider.QPopBack(ctx, name))
 }
 
 // QFront 只读查看并解码队头；队列为空返回 ErrNotFound。
 func (t TypedStore) QFront[T any](ctx context.Context, name string) (T, error) {
+	return mustExist(D[T](t.StoreProvider.QFront(ctx, name)))
+}
+
+// QFrontOK 与 QFront 相同，但**保留 ok 原值**。
+func (t TypedStore) QFrontOK[T any](ctx context.Context, name string) (T, bool, error) {
 	return D[T](t.StoreProvider.QFront(ctx, name))
 }
 
 // QBack 只读查看并解码队尾；队列为空返回 ErrNotFound。
 func (t TypedStore) QBack[T any](ctx context.Context, name string) (T, error) {
+	return mustExist(D[T](t.StoreProvider.QBack(ctx, name)))
+}
+
+// QBackOK 与 QBack 相同，但**保留 ok 原值**。
+func (t TypedStore) QBackOK[T any](ctx context.Context, name string) (T, bool, error) {
 	return D[T](t.StoreProvider.QBack(ctx, name))
 }
 
 // ---- Batch ----
 
-// TypedBatch 是 Batch 的类型化收集壳：收集时即完成编码（B[T]），因此批内容与
+// TypedBatch 是 Batch 的类型化收集壳：收集时即完成编码（Enc[T]），因此批内容与
 // 直接调用基座写入的字节完全一致。**同一批可混装多种类型**——类型参数在方法上，
 // 每次调用各自推导：
 //
@@ -156,7 +181,7 @@ func (t TypedStore) QBack[T any](ctx context.Context, name string) (T, error) {
 //  2. 未被遮蔽的方法（如 Del）会解析到嵌入里那个 nil 的 provider 字段，
 //     调用即 panic（实测 nil pointer dereference），而不是收集到批里。
 //
-// 所以二者只在**编码规则**上统一（都走 B[T]/P[T]/D[T]），不共享嵌入结构。
+// 所以二者只在**编码规则**上统一（都走 Enc[T]/Dec[T]/D[T]），不共享嵌入结构。
 type TypedBatch struct {
 	*Batch
 }
@@ -166,22 +191,22 @@ func TypedBatchOf(b *Batch) TypedBatch { return TypedBatch{Batch: b} }
 
 // Set 收集一次写入（value 按 T 编码）。
 func (b TypedBatch) Set[T any](key string, value T) {
-	b.Batch.Set(key, B(value))
+	b.Batch.Set(key, Enc(value))
 }
 
 // SetEx 收集一次带 TTL 的写入（value 按 T 编码）。
 func (b TypedBatch) SetEx[T any](key string, value T, ttl int64) {
-	b.Batch.SetEx(key, B(value), ttl)
+	b.Batch.SetEx(key, Enc(value), ttl)
 }
 
 // QPush 收集一次队尾入队（value 按 T 编码）。
 func (b TypedBatch) QPush[T any](name string, value T) {
-	b.Batch.QPush(name, B(value))
+	b.Batch.QPush(name, Enc(value))
 }
 
 // QPushFront 收集一次队头入队（value 按 T 编码）。
 func (b TypedBatch) QPushFront[T any](name string, value T) {
-	b.Batch.QPushFront(name, B(value))
+	b.Batch.QPushFront(name, Enc(value))
 }
 
 // BatchT 与 DB.Batch 相同，但回调里拿到的是类型化收集壳：回调返回 nil 时整批

@@ -4,7 +4,7 @@
 
 A Go persistence adapter SDK modeled on **Redis command semantics**: it exposes a unified
 **KV + Queue + ZSet** interface, while the underlying pluggable persistence backend
-(in-memory / file log / SQL / Redis / SSDB / BoltDB) can be swapped at will, with built-in
+(in-memory / jsonl / SQL / Redis / SSDB / BoltDB) can be swapped at will, with built-in
 batched writes and byte codec helpers.
 
 ```go
@@ -23,7 +23,7 @@ n, err := db.Incr(ctx, "visits", 1)
 - **Empty registry by default**: use a backend and `import _` its package; the root package and mod pull in no driver dependencies
 - **Interface-based returns**: `kvdb.Open` returns the interface `DB`, so business code can depend narrowly on sub-interfaces such as `KvProvider`, which eases mocking
 - **Batched writes**: a batch of operations maps onto each backend's native mechanism (transaction / MULTI/EXEC / pipeline / a single flush)
-- **Bytes ↔ generic helpers**: `B` / `P` / `D` / `DMust` support scalars and structs (JSON by default, codec replaceable); scalar encoding interoperates with `Incr`
+- **Bytes ↔ generic helpers**: `Enc` / `Dec` / `D` / `DMust` support scalars and structs (JSON by default, codec replaceable); scalar encoding interoperates with `Incr`. `D` passes `ok`/`err` through untouched; `DMust` inspects only `err`
 - **Local becomes remote (c/s)**: `rpc` exposes any backend as a server, and the client accesses it through the same set of interfaces;
   the client is **unaware of the server's underlying backend**, and comes with c/s authentication (plaintext / challenge-response) plus optional TLS, with a replaceable protocol codec
 - **Optional Go 1.27.1+ thin shell**: `kvdb.Typed(store)` provides the generic read/write methods `db.Get[T](...)` / `db.Set(ctx, k, v)` (isolated by build constraints)
@@ -221,24 +221,29 @@ type User struct {
 }
 
 // Write: inline encoding
-db.Set(ctx, "n", kvdb.B(int64(42)))     // scalar -> decimal text
-db.Set(ctx, "u", kvdb.B(User{ID: 7}))   // struct -> JSON
+db.Set(ctx, "n", kvdb.Enc(int64(42)))     // scalar -> decimal text
+db.Set(ctx, "u", kvdb.Enc(User{ID: 7}))   // struct -> JSON
 
-// Read: D merges the (val, ok, err) three return values of Get/QPop (missing -> ErrNotFound)
-n, err := kvdb.D[int64](db.Get(ctx, "n"))
-u, err := kvdb.D[User](db.Get(ctx, "u"))
-v, err := kvdb.D[string](db.QPop(ctx, "jobs"))
+// Read: D merges the (val, ok, err) three return values of Get/QPop.
+// Both ok and err pass through as-is: a missing key gives ok=false, err=nil.
+n, ok, err := kvdb.D[int64](db.Get(ctx, "n"))
+u, ok, err := kvdb.D[User](db.Get(ctx, "u"))
+v, ok, err := kvdb.D[string](db.QPop(ctx, "jobs"))
 
-// panic variant / single-value decoding
+// Treat "missing" as an error yourself when that is what you want:
+//   if err != nil { return err }   // IO / parse error
+//   if !ok { return kvdb.ErrNotFound }
+
+// panic variant: only inspects err (ok is ignored, so a missing key yields the zero value)
 n := kvdb.DMust[int64](db.Get(ctx, "n"))
-raw, err := kvdb.P[User](b)
+raw, err := kvdb.Dec[User](b)
 ```
 
 Encoding rules:
 
 | Type | Encoding | Notes |
 |---|---|---|
-| integers (including `~` aliases), float, string, bool | text | interoperates with `Incr` (`B(int64)` → decimal) |
+| integers (including `~` aliases), float, string, bool | text | interoperates with `Incr` (`Enc(int64)` → decimal) |
 | `[]byte` | identity | does not go through JSON/base64 |
 | structs, slices, maps, pointers, interfaces, etc. | `Marshal` (JSON by default) | supports nested structs and `json` tags; unexported fields are ignored |
 
@@ -253,7 +258,7 @@ func init() {
 }
 ```
 
-Note that `B` panics on an encoding failure (it returns no error); call `Marshal` directly when
+Note that `Enc` panics on an encoding failure (it returns no error); call `Marshal` directly when
 error handling is needed.
 
 ### Go 1.27.1+: the `TypedStore` shell (read and write both via type parameters)
@@ -264,18 +269,19 @@ error handling is needed.
 ```go
 tdb := kvdb.Typed(db)                      // db only needs to satisfy kvdb.StoreProvider
 u, err := tdb.Get[User](ctx, "user:1")     // = kvdb.D[User](db.Get(ctx, "user:1"))
-err = tdb.Set(ctx, "user:1", u)            // = db.Set(ctx, "user:1", kvdb.B(u))
+err = tdb.Set(ctx, "user:1", u)            // = db.Set(ctx, "user:1", kvdb.Enc(u))
 err = tdb.SetEx(ctx, "sess", s, 3600)
 n, err := tdb.Get[int64](ctx, "visits")    // scalars use text encoding, interoperating with Incr
 job, err := tdb.QPush(ctx, "jobs", j)      // queue writes are generic too
 ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
 ```
 
-- **Writes**: `Set[T]` / `SetEx[T]` / `QPush[T]` / `QPushFront[T]`, encoded with `B[T]`;
-- **Reads**: `Get[T]` / `GetOK[T]` / `MGet[T]` / `QPop[T]` / `QPopBack[T]` /
-  `QFront[T]` / `QBack[T]`, decoded with `P[T]`/`D[T]`; a missing key returns `ErrNotFound`
-  (`GetOK` preserves the `ok` semantics);
-- when `T = []byte` it is **exactly equivalent** to calling the backend method directly (`B` passes `[]byte` through by identity);
+- **Writes**: `Set[T]` / `SetEx[T]` / `QPush[T]` / `QPushFront[T]`, encoded with `Enc[T]`;
+- **Reads**: `Get[T]` / `MGet[T]` / `QPop[T]` / `QPopBack[T]` / `QFront[T]` / `QBack[T]`,
+  decoded with `Dec[T]`/`D[T]`; empty/missing is folded into `ErrNotFound`. Each of them has an
+  `…OK` variant (`GetOK` / `QPopOK` / `QPopBackOK` / `QFrontOK` / `QBackOK`) that **preserves the
+  `ok` value** instead: `ok=false` with `err=nil`;
+- when `T = []byte` it is **exactly equivalent** to calling the backend method directly (`Enc` passes `[]byte` through by identity);
 - **Batched writes**: `tdb.BatchT(ctx, func(b kvdb.TypedBatch) error {...})` — encoding happens at collection time,
   and **one batch may mix several types** (`b.Set("cnt", 42)` coexisting with `b.Set("u:1", u)`);
   `Del`/`Expire`/`ZSet` and the like remain directly available through the embedded `*Batch`;
@@ -652,7 +658,7 @@ core/                  Contract: KvProvider / Queue- / ZSet- / BatchProvider / C
 provider.go            Open and contract re-exports
 db.go                  DB interface and the default adapter
 batch.go               Batch collector and DB.Batch dispatch
-bytes.go               B / P / D / DMust byte encoding and decoding
+bytes.go               Enc / Dec / D / DMust byte encoding and decoding
 registry.go            Register / MustRegister / Schemes
 kvdbtest/              Contract cases shared across backends (public package, referenced by backend module tests)
 all/                   Aggregating registration package: import _ to pull in all built-in backends

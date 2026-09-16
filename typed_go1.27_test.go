@@ -29,7 +29,7 @@ func TestTypedGet(t *testing.T) {
 
 	// 结构体（默认 JSON）
 	want := tUser{ID: 7, Name: "alice", Tags: []string{"a", "b"}}
-	if err := db.Set(ctx, "u:7", kvdb.B(want)); err != nil {
+	if err := db.Set(ctx, "u:7", kvdb.Enc(want)); err != nil {
 		t.Fatal(err)
 	}
 	got, err := tdb.Get[tUser](ctx, "u:7")
@@ -69,14 +69,14 @@ func TestTypedGet(t *testing.T) {
 	}
 
 	// MGet 批量解码（结构体 + 标量混合场景）
-	db.Set(ctx, "u:8", kvdb.B(tUser{ID: 8, Name: "bob"}))
+	db.Set(ctx, "u:8", kvdb.Enc(tUser{ID: 8, Name: "bob"}))
 	ms, err := tdb.MGet[tUser](ctx, "u:7", "u:8", "missing")
 	if err != nil || len(ms) != 2 || ms["u:8"].Name != "bob" {
 		t.Fatalf("MGet[tUser] = %+v, %v", ms, err)
 	}
 }
 
-// TestTypedSet 验证写方向的泛型形态：Set/SetEx 接受 value T 并按 B[T] 编码。
+// TestTypedSet 验证写方向的泛型形态：Set/SetEx 接受 value T 并按 Enc[T] 编码。
 func TestTypedSet(t *testing.T) {
 	ctx := context.Background()
 	db, err := kvdb.Open(ctx, "stub://")
@@ -86,13 +86,13 @@ func TestTypedSet(t *testing.T) {
 	defer db.Close()
 	tdb := kvdb.Typed(db)
 
-	// 结构体：写入即可读回，且与手动 B[T] 编码的字节完全一致
+	// 结构体：写入即可读回，且与手动 Enc[T] 编码的字节完全一致
 	u := tUser{ID: 7, Name: "alice", Tags: []string{"a"}}
 	if err := tdb.Set(ctx, "u:7", u); err != nil {
 		t.Fatalf("Set[tUser]: %v", err)
 	}
-	if v, ok, _ := db.Get(ctx, "u:7"); !ok || string(v) != string(kvdb.B(u)) {
-		t.Fatalf("Set 编码应等于 B[tUser]")
+	if v, ok, _ := db.Get(ctx, "u:7"); !ok || string(v) != string(kvdb.Enc(u)) {
+		t.Fatalf("Set 编码应等于 Enc[tUser]")
 	}
 	if got, err := tdb.Get[tUser](ctx, "u:7"); err != nil || got.Name != "alice" {
 		t.Fatalf("回读 = %+v, %v", got, err)
@@ -191,9 +191,56 @@ func TestTypedQueue(t *testing.T) {
 	if got, err := tdb.QPopBack[tUser](ctx, "jobs"); err != nil || got.ID != 1 {
 		t.Fatalf("QPopBack = %+v, %v", got, err)
 	}
-	// 空队列 -> ErrNotFound
+	// 空队列 -> ErrNotFound（不带 OK 后缀的形态把"空"折算为错误）
 	if _, err := tdb.QPop[tUser](ctx, "jobs"); !errors.Is(err, core.ErrNotFound) {
 		t.Fatalf("空队列应 ErrNotFound, got %v", err)
+	}
+}
+
+// TestTypedOKVariants 验证 *OK 系列**保留 ok 原值**：空/缺失时 ok=false 且 err=nil，
+// 与不带 OK 后缀的形态（把"空"折算为 ErrNotFound）区分开。
+func TestTypedOKVariants(t *testing.T) {
+	ctx := context.Background()
+	db, err := kvdb.Open(ctx, "stub://")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tdb := kvdb.Typed(db)
+
+	// 缺失 key：Get 报 ErrNotFound，GetOK 给 ok=false + err=nil
+	if _, err := tdb.Get[string](ctx, "missing"); !errors.Is(err, core.ErrNotFound) {
+		t.Fatalf("Get 缺失应 ErrNotFound, got %v", err)
+	}
+	if v, ok, err := tdb.GetOK[string](ctx, "missing"); err != nil || ok || v != "" {
+		t.Fatalf("GetOK 缺失应为 \"\",false,nil，got %q,%v,%v", v, ok, err)
+	}
+
+	// 空队列：四个读方法都有 OK 变体
+	for _, tc := range []struct {
+		name string
+		call func() (string, bool, error)
+	}{
+		{"QPopOK", func() (string, bool, error) { return tdb.QPopOK[string](ctx, "empty") }},
+		{"QPopBackOK", func() (string, bool, error) { return tdb.QPopBackOK[string](ctx, "empty") }},
+		{"QFrontOK", func() (string, bool, error) { return tdb.QFrontOK[string](ctx, "empty") }},
+		{"QBackOK", func() (string, bool, error) { return tdb.QBackOK[string](ctx, "empty") }},
+	} {
+		v, ok, err := tc.call()
+		if err != nil || ok || v != "" {
+			t.Fatalf("%s 空队列应为 \"\",false,nil，got %q,%v,%v", tc.name, v, ok, err)
+		}
+	}
+
+	// 有值时 OK 变体正常返回 ok=true
+	if err := tdb.QPush(ctx, "jobs", "job-1"); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok, err := tdb.QFrontOK[string](ctx, "jobs"); err != nil || !ok || v != "job-1" {
+		t.Fatalf("QFrontOK 有值 = %q,%v,%v", v, ok, err)
+	}
+	if v, ok, err := tdb.QPopOK[string](ctx, "jobs"); err != nil || !ok || v != "job-1" {
+		t.Fatalf("QPopOK 有值 = %q,%v,%v", v, ok, err)
 	}
 }
 

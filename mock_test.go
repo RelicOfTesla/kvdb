@@ -96,14 +96,14 @@ func (f *fakeKV) Incr(ctx context.Context, key string, delta int64) (int64, erro
 	}
 	var n int64
 	if ok {
-		if n, err = kvdb.P[int64](cur); err != nil {
+		if n, err = kvdb.Dec[int64](cur); err != nil {
 			// 与真实基座对齐：非整数值返回 core.ErrNotInteger（errors.Is 可判），
 			// 而不是把解码错误原样透出。
 			return 0, core.ErrNotInteger
 		}
 	}
 	n += delta
-	if err := f.Set(ctx, key, kvdb.B(n)); err != nil {
+	if err := f.Set(ctx, key, kvdb.Enc(n)); err != nil {
 		return 0, err
 	}
 	return n, nil

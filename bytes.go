@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
-
-	"github.com/RelicOfTesla/kvdb/core"
 )
 
 // Marshal / Unmarshal 是**非标量**类型（结构体、切片、映射、指针等）的
@@ -17,7 +15,7 @@ import (
 //	    kvdb.Unmarshal = msgpack.Unmarshal
 //	}
 //
-// 替换后 B/P/D/DMust 对结构体等类型即使用新编解码；标量（整数/浮点/字符串/
+// 替换后 Enc/Dec/D/DMust 对结构体等类型即使用新编解码；标量（整数/浮点/字符串/
 // 布尔/[]byte）不受影响——它们仍走文本编码，以保持与 Incr 等命令的互操作。
 // 需要自行处理编码错误时，直接调用 Marshal / Unmarshal。
 var (
@@ -27,11 +25,11 @@ var (
 
 var byteSliceType = reflect.TypeOf([]byte(nil))
 
-// B 将 T 编码为二进制安全字节，供写路径内联使用：
+// Enc 将 T 编码为二进制安全字节，供写路径内联使用：
 //
-//	db.Set(ctx, "n", B(int64(42)))          // 标量：十进制文本
-//	db.Set(ctx, "u", B(User{ID: 7}))        // 结构体：默认 JSON（可换编解码）
-//	db.QPush(ctx, "q", B([]string{"a", "b"}))
+//	db.Set(ctx, "n", Enc(int64(42)))          // 标量：十进制文本
+//	db.Set(ctx, "u", Enc(User{ID: 7}))        // 结构体：默认 JSON（可换编解码）
+//	db.QPush(ctx, "q", Enc([]string{"a", "b"}))
 //
 // 编码规则：
 //   - 标量走文本编码，与 Incr 语义对齐（写入整数后仍可 Incr）：
@@ -39,23 +37,23 @@ var byteSliceType = reflect.TypeOf([]byte(nil))
 //     string → 原样；[]byte → 恒等
 //   - 其他类型（结构体、切片、映射、指针、接口等）→ Marshal（默认 JSON）
 //
-// 注意：非标量编码失败会 panic（B 不返回错误）。需要错误处理时直接调用
+// 注意：非标量编码失败会 panic（Enc 不返回错误）。需要错误处理时直接调用
 // Marshal，或先自行校验。
-func B[T any](v T) []byte {
+func Enc[T any](v T) []byte {
 	if b, ok := encodeScalar(v); ok {
 		return b
 	}
 	b, err := Marshal(v)
 	if err != nil {
-		panic(fmt.Sprintf("kvdb: B: %v", err))
+		panic(fmt.Sprintf("kvdb: Enc: %v", err))
 	}
 	return b
 }
 
-// P 将字节解码为 T（B 的逆操作）：
+// Dec 将字节解码为 T（Enc 的逆操作）：
 //   - 标量按 T 的位宽严格解析文本，越界或格式非法返回 *strconv.NumError 类错误；
 //   - 其他类型走 Unmarshal（默认 JSON）。
-func P[T any](b []byte) (T, error) {
+func Dec[T any](b []byte) (T, error) {
 	var out T
 	rv := reflect.ValueOf(&out).Elem()
 	if err := decodeScalar(rv, b); err == nil {
@@ -74,28 +72,41 @@ func P[T any](b []byte) (T, error) {
 // D 合并 Get/QPop 族的 (val, ok, err) 三返回值并解码为 T，
 // Go 多返回值可直接作为实参展开，形态：
 //
-//	n, err := D[int64](db.Get(ctx, "n"))     // 缺 key -> ErrNotFound
-//	u, err := D[User](db.Get(ctx, "u"))      // 结构体（默认 JSON）
-//	v, err := D[string](db.QPop(ctx, "q"))   // 空队列同样适用
+//	v, ok, err := D[int64](db.Get(ctx, "n"))   // ok 原值透传
+//	u, ok, err := D[User](db.Get(ctx, "u"))    // 结构体（默认 JSON）
+//	v, ok, err := D[string](db.QPop(ctx, "q")) // 空队列同样适用
 //
-// ok=false（key/成员不存在）转换为 core.ErrNotFound；err 原样透传。
-func D[T any](val []byte, ok bool, err error) (T, error) {
+// **ok 与 err 都原值透传，不做任何转换**：key/成员不存在时 ok=false 而 err=nil。
+// 需要"缺失即错误"的语义时自行判断：
+//
+//	v, ok, err := D[User](db.Get(ctx, "u"))
+//	if err != nil { return err }   // IO/解析错误
+//	if !ok { return ErrNotFound }  // 缺失
+func D[T any](val []byte, ok bool, err error) (T, bool, error) {
 	var z T
 	if err != nil {
-		return z, err
+		return z, false, err
 	}
 	if !ok {
-		return z, core.ErrNotFound
+		return z, false, nil
 	}
-	return P[T](val)
+	v, err := Dec[T](val)
+	if err != nil {
+		return z, false, err
+	}
+	return v, true, nil
 }
 
-// DMust 是 D 的 panic 变体：缺失或解析失败直接 panic(err)：
+// DMust 是 D 的 panic 变体，但**只看 err、忽略 ok**：
 //
 //	n := DMust[int64](db.Get(ctx, "n"))
 //	u := DMust[User](db.Get(ctx, "u"))
+//
+// 语义边界（重要）：err != nil 时 panic(err)；**ok=false 不 panic，返回零值**。
+// 也就是说它断言的是"这次读取没有出错"，而不是"值一定存在"——缺失的 key 会得到
+// 零值而非 panic。需要"缺失也算失败"就用 D 自行判断。
 func DMust[T any](val []byte, ok bool, err error) T {
-	v, err := D[T](val, ok, err)
+	v, _, err := D[T](val, ok, err)
 	if err != nil {
 		panic(err)
 	}

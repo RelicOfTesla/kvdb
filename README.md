@@ -98,8 +98,8 @@ URI 一览（各包也提供等价的直接构造函数，如 `sqlite.Open`）�
 
 ```
 mem://
-jsonl://./data.jsonl?sync=1        # 默认逐操作 flush 不 fsync；sync=1 每次写 flush+fsync
-jsonl://./data.jsonl?buffered=1    # 攒 32KiB 缓冲，空闲 100ms 自动落盘（约 2× 写吞吐）
+jsonl://./data.jsonl?sync=1        # 缺省 flush 每 500ms、fsync 每 1s；sync=1 逐操作 flush+fsync（掉电不丢）
+jsonl://./data.jsonl?each_flush=1  # 逐操作 flush（fsync 仍按周期）；flush_interval/sync_interval 可调周期
 sqlite://./data.db?sync=1          # 缺省 NORMAL（不逐提交 fsync，与其他本地基座一致）；sync=1 用 FULL（掉电不丢）
 sqlite://./data.db?table_prefix=app_       # 表名前缀（mysql/pg 同名参数）
 bolt://./data.bolt?sync=1&sync_interval=1s   # 缺省不逐提交 fsync，但按 sync_interval 周期落盘（缺省 1s）；sync=1 逐提交 fsync
@@ -472,12 +472,12 @@ SQLite 采用纯 Go 驱动（modernc），吞吐与 CGO 驱动相当，不引入
 | 基座 | Set | Get | Incr多key | Incr同key | QPush | MGet条目 | 批写条目 |
 |---|---|---|---|---|---|---|---
 | mem | ~775k | ~8.4M | ~825k | ~3.0M | ~2.85M | ~14.8M | ~1.48M |
-| jsonl · tmpfs | ~201.8k | ~10.1M | ~221.9k | ~298.2k | ~286.3k | ~13.4M | ~510.5k |
+| jsonl · tmpfs | ~330.7k | ~10.1M | ~221.9k | ~298.2k | ~580.9k | ~13.4M | ~510.5k |
 | bolt · tmpfs | ~22.1k | ~569.8k | ~22.9k | ~26.9k | ~20.9k | ~2.2M | ~479.1k |
 | leveldb · tmpfs | ~137.0k | ~1.0M | ~111.8k | ~122.4k | ~108.5k | ~1.0M | ~381.8k |
 | badger · tmpfs | ~67.0k | ~274.4k | ~63.5k | ~34.0k | ~53.1k | ~638.4k | ~461.5k |
 | sqlite · tmpfs | ~12.0k | ~60.6k | ~5.7k | ~5.8k | ~7.3k | ~447.9k | ~35.6k |
-| jsonl · ext4（缺省） | ~215.5k | ~10.0M | ~190.1k | ~242.2k | ~268.9k | ~14.1M | ~498.7k |
+| jsonl · ext4（缺省） | ~353.6k | ~10.0M | ~190.1k | ~242.2k | ~639.3k | ~14.1M | ~454.7k |
 | jsonl · ext4（`sync=1`） | ~377 | ~10.0M | — | — | ~410 | ~14.1M | — |
 | bolt · ext4（缺省） | ~25.2k | ~591.1k | ~22.9k | ~26.9k | ~20.9k | ~2.6M | ~473.8k |
 | bolt · ext4（`sync=1`） | ~449 | ~591.1k | — | — | ~464 | ~2.6M | — |
@@ -498,8 +498,9 @@ SQLite 采用纯 Go 驱动（modernc），吞吐与 CGO 驱动相当，不引入
 | pg 16 | ~2.4k | ~9.9k | ~2.2k | ~647 | ~1.4k | ~185.7k | ~8.8k |
 
 ① **五个本地基座的缺省档已统一为"不逐提交 fsync"**，`?sync=1` 才要断电安全
-（sqlite 缺省由 FULL 改为 NORMAL）。比较时须先对齐持久化等级。**缺省档与 `sync=1`
-在真实 ext4 上差 29–570×**（见 [PERFORMANCE.md](PERFORMANCE.md) §1.1）——"要不要
+（sqlite 缺省由 FULL 改为 NORMAL；jsonl 缺省为 flush 500ms + fsync 1s 两个周期，
+可用 `?each_flush=1` 改逐操作 flush）。比较时须先对齐持久化等级。**缺省档与 `sync=1`
+在真实 ext4 上差 29–940×**（见 [PERFORMANCE.md](PERFORMANCE.md) §1.1）——"要不要
 sync=1"比"选哪个基座"影响更大。sqlite 的历史数字（Set ~559）对应今天的 `sync=1`。
 ② `sync=1` 行只列受 fsync 影响的写路径：读不受影响，与缺省档相同。
 

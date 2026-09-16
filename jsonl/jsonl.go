@@ -30,16 +30,43 @@ import (
 	"github.com/RelicOfTesla/kvdb/mem"
 )
 
-// OpenURI 解析 jsonl://<path>[?sync=1][&buffered=1]；
+// OpenURI 解析 jsonl://<path>[?sync=1][&each_flush=1][&flush_interval=500ms][&sync_interval=1s]。
 // 路径支持 jsonl://./x、jsonl:///abs/x。
+//
+//	sync=1         逐操作 flush + fsync（此档下 each_flush 无意义）
+//	each_flush=1   逐操作 flush（fsync 仍按周期）
+//	（都不写）      周期策略：flush 每 500ms、fsync 每 1s
 func OpenURI(ctx context.Context, u *url.URL) (core.KvProvider, error) {
 	q := u.Query()
-	cfg := Config{Sync: q.Get("sync") == "1", Buffered: q.Get("buffered") == "1"}
-	if cfg.Sync && cfg.Buffered {
-		// 两个参数意图互斥：一个要求逐操作落盘，一个要求攒着不落盘。
-		return nil, fmt.Errorf("jsonl: sync=1 与 buffered=1 不能同时设置")
+	cfg := Config{
+		Sync:      q.Get("sync") == "1",
+		EachFlush: q.Get("each_flush") == "1",
+	}
+	var err error
+	if cfg.FlushInterval, err = parseInterval(q, "flush_interval"); err != nil {
+		return nil, err
+	}
+	if cfg.SyncInterval, err = parseInterval(q, "sync_interval"); err != nil {
+		return nil, err
 	}
 	return Open(ctx, pathFromURL(u), cfg)
+}
+
+// parseInterval 解析时长参数；给了但非法必须报错而不是静默回落到默认值——
+// 写错单位会让周期退化成默认值，而使用者以为自己已经调过（"以为安全其实没有"）。
+func parseInterval(q url.Values, name string) (time.Duration, error) {
+	s := q.Get(name)
+	if s == "" {
+		return 0, nil // 0 = 用该旋钮的默认间隔
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("jsonl: bad %s %q: %w", name, s, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("jsonl: %s must be positive, got %q", name, s)
+	}
+	return d, nil
 }
 
 // pathFromURL 归一化文件型路径：Host 为空表示绝对路径 jsonl:///abs/x。
@@ -54,31 +81,46 @@ var (
 	_ core.FullProvider = (*Provider)(nil)
 )
 
-// DefaultFlushInterval 是 Buffered 模式下"空闲落盘"的缺省阈值：连续这么久
-// 没有新写入，就把缓冲里的记录 Flush 给 OS（不再等下一次写、也不等 Close）。
-const DefaultFlushInterval = 100 * time.Millisecond
+// DefaultFlushInterval 是缺省档的周期 flush 间隔（500ms）：距上次 flush 超过这么久
+// 就把进程缓冲里的记录交给 OS。
+const DefaultFlushInterval = 500 * time.Millisecond
 
-// Config 控制 JSONL 基座行为。
+// DefaultSyncInterval 是缺省档的周期 fsync 间隔（1000ms）：距上次 fsync 超过这么久
+// 就把数据落到磁盘。与 flush 是两个独立的旋钮（见 Config）。
+const DefaultSyncInterval = time.Second
+
+// Config 控制 JSONL 基座行为。落盘分两个**旋钮**：
+//
+//	flush：把进程缓冲（bufio）里的字节交给 OS —— 决定"数据离开本进程"的时机
+//	fsync：让 OS 把数据写到物理介质 —— 决定"机器掉电也不丢"的时机
+//
+// 默认策略（两者都按周期，各自独立计时）：
+//
+//	flush 周期 500ms（DefaultFlushInterval）
+//	fsync 周期 1000ms（DefaultSyncInterval）
+//
+// 于是默认档的丢失边界是：**进程崩溃丢最后 500ms 内未 flush 的写**
+//（已 flush 的在 OS 页缓存里，进程崩溃不丢）；**机器掉电丢最后 1000ms 内未
+// fsync 的写**。两个周期都是真周期（Open 起跑、回调自我重排），不是"空闲才
+// 触发"——否则持续写入会不断推后到期时间，等于永不落盘。
+//
+// 注意 fsync 隐含 flush：Sync 只作用于 fd 上"已写出去"的字节，所以周期 fsync
+// 到期时会先 Flush 再 Sync，否则那段数据既没交给 OS 也没落盘。
 type Config struct {
-	// Sync 为 true 时每个写操作后立即 Flush + fsync（断电安全，吞吐低）。
+	// EachFlush 为 true 时**逐操作 flush**（而不是攒 500ms 周期），即"不缓冲"。
+	// 名字里的 each 指"每次写都做"，与 Sync 的"每次写都 fsync"对仗；
+	// 它只管 flush，**不管 fsync**——fsync 仍由 Sync 独立控制。
+	// 对应 URI 参数 each_flush=1。
+	EachFlush bool
+	// Sync 为 true 时**逐操作 flush + fsync**（断电安全，吞吐最低）。
+	// 对应 URI 参数 sync=1。此档下 EachFlush 无意义（flush+fsync 已包含 flush）。
 	Sync bool
-	// Buffered 为 true 时不做逐操作 Flush：记录先攒在 32KiB 进程缓冲里，
-	// 由下面两条兜底把它交出去——
-	//
-	//  1. 缓冲写满（32KiB）自然落盘；
-	//  2. **空闲落盘**：连续 FlushInterval 没有新写入就主动 Flush，
-	//     所以"没有后续写入"也不会永久不落盘（缺省 100ms，见 DefaultFlushInterval）。
-	//
-	// 实测写吞吐约 1.7×（省掉每操作一次 write 系统调用），代价两条：
-	//   - 崩溃最多丢"最后 FlushInterval 内 + 缓冲内"的尾部记录；
-	//   - 写失败不再在出错的那次操作上报，而是推迟到落盘时刻（写满/空闲/Close
-	//     任一处 Flush），并由后续操作或 Close 上报。
-	//
-	// 默认关闭：默认模式逐操作 Flush（不 fsync），写失败立刻返回给调用方。
-	// Compact/Close 一定会先 Flush，不会丢已确认的写入。
-	Buffered bool
-	// FlushInterval 是空闲落盘阈值，仅 Buffered 模式生效；<=0 用 DefaultFlushInterval。
+	// FlushInterval 是周期 flush 间隔；<=0 用 DefaultFlushInterval（500ms）。
+	// EachFlush=true 或 Sync=true 时无效（那两档逐操作 flush）。
 	FlushInterval time.Duration
+	// SyncInterval 是周期 fsync 间隔；<=0 用 DefaultSyncInterval（1000ms）。
+	// Sync=true 时无效（逐操作 fsync）。
+	SyncInterval time.Duration
 }
 
 // 日志记录的操作名。它们是**持久化格式的一部分**：写入侧与回放侧必须逐字一致，
@@ -147,24 +189,52 @@ func (e *parseError) Unwrap() error { return e.err }
 // 所以读路径不取 mu，读写可以真正并行。若把读也纳入这把锁（哪怕用 RLock），
 // 一个写者就会阻塞全部读者，而读侧本来不需要任何额外一致性保证。
 type Provider struct {
-	mu       sync.Mutex
-	mem      *mem.Provider
-	file     *os.File
-	bw       *bufio.Writer
-	path     string
-	sync     bool
-	buffered bool
-	closed   atomic.Bool
+	mu        sync.Mutex
+	mem       *mem.Provider
+	file      *os.File
+	bw        *bufio.Writer
+	path      string
+	sync      bool // 逐操作 flush+fsync
+	eachFlush bool // 逐操作 flush
+	closed    atomic.Bool
+	// writeErr 一旦置位，表示日志写入已**不可恢复地**失败，Provider 拒绝后续写入。
+	//
+	// 为什么必须 fail-stop：bufio.Writer 的错误是粘性的（Go 的 bufio 没有清除
+	// b.err 的公开 API），Flush/Write 一旦出错，缓冲里残留的字节再也不会被写出去
+	// （Flush 开头就是 `if b.err != nil { return b.err }`，连重试都没有）。此时若
+	// 继续接受写入，就是"每次 Set 都报成功、却永远写不出去"——比直接报错危险得多。
+	// 因此任何 flush/write 失败都立即把 Provider 置为不可写。
+	writeErr atomic.Pointer[error]
 
-	// idle 是 Buffered 模式的空闲落盘计时器。复用同一个 timer 做 Reset
-	// （实测 67ns/op，约写操作的 2%），避免每次新建 AfterFunc（318ns/op）。
-	// 回调只在"真的空闲"时触发，那时候没有写竞争，拿锁 Flush 不拖慢写路径。
-	idle *time.Timer
-	// interval 是解析后的空闲落盘阈值（Buffered 模式下 >0）。
-	interval time.Duration
-	// pending 记录落盘失败的粘性错误：守护回调里 Flush 失败时不能只在后台
-	// 吞掉——下一次写或 Close 必须把它报给调用方。
-	pending atomic.Pointer[error]
+	// 两个旋钮各自的周期状态；某档为"逐操作"时对应计时器为 nil。
+	flushInterval time.Duration
+	lastFlush     atomic.Int64
+	flushTimer    *time.Timer
+
+	syncInterval time.Duration
+	lastSync     atomic.Int64
+	syncTimer    *time.Timer
+}
+
+// failWrite 记录不可恢复的写失败（只保留第一个错误）。
+// 由写路径与两个周期回调共同调用，任何一处失败都让 Provider 立刻停写。
+func (p *Provider) failWrite(err error) error {
+	if err == nil {
+		return nil
+	}
+	p.writeErr.CompareAndSwap(nil, &err)
+	return err
+}
+
+// writeCheck 返回写入前必须满足的条件：已关闭或已失败都拒绝写入。
+func (p *Provider) writeCheck() error {
+	if p.closed.Load() {
+		return core.ErrClosed
+	}
+	if pe := p.writeErr.Load(); pe != nil {
+		return fmt.Errorf("jsonl: log is no longer writable: %w", *pe)
+	}
+	return nil
 }
 
 // Open 打开（不存在则创建）日志文件并回放恢复状态。
@@ -175,63 +245,83 @@ func Open(ctx context.Context, path string, cfg Config) (*Provider, error) {
 		return nil, fmt.Errorf("jsonl: open %s: %w", path, err)
 	}
 	p := &Provider{
-		mem:      mem.New(),
-		file:     f,
-		bw:       bufio.NewWriterSize(f, writeBufSize),
-		path:     path,
-		sync:     cfg.Sync,
-		buffered: cfg.Buffered,
+		mem:       mem.New(),
+		file:      f,
+		bw:        bufio.NewWriterSize(f, writeBufSize),
+		path:      path,
+		sync:      cfg.Sync,
+		eachFlush: cfg.EachFlush,
 	}
 	if err := p.replay(); err != nil {
 		f.Close()
 		return nil, err
 	}
-	if p.buffered {
-		// 回放结束、进入可服务状态后才装空闲计时器：回放期间 p.file 被 Seek/读
-		// 占用，此时触发落盘会与回放交错。计时器初值设为很大的间隔并等第一次
-		// 写入时 Reset 到 interval——没有写入就没有需要落盘的数据。
-		p.interval = cfg.FlushInterval
-		if p.interval <= 0 {
-			p.interval = DefaultFlushInterval
+	// 回放结束、进入可服务状态后才起计时器：回放期间 p.file 被 Seek/读占用，
+	// 此时触发落盘会与回放交错。
+	//
+	// 计时器是**真周期**（Open 即按间隔起跑，回调里自我重排），不是"空闲才触发"：
+	// 否则持续写入会不断推后到期时间，等于永不落盘。到期时若无未落盘数据，
+	// 对应的 Flush/Sync 是廉价空操作。
+	//
+	// sync=1 档逐操作 flush+fsync，两个计时器都不需要（each_flush 在该档无意义）。
+	if !p.sync {
+		now := core.Now()
+		if !p.eachFlush {
+			p.flushInterval = cfg.FlushInterval
+			if p.flushInterval <= 0 {
+				p.flushInterval = DefaultFlushInterval
+			}
+			p.lastFlush.Store(now.UnixNano())
+			p.flushTimer = time.AfterFunc(p.flushInterval, p.flushTick)
 		}
-		p.idle = time.AfterFunc(time.Hour, func() { p.flushIdle(p.interval) })
+		p.syncInterval = cfg.SyncInterval
+		if p.syncInterval <= 0 {
+			p.syncInterval = DefaultSyncInterval
+		}
+		p.lastSync.Store(now.UnixNano())
+		p.syncTimer = time.AfterFunc(p.syncInterval, p.syncTick)
 	}
 	return p, nil
 }
 
-// flushIdle 是空闲落盘回调：连续 FlushInterval 没有新写入时把缓冲交给 OS。
-// 失败必须留痕：后台不能把错误吞掉，否则调用方永远不知道数据没落盘。
-func (p *Provider) flushIdle(iv time.Duration) {
+// flushTick 是周期 flush 回调：把进程缓冲交给 OS，避免数据长时间停在进程内。
+// 失败即让 Provider 停写（见 writeErr 的说明）并留痕，由后续写或 Close 上报。
+// **无论成败都重排计时器**：否则一次失败就让这条周期永久停摆，连错误都不再上报。
+func (p *Provider) flushTick() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed.Load() {
+	defer p.flushTimer.Reset(p.flushInterval)
+	if p.closed.Load() || p.writeErr.Load() != nil {
 		return
 	}
 	if err := p.bw.Flush(); err != nil {
-		p.setPending(err)
+		p.failWrite(err)
 		return
 	}
-	// 期间若又有写入把缓冲填上了，重新排一次空闲落盘（否则这批要等到下次写、
-	// 或 Close 才落盘——正是"无新写永远不落地"那个坑）。
-	if p.bw.Buffered() > 0 {
-		p.idle.Reset(iv)
-	}
+	p.lastFlush.Store(core.Now().UnixNano())
 }
 
-// setPending 记录"落盘失败"的粘性错误（只保留第一个，避免被后续错误覆盖）。
-func (p *Provider) setPending(err error) {
-	if err == nil {
+// syncTick 是周期 fsync 回调：先 flush 再 fsync。
+//
+// **必须先 Flush 再 Sync**：fsync 作用于 fd 上"已写出去"的字节，数据还停在
+// bufio（用户态）缓冲里时 Sync 刷不到它——那段数据既没交给 OS 也没落盘，
+// 这次 fsync 等于白做。Flush 幂等，缓冲空时是空操作，因此两个周期重叠也无额外成本。
+func (p *Provider) syncTick() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	defer p.syncTimer.Reset(p.syncInterval)
+	if p.closed.Load() || p.writeErr.Load() != nil {
 		return
 	}
-	p.pending.CompareAndSwap(nil, &err)
-}
-
-// takePending 取出并清空粘性错误。
-func (p *Provider) takePending() error {
-	if pe := p.pending.Swap(nil); pe != nil {
-		return *pe
+	if err := p.bw.Flush(); err != nil {
+		p.failWrite(err)
+		return
 	}
-	return nil
+	if err := p.file.Sync(); err != nil {
+		p.failWrite(err)
+		return
+	}
+	p.lastSync.Store(core.Now().UnixNano())
 }
 
 // replay 打开时流式回放日志（内存峰值限单行，不缓存全文件）。
@@ -448,29 +538,29 @@ func (p *Provider) appendOps(recs []op) error {
 		buf = append(buf, '\n')
 	}
 	if _, err := p.bw.Write(buf); err != nil {
-		return err
+		// Write 也可能失败（缓冲满时它内部会 Flush）。失败即停写：bufio 的错误
+		// 是粘性的，继续接受写入只会"报成功却永远写不出去"。
+		return p.failWrite(err)
 	}
-	if !p.sync {
-		if !p.buffered {
-			// 默认模式：逐操作 Flush 交给 OS（不 fsync）。写失败立刻返回给调用方
-			// ——"磁盘满/只读/EIO 会在出错的那次操作上报"是默认模式要守住的契约。
-			return p.bw.Flush()
+	if p.sync {
+		// sync=1：逐操作 flush + fsync（最安全，吞吐最低）。此档下 each_flush
+		// 无意义——flush+fsync 已经包含 flush。
+		if err := p.bw.Flush(); err != nil {
+			return p.failWrite(err)
 		}
-		// Buffered 模式：攒在缓冲里（写满自然落盘），并把空闲计时器重置到
-		// FlushInterval，保证"没有后续写入"也会在有界时间内落盘。
-		// 同时先把上一次后台落盘的失败报出来，避免它被静默吞掉。
-		if err := p.takePending(); err != nil {
-			return err
-		}
-		if p.idle != nil {
-			p.idle.Reset(p.interval)
+		if err := p.file.Sync(); err != nil {
+			return p.failWrite(err)
 		}
 		return nil
 	}
-	if err := p.bw.Flush(); err != nil {
-		return err
+	if p.eachFlush {
+		// each_flush=1：逐操作 flush，让写失败当次返回、内存不会接受它。
+		if err := p.bw.Flush(); err != nil {
+			return p.failWrite(err)
+		}
 	}
-	return p.file.Sync()
+	// 其余情况交给周期计时器：数据留在缓冲里，到点由 flushTick/syncTick 交出。
+	return nil
 }
 
 // ---- Batch ----
@@ -493,8 +583,8 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed.Load() {
-		return core.ErrClosed
+	if err := p.writeCheck(); err != nil {
+		return err
 	}
 	recs := make([]op, 0, len(ops))
 	now := core.NowUnix()
@@ -555,8 +645,8 @@ func toRecord(o core.BatchOp, now int64) (op, error) {
 func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed.Load() {
-		return core.ErrClosed
+	if err := p.writeCheck(); err != nil {
+		return err
 	}
 	// WAL 顺序：先写日志、再改内存。若写日志失败则内存不变，二者始终一致
 	//（反序会出现"内存已改、日志缺失"，重启回放后状态回退）。
@@ -571,8 +661,8 @@ func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed.Load() {
-		return core.ErrClosed
+	if err := p.writeCheck(); err != nil {
+		return err
 	}
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
@@ -593,8 +683,8 @@ func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 func (p *Provider) Del(ctx context.Context, key string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed.Load() {
-		return core.ErrClosed
+	if err := p.writeCheck(); err != nil {
+		return err
 	}
 	if err := p.appendOp(encOp(op{Op: opDel}, key, "", nil)); err != nil {
 		return err
@@ -612,7 +702,7 @@ func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed.Load() {
+	if err := p.writeCheck(); err != nil {
 		return 0, core.ErrClosed
 	}
 	// 先校验既有值可解析为整数：若直接写日志再应用，日志里会留下一条
@@ -647,8 +737,8 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed.Load() {
-		return core.ErrClosed
+	if err := p.writeCheck(); err != nil {
+		return err
 	}
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
@@ -679,8 +769,8 @@ func (p *Provider) QPushFront(ctx context.Context, name string, value []byte) er
 func (p *Provider) qpush(ctx context.Context, name string, value []byte, front bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed.Load() {
-		return core.ErrClosed
+	if err := p.writeCheck(); err != nil {
+		return err
 	}
 	if err := p.appendOp(encOp(op{Op: opQPush, F: front}, name, "", value)); err != nil {
 		return err
@@ -702,7 +792,7 @@ func (p *Provider) QPopBack(ctx context.Context, name string) ([]byte, bool, err
 func (p *Provider) qpop(ctx context.Context, name string, back bool) ([]byte, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed.Load() {
+	if err := p.writeCheck(); err != nil {
 		return nil, false, core.ErrClosed
 	}
 	// 空队列不写日志（否则回放时多出一条无对应元素的 qpop）。
@@ -751,8 +841,8 @@ func (p *Provider) QBack(ctx context.Context, name string) ([]byte, bool, error)
 func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed.Load() {
-		return core.ErrClosed
+	if err := p.writeCheck(); err != nil {
+		return err
 	}
 	if err := p.appendOp(encOp(op{Op: opZSet, S: score}, name, key, nil)); err != nil {
 		return err
@@ -770,8 +860,8 @@ func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, err
 func (p *Provider) ZDel(ctx context.Context, name, key string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed.Load() {
-		return core.ErrClosed
+	if err := p.writeCheck(); err != nil {
+		return err
 	}
 	if err := p.appendOp(encOp(op{Op: opZDel}, name, key, nil)); err != nil {
 		return err
@@ -803,7 +893,7 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (int64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed.Load() {
+	if err := p.writeCheck(); err != nil {
 		return 0, core.ErrClosed
 	}
 	if err := p.appendOp(encOp(op{Op: opZIncr, D: delta}, name, key, nil)); err != nil {
@@ -817,8 +907,8 @@ func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (in
 func (p *Provider) Compact(ctx context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed.Load() {
-		return core.ErrClosed
+	if err := p.writeCheck(); err != nil {
+		return err
 	}
 	_ = ctx
 	s := p.mem.Snapshot()
@@ -930,26 +1020,29 @@ func (p *Provider) Close() error {
 		return nil
 	}
 	p.closed.Store(true)
-	// 先停空闲计时器再关文件：否则回调可能在 file.Close() 之后跑，对着已关闭的
-	// fd 做 Flush（表现为 Close 返回 nil 却有无意义的 EBADF 写尝试）。
-	// Stop 返回 false 说明回调已在跑，但那时它也阻塞在 p.mu 上，等我们释放锁后
-	// 会看到 closed=true 直接返回，不会碰文件。
-	if p.idle != nil {
-		p.idle.Stop()
+	// 先停两个周期计时器再关文件：否则回调可能在 file.Close() 之后跑，对着
+	// 已关闭的 fd 做 Flush/Sync。Stop 返回 false 说明回调已在跑，但那时它也
+	// 阻塞在 p.mu 上，等我们释放锁后会看到 closed=true 直接返回，不会碰文件。
+	if p.flushTimer != nil {
+		p.flushTimer.Stop()
+	}
+	if p.syncTimer != nil {
+		p.syncTimer.Stop()
 	}
 	err1 := p.bw.Flush()
 	err2 := p.file.Sync()
 	err3 := p.file.Close()
 	p.mem.Close()
-	// 后台空闲落盘曾失败的话，这里必须报出来——那是真实的丢数据信号。
-	if err := p.takePending(); err != nil {
-		return err
+	// 任何一次落盘失败（写路径或后台周期）都必须在这里报出来——那是真实的
+	// 丢数据信号，优先于 Flush/Sync/Close 自身的错误上报。
+	if pe := p.writeErr.Load(); pe != nil {
+		return *pe
 	}
 	if err1 != nil {
-		return err1
+		return p.failWrite(err1)
 	}
 	if err2 != nil {
-		return err2
+		return p.failWrite(err2)
 	}
 	return err3
 }

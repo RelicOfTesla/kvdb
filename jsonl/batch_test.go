@@ -16,10 +16,14 @@ import (
 
 // TestWriteFailureKeepsMemoryConsistent 验证写日志失败时内存不变：
 // 反序实现（先改内存后写日志）会在这里暴露不一致。
+//
+// 用 each_flush=1：写失败必须在**当次操作**上报，这条不变式要求每次都 flush。
+// 缺省周期档下失败会推迟到周期 tick，由 durability_test.go 的
+// TestWriteFailurePoisonsProvider / TestWriteFailureReportedOnClose 覆盖。
 func TestWriteFailureKeepsMemoryConsistent(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "db.jsonl")
-	p, err := Open(ctx, path, Config{})
+	p, err := Open(ctx, path, Config{EachFlush: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +133,9 @@ func TestBatchCommitAndReplay(t *testing.T) {
 func TestBatchAtomicOnWriteFailure(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "db.jsonl")
-	p, err := Open(ctx, path, Config{})
+	// 同 TestWriteFailureKeepsMemoryConsistent：整批"写失败即当次报错且完全不生效"
+	// 依赖逐操作 flush。
+	p, err := Open(ctx, path, Config{EachFlush: true})
 	if err != nil {
 		t.Fatal(err)
 	}

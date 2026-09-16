@@ -133,6 +133,9 @@ func (p *Provider) Close() error {
 // ---- KV ----
 
 func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -146,6 +149,9 @@ func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 
 // SetEx 写入 value 并设置 ttl 秒存活（Redis SETEX；覆盖旧 TTL）。
 func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int64) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -167,6 +173,9 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 // Redis 的 MULTI/EXEC 不做命令级回滚，若 EXPIREAT 失败，SET 的结果会保留
 // （与 Batch 的既有说明一致）。
 func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int64) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -187,6 +196,9 @@ func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int
 }
 
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	if err := core.CheckKey(key); err != nil {
+		return nil, false, err
+	}
 	if err := p.check(); err != nil {
 		return nil, false, err
 	}
@@ -202,6 +214,9 @@ func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 }
 
 func (p *Provider) Del(ctx context.Context, key string) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -213,6 +228,9 @@ func (p *Provider) Del(ctx context.Context, key string) error {
 }
 
 func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
+	if err := core.CheckKey(key); err != nil {
+		return false, err
+	}
 	if err := p.check(); err != nil {
 		return false, err
 	}
@@ -225,6 +243,9 @@ func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 }
 
 func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, error) {
+	if err := core.CheckKey(key); err != nil {
+		return 0, err
+	}
 	if err := p.check(); err != nil {
 		return 0, err
 	}
@@ -319,6 +340,9 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 }
 
 func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -335,6 +359,9 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 // ExpireAt 让 key 在 at（unix 秒）过期；at 已过去则立即删除。
 // 直接用 Redis 原生 EXPIREAT：过去时间点由服务端立即删除该 key。
 func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -345,6 +372,9 @@ func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
 }
 
 func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
+	if err := core.CheckKey(key); err != nil {
+		return 0, false, err
+	}
 	if err := p.check(); err != nil {
 		return 0, false, err
 	}
@@ -363,6 +393,9 @@ func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
 // ---- Queue（Redis List 映射：队尾=右，队头=左） ----
 
 func (p *Provider) QPush(ctx context.Context, name string, value []byte) error {
+	if err := core.CheckKey(name); err != nil {
+		return err
+	}
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -374,6 +407,9 @@ func (p *Provider) QPush(ctx context.Context, name string, value []byte) error {
 }
 
 func (p *Provider) QPushFront(ctx context.Context, name string, value []byte) error {
+	if err := core.CheckKey(name); err != nil {
+		return err
+	}
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -385,6 +421,9 @@ func (p *Provider) QPushFront(ctx context.Context, name string, value []byte) er
 }
 
 func (p *Provider) QPop(ctx context.Context, name string) ([]byte, bool, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, false, err
+	}
 	if err := p.check(); err != nil {
 		return nil, false, err
 	}
@@ -400,6 +439,9 @@ func (p *Provider) QPop(ctx context.Context, name string) ([]byte, bool, error) 
 }
 
 func (p *Provider) QPopBack(ctx context.Context, name string) ([]byte, bool, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, false, err
+	}
 	if err := p.check(); err != nil {
 		return nil, false, err
 	}
@@ -415,6 +457,9 @@ func (p *Provider) QPopBack(ctx context.Context, name string) ([]byte, bool, err
 }
 
 func (p *Provider) QSize(ctx context.Context, name string) (int64, error) {
+	if err := core.CheckKey(name); err != nil {
+		return 0, err
+	}
 	if err := p.check(); err != nil {
 		return 0, err
 	}
@@ -440,6 +485,9 @@ func (p *Provider) QBack(ctx context.Context, name string) ([]byte, bool, error)
 // 队列不存在视为空、返回顺序恰好是队头 → 队尾）与本契约完全一致，无需客户端换算。
 // 队列为空（或 key 不存在）时 LRANGE 返回空数组而非 nil 错误，故直接映射为空切片。
 func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) ([][]byte, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	if err := p.check(); err != nil {
 		return nil, err
 	}
@@ -452,6 +500,9 @@ func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) (
 }
 
 func (p *Provider) lindex(ctx context.Context, name string, idx int64) ([]byte, bool, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, false, err
+	}
 	if err := p.check(); err != nil {
 		return nil, false, err
 	}
@@ -469,6 +520,9 @@ func (p *Provider) lindex(ctx context.Context, name string, idx int64) ([]byte, 
 // ---- ZSet（Redis Sorted Set） ----
 
 func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) error {
+	if err := core.CheckKeys(name, key); err != nil {
+		return err
+	}
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -480,6 +534,9 @@ func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) erro
 }
 
 func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, error) {
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, false, err
+	}
 	if err := p.check(); err != nil {
 		return 0, false, err
 	}
@@ -495,6 +552,9 @@ func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, err
 }
 
 func (p *Provider) ZDel(ctx context.Context, name, key string) error {
+	if err := core.CheckKeys(name, key); err != nil {
+		return err
+	}
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -506,6 +566,9 @@ func (p *Provider) ZDel(ctx context.Context, name, key string) error {
 }
 
 func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
+	if err := core.CheckKey(name); err != nil {
+		return 0, err
+	}
 	if err := p.check(); err != nil {
 		return 0, err
 	}
@@ -518,6 +581,9 @@ func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
 }
 
 func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, error) {
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, false, err
+	}
 	if err := p.check(); err != nil {
 		return 0, false, err
 	}
@@ -533,6 +599,9 @@ func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, er
 }
 
 func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) ([]core.ZItem, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	if err := p.check(); err != nil {
 		return nil, err
 	}
@@ -557,6 +626,9 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 // 才能满足"desc 时同分成员仍按成员字节序升序"的契约（见 core.ZSetProvider 注释）。
 // 顺带一提：升序分支的 [min, max] 闭区间由 Redis 的 "min<=score<=max" 语义天然满足。
 func (p *Provider) ZRangeByScore(ctx context.Context, name string, min, max int64, limit int, desc bool) ([]core.ZItem, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	if err := p.check(); err != nil {
 		return nil, err
 	}
@@ -623,6 +695,9 @@ func fixDescTieOrder(out []core.ZItem) {
 }
 
 func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (int64, error) {
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, err
+	}
 	if err := p.check(); err != nil {
 		return 0, err
 	}
@@ -699,6 +774,18 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 		return nil
 	}
 	for _, op := range ops {
+		// 空 key/队列名/zset 名（以及 zset 成员）整批拒绝：与单条路径同口径，
+		// 且**不得静默跳过**（跳过会让调用方以为整批已写入，见 core.ErrInvalidKey）。
+		switch op.Kind {
+		case core.BatchZSet, core.BatchZDel, core.BatchZIncr:
+			if err := core.CheckKeys(op.Key, op.Member); err != nil {
+				return err
+			}
+		default:
+			if err := core.CheckKey(op.Key); err != nil {
+				return err
+			}
+		}
 		switch op.Kind {
 		case core.BatchSetEx, core.BatchExpire:
 			if op.TTL <= 0 {

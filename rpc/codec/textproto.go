@@ -32,6 +32,7 @@ import (
 //	closed        StatusClosed         底座已关闭
 //	not_integer   StatusNotInteger     Incr 遇到非十进制整数
 //	invalid_ttl   StatusInvalidTTL     TTL<=0
+//	invalid_key   StatusInvalidKey     key/队列名/zset 名/成员为空串
 //	not_found     StatusNotFound       以错误形态上报的"不存在"
 //	auth_required StatusAuthRequired   认证前被拒
 //	auth_failed   StatusAuthFailed     认证失败
@@ -200,6 +201,8 @@ func textProtoStatusName(s Status) (string, error) {
 		return "not_integer", nil
 	case StatusInvalidTTL:
 		return "invalid_ttl", nil
+	case StatusInvalidKey:
+		return "invalid_key", nil
 	case StatusNotFound:
 		return "not_found", nil
 	case StatusAuthRequired:
@@ -228,6 +231,8 @@ func textProtoStatusFromName(name string) (Status, error) {
 		return StatusNotInteger, nil
 	case "invalid_ttl":
 		return StatusInvalidTTL, nil
+	case "invalid_key":
+		return StatusInvalidKey, nil
 	case "not_found":
 		return StatusNotFound, nil
 	case "auth_required":

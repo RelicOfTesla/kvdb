@@ -14,24 +14,43 @@ import (
 //     的 key 造一个空值、把错误换成另一种）都会让远程与本地分叉。
 //  2. **哨兵错误原样还原**：服务端用状态码区分的哨兵，这里用 errorForStatus
 //     还原成同一个 core 错误对象，保证 errors.Is 在两条路径下结果一致。
+//
+// 唯一的例外是空 key/空名字的**前置校验**（core.CheckKey / core.CheckKeys）：
+// 它不是"加工"，而是提前执行同一份契约——服务端基座照样会校验（且是真值来源，
+// 见 core/provider.go 对 CheckKey 的说明），这里只是让调用方**免一次网络往返**
+// 就拿到同一个哨兵。若去掉它，行为仍然正确，只是慢。
+//
+// 这些校验一律放在编码参数之前，因此空 key 不会先把空串写到线路上再被拒。
 
 // Set 写入 key。
 func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	return p.callErr(ctx, mSet, []byte(key), value)
 }
 
 // SetEx 写入并设置 TTL。
 func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int64) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	return p.callErr(ctx, mSetEx, []byte(key), value, encInt(ttl))
 }
 
 // SetExAt 写入并设置绝对到期时刻（unix 秒）。
 func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int64) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	return p.callErr(ctx, mSetExAt, []byte(key), value, encInt(at))
 }
 
 // Get 读取 key。
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	if err := core.CheckKey(key); err != nil {
+		return nil, false, err
+	}
 	st, payload, err := p.call(ctx, []byte(mGet), []byte(key))
 	if err != nil {
 		return nil, false, err
@@ -50,11 +69,17 @@ func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 
 // Del 删除 key。
 func (p *Provider) Del(ctx context.Context, key string) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	return p.callErr(ctx, mDel, []byte(key))
 }
 
 // Exists 判断存在性。
 func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
+	if err := core.CheckKey(key); err != nil {
+		return false, err
+	}
 	st, payload, err := p.call(ctx, []byte(mExists), []byte(key))
 	if err != nil {
 		return false, err
@@ -67,6 +92,9 @@ func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 
 // Incr 原子自增。
 func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, error) {
+	if err := core.CheckKey(key); err != nil {
+		return 0, err
+	}
 	st, payload, err := p.call(ctx, []byte(mIncr), []byte(key), encInt(delta))
 	if err != nil {
 		return 0, err
@@ -122,16 +150,25 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 
 // Expire 设置 TTL。
 func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	return p.callErr(ctx, mExpire, []byte(key), encInt(ttl))
 }
 
 // ExpireAt 设置绝对到期时刻（unix 秒）。
 func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	return p.callErr(ctx, mExpireAt, []byte(key), encInt(at))
 }
 
 // TTL 读取剩余秒数。
 func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
+	if err := core.CheckKey(key); err != nil {
+		return 0, false, err
+	}
 	st, payload, err := p.call(ctx, []byte(mTTL), []byte(key))
 	if err != nil {
 		return 0, false, err
@@ -153,41 +190,65 @@ func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
 
 // QPush 追加到队尾。
 func (p *Provider) QPush(ctx context.Context, name string, value []byte) error {
+	if err := core.CheckKey(name); err != nil {
+		return err
+	}
 	return p.callErr(ctx, mQPush, []byte(name), value)
 }
 
 // QPushFront 插入到队头。
 func (p *Provider) QPushFront(ctx context.Context, name string, value []byte) error {
+	if err := core.CheckKey(name); err != nil {
+		return err
+	}
 	return p.callErr(ctx, mQPushFr, []byte(name), value)
 }
 
 // QPop 取出队头。
 func (p *Provider) QPop(ctx context.Context, name string) ([]byte, bool, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, false, err
+	}
 	return p.popLike(ctx, mQPop, name)
 }
 
 // QPopBack 取出队尾。
 func (p *Provider) QPopBack(ctx context.Context, name string) ([]byte, bool, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, false, err
+	}
 	return p.popLike(ctx, mQPopBk, name)
 }
 
 // QSize 返回长度。
 func (p *Provider) QSize(ctx context.Context, name string) (int64, error) {
+	if err := core.CheckKey(name); err != nil {
+		return 0, err
+	}
 	return p.intLike(ctx, mQSize, name)
 }
 
 // QFront 查看队头。
 func (p *Provider) QFront(ctx context.Context, name string) ([]byte, bool, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, false, err
+	}
 	return p.popLike(ctx, mQFront, name)
 }
 
 // QBack 查看队尾。
 func (p *Provider) QBack(ctx context.Context, name string) ([]byte, bool, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, false, err
+	}
 	return p.popLike(ctx, mQBack, name)
 }
 
 // QRange 返回区间内的元素（队头 → 队尾，保序）。
 func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) ([][]byte, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	st, payload, err := p.call(ctx, []byte(mQRange), []byte(name), encInt(start), encInt(stop))
 	if err != nil {
 		return nil, err
@@ -207,11 +268,17 @@ func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) (
 
 // ZSet 写入成员分数。
 func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) error {
+	if err := core.CheckKeys(name, key); err != nil {
+		return err
+	}
 	return p.callErr(ctx, mZSet, []byte(name), []byte(key), encInt(score))
 }
 
 // ZGet 读取成员分数。
 func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, error) {
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, false, err
+	}
 	st, payload, err := p.call(ctx, []byte(mZGet), []byte(name), []byte(key))
 	if err != nil {
 		return 0, false, err
@@ -231,16 +298,25 @@ func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, err
 
 // ZDel 删除成员。
 func (p *Provider) ZDel(ctx context.Context, name, key string) error {
+	if err := core.CheckKeys(name, key); err != nil {
+		return err
+	}
 	return p.callErr(ctx, mZDel, []byte(name), []byte(key))
 }
 
 // ZSize 返回成员数。
 func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
+	if err := core.CheckKey(name); err != nil {
+		return 0, err
+	}
 	return p.intLike(ctx, mZSize, name)
 }
 
 // ZRank 返回升序排名。
 func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, error) {
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, false, err
+	}
 	st, payload, err := p.call(ctx, []byte(mZRank), []byte(name), []byte(key))
 	if err != nil {
 		return 0, false, err
@@ -260,6 +336,9 @@ func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, er
 
 // ZRange 返回区间成员（保序）。
 func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) ([]core.ZItem, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	st, payload, err := p.call(ctx, []byte(mZRange), []byte(name), encInt(start), encInt(stop))
 	if err != nil {
 		return nil, err
@@ -286,6 +365,9 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 // 编码与 ZRANGE 相同，另带 min/max/limit/desc 四个十进制文本参数；
 // desc 编成 0/1（与其它 int 参数同一 decInt 口径），只翻转分数方向。
 func (p *Provider) ZRangeByScore(ctx context.Context, name string, min, max int64, limit int, desc bool) ([]core.ZItem, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	d := int64(0)
 	if desc {
 		d = 1
@@ -314,6 +396,9 @@ func (p *Provider) ZRangeByScore(ctx context.Context, name string, min, max int6
 
 // ZIncr 累加分数。
 func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (int64, error) {
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, err
+	}
 	st, payload, err := p.call(ctx, []byte(mZIncr), []byte(name), []byte(key), encInt(delta))
 	if err != nil {
 		return 0, err
@@ -330,8 +415,29 @@ func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (in
 // （BatchComposed），远程经由此路径同样具备——因为服务端是把 ops 原样
 // 交给底座的 ApplyBatch，中间没有任何拆分或重排。
 func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
+	// 空批是空操作（与 core.BatchProvider 契约一致），因此先于任何校验返回：
+	// len(ops)==0 时根本没有 key 可校验。
 	if len(ops) == 0 {
 		return nil
+	}
+	// 校验口径与服务端基座 sqlstore.checkBatchOps 一致：zset 类操作同时校验
+	// 集合名与成员；其余操作只看 Key（非 zset 操作的 Member 按契约被忽略，
+	// 不参与校验，否则会给一条本来合法的 BatchSet 平添无谓的失败）。
+	// 另外注意 wireKind 必须先跑：Kind 非法时连"该不该校验 Member"都无从判断。
+	for _, op := range ops {
+		if _, err := wireKind(op.Kind); err != nil {
+			return err
+		}
+		switch op.Kind {
+		case core.BatchZSet, core.BatchZDel, core.BatchZIncr:
+			if err := core.CheckKeys(op.Key, op.Member); err != nil {
+				return err
+			}
+		default:
+			if err := core.CheckKey(op.Key); err != nil {
+				return err
+			}
+		}
 	}
 	args := make([][]byte, 0, len(ops)+1)
 	args = append(args, []byte(mBatch))

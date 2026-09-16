@@ -76,6 +76,9 @@ func (p *Provider) lookup(key string, now int64, purge bool) (*entry, bool) {
 
 func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.checkOpen(); err != nil {
@@ -98,6 +101,9 @@ func (p *Provider) setLocked(key string, value []byte, now int64) {
 // SetEx 写入 value 并覆盖 TTL（对应 Redis SETEX / SSDB setx）。
 func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int64) error {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
@@ -120,6 +126,9 @@ func (p *Provider) setExLocked(key string, value []byte, ttl int64, now int64) {
 // at 已是过去时间时删除该 key（与 Redis SETEXAT 一致）。
 func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int64) error {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.checkOpen(); err != nil {
@@ -176,6 +185,9 @@ func clone(b []byte) []byte {
 
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return nil, false, err
+	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if err := p.checkOpen(); err != nil {
@@ -190,6 +202,9 @@ func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 
 func (p *Provider) Del(ctx context.Context, key string) error {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.checkOpen(); err != nil {
@@ -204,6 +219,9 @@ func (p *Provider) delLocked(key string) { delete(p.kv, key) }
 
 func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return false, err
+	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if err := p.checkOpen(); err != nil {
@@ -215,6 +233,9 @@ func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 
 func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, error) {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return 0, err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.checkOpen(); err != nil {
@@ -289,6 +310,9 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 
 func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
@@ -314,6 +338,9 @@ func (p *Provider) expireLocked(key string, ttl int64, now int64) {
 // key 不存在时不视为错误（与 Expire 一致）。
 func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.checkOpen(); err != nil {
@@ -333,6 +360,9 @@ func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
 
 func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return 0, false, err
+	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if err := p.checkOpen(); err != nil {
@@ -416,7 +446,12 @@ func (p *Provider) QPushFront(ctx context.Context, name string, value []byte) er
 	return p.qpush(ctx, name, value, true)
 }
 
+// qpush 是 QPush/QPushFront 的共用实现：空名校验放在这里，两个公开入口
+// 都必经此处（见 core.CheckKey）。
 func (p *Provider) qpush(_ context.Context, name string, value []byte, front bool) error {
+	if err := core.CheckKey(name); err != nil {
+		return err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.checkOpen(); err != nil {
@@ -449,7 +484,11 @@ func (p *Provider) QPopBack(ctx context.Context, name string) ([]byte, bool, err
 	return p.qpop(ctx, name, true)
 }
 
+// qpop 是 QPop/QPopBack 的共用实现：空名校验放在这里，两个公开入口都必经此处。
 func (p *Provider) qpop(_ context.Context, name string, back bool) ([]byte, bool, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, false, err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.checkOpen(); err != nil {
@@ -474,6 +513,9 @@ func (p *Provider) qpop(_ context.Context, name string, back bool) ([]byte, bool
 }
 
 func (p *Provider) QSize(_ context.Context, name string) (int64, error) {
+	if err := core.CheckKey(name); err != nil {
+		return 0, err
+	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if err := p.checkOpen(); err != nil {
@@ -495,6 +537,9 @@ func (p *Provider) QBack(ctx context.Context, name string) ([]byte, bool, error)
 
 // QRange 只读返回 [start, stop] 区间内的元素，方向为队头 → 队尾。
 func (p *Provider) QRange(_ context.Context, name string, start, stop int64) ([][]byte, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if err := p.checkOpen(); err != nil {
@@ -544,7 +589,11 @@ func indexRange(n, start, stop int64) (lo, hi int64, ok bool) {
 	return start, stop, true
 }
 
+// qfront 是 QFront/QBack 的共用实现：空名校验放在这里，两个公开入口都必经此处。
 func (p *Provider) qfront(_ context.Context, name string, back bool) ([]byte, bool, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, false, err
+	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if err := p.checkOpen(); err != nil {
@@ -563,6 +612,9 @@ func (p *Provider) qfront(_ context.Context, name string, back bool) ([]byte, bo
 // ---- ZSet ----
 
 func (p *Provider) ZSet(_ context.Context, name, key string, score int64) error {
+	if err := core.CheckKeys(name, key); err != nil {
+		return err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.checkOpen(); err != nil {
@@ -583,6 +635,9 @@ func (p *Provider) zsetLocked(name, key string, score int64) {
 }
 
 func (p *Provider) ZGet(_ context.Context, name, key string) (int64, bool, error) {
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, false, err
+	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if err := p.checkOpen(); err != nil {
@@ -593,6 +648,9 @@ func (p *Provider) ZGet(_ context.Context, name, key string) (int64, bool, error
 }
 
 func (p *Provider) ZDel(_ context.Context, name, key string) error {
+	if err := core.CheckKeys(name, key); err != nil {
+		return err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.checkOpen(); err != nil {
@@ -614,6 +672,9 @@ func (p *Provider) zdelLocked(name, key string) {
 }
 
 func (p *Provider) ZSize(_ context.Context, name string) (int64, error) {
+	if err := core.CheckKey(name); err != nil {
+		return 0, err
+	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if err := p.checkOpen(); err != nil {
@@ -623,6 +684,9 @@ func (p *Provider) ZSize(_ context.Context, name string) (int64, error) {
 }
 
 func (p *Provider) ZRank(_ context.Context, name, key string) (int64, bool, error) {
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, false, err
+	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if err := p.checkOpen(); err != nil {
@@ -642,6 +706,9 @@ func (p *Provider) ZRank(_ context.Context, name, key string) (int64, bool, erro
 }
 
 func (p *Provider) ZRange(_ context.Context, name string, start, stop int64) ([]core.ZItem, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if err := p.checkOpen(); err != nil {
@@ -652,6 +719,9 @@ func (p *Provider) ZRange(_ context.Context, name string, start, stop int64) ([]
 
 // ZRangeByScore 返回分数落在闭区间 [min, max] 内的成员；desc 只改遍历方向。
 func (p *Provider) ZRangeByScore(_ context.Context, name string, min, max int64, limit int, desc bool) ([]core.ZItem, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if err := p.checkOpen(); err != nil {
@@ -717,6 +787,9 @@ func zScoreWindow(items []core.ZItem, min, max int64, limit int, desc bool) []co
 }
 
 func (p *Provider) ZIncr(_ context.Context, name, key string, delta int64) (int64, error) {
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.checkOpen(); err != nil {
@@ -803,15 +876,25 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 	if err := p.checkOpen(); err != nil {
 		return err
 	}
-	// 先校验整批（Kind 与 TTL 合法性），避免"应用一半才发现参数非法"。
+	// 先校验整批（Kind、TTL 与空 key 合法性），避免"应用一半才发现参数非法"。
 	for _, op := range ops {
 		switch op.Kind {
-		case core.BatchSet, core.BatchDel, core.BatchQPush, core.BatchQPushFront,
-			core.BatchZSet, core.BatchZDel, core.BatchZIncr:
-			// 无条件写，无参数校验需求
+		case core.BatchSet, core.BatchDel, core.BatchQPush, core.BatchQPushFront:
+			// 单 key 的无条件写：只校验 op.Key。
+			if err := core.CheckKey(op.Key); err != nil {
+				return err
+			}
 		case core.BatchSetEx, core.BatchExpire:
+			if err := core.CheckKey(op.Key); err != nil {
+				return err
+			}
 			if op.TTL <= 0 {
 				return core.ErrInvalidTTL
+			}
+		case core.BatchZSet, core.BatchZDel, core.BatchZIncr:
+			// zset 操作同时带 zset 名（op.Key）与成员（op.Member），两者都要非空。
+			if err := core.CheckKeys(op.Key, op.Member); err != nil {
+				return err
 			}
 		default:
 			return fmt.Errorf("mem: unknown batch op %d", op.Kind)

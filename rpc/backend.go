@@ -175,6 +175,8 @@ func statusFor(err error) (codec.Status, [][]byte) {
 		st = codec.StatusNotInteger
 	case errors.Is(err, core.ErrInvalidTTL):
 		st = codec.StatusInvalidTTL
+	case errors.Is(err, core.ErrInvalidKey):
+		st = codec.StatusInvalidKey
 	case errors.Is(err, core.ErrNotFound):
 		st = codec.StatusNotFound
 	}
@@ -193,6 +195,8 @@ func errorForStatus(st codec.Status, payload [][]byte) error {
 		return wrapSentinel(core.ErrNotInteger, msg)
 	case codec.StatusInvalidTTL:
 		return wrapSentinel(core.ErrInvalidTTL, msg)
+	case codec.StatusInvalidKey:
+		return wrapSentinel(core.ErrInvalidKey, msg)
 	case codec.StatusNotFound:
 		return wrapSentinel(core.ErrNotFound, msg)
 	case codec.StatusError:

@@ -702,11 +702,30 @@ func validTablePrefix(p string) error {
 	return nil
 }
 
+// check 判定基座是否已关闭。
+//
+// 注意它与 Close 之间存在固有竞态：判定通过后、真正执行语句前，db.Close() 可能
+// 已经落地，此时驱动会返回"database is closed"这类**非哨兵**错误，破坏
+// "关闭后一律 ErrClosed"的契约（sqlite 的 close_race_test 正是钉这一点）。
+// 该窗口无法用 closed 标志消除，故 DB 层调用统一经 closedErr 归一。
 func (p *Provider) check() error {
 	if p.closed.Load() {
 		return core.ErrClosed
 	}
 	return nil
+}
+
+// closedErr 把"底层连接池已关闭"导致的驱动错误归一成 core.ErrClosed。
+//
+// 判据是**标志位 + 错误**同时成立：只有 Close 已经把 closed 置位、并且这条语句
+// 确实失败了，才把错误改写成哨兵。正常业务错误（约束冲突、类型不匹配等）发生
+// 在 closed=false 时不受影响；而 closed=true 之后本就不该有任何成功调用。
+// 这样既消除上面 check/Close 的竞态泄漏，又不会掩盖真实错误。
+func (p *Provider) closedErr(err error) error {
+	if err != nil && p.closed.Load() {
+		return core.ErrClosed
+	}
+	return err
 }
 
 // IncrWraps 能力声明：sqlstore 的 Incr 有显式溢出检查（事务与单语句路径都返回
@@ -740,6 +759,19 @@ func (p *Provider) checkLen(what string, parts ...string) error {
 // bs 把字符串键转 []byte，保证二进制安全的参数绑定。
 func bs(s string) []byte { return []byte(s) }
 
+// bv 归一化待写入的值：nil 切片按**空值**绑定，而不是 SQL NULL。
+//
+// 四张表的 v 列都声明为 NOT NULL，而 nil []byte 会被驱动绑定成 NULL，
+// 于是 `Set(k, nil)` 报 constraint failed —— 与其它基座"零长值可正常往返"
+// 的契约不一致（nil 与 []byte{} 在契约中无区别，Get 只承诺 ok=true 且 len=0）。
+// 这里统一把 nil 转成非 nil 零长，使零长值在所有方言上都能写入。
+func bv(v []byte) []byte {
+	if v == nil {
+		return []byte{}
+	}
+	return v
+}
+
 // writeLock 返回一个释放函数：方言要求写串行化时加进程级写锁，
 // 否则为空操作。所有写方法在进入时调用（SQLite 单写者排队）。
 func (p *Provider) writeLock() func() {
@@ -753,6 +785,9 @@ func (p *Provider) writeLock() func() {
 // ---- KV ----
 
 func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	defer p.writeLock()()
 	if err := p.check(); err != nil {
 		return err
@@ -761,13 +796,13 @@ func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 		return err
 	}
 	// 参数顺序须与 kvSetTemplate 一致：k, v[, n], now（now 供冲突子句清过期）。
-	args := []any{bs(key), value}
+	args := []any{bs(key), bv(value)}
 	if p.hasNumCol {
 		args = append(args, numProjection(value))
 	}
 	args = append(args, core.NowUnix())
 	if _, err := p.db.ExecContext(ctx, p.st.kvUpsert, args...); err != nil {
-		return fmt.Errorf("sqlstore: set: %w", err)
+		return fmt.Errorf("sqlstore: set: %w", p.closedErr(err))
 	}
 	return nil
 }
@@ -784,6 +819,9 @@ func numProjection(value []byte) any {
 // SetEx 写入 value 并设置 TTL（单条 upsert 同时写值与 expire_at，
 // 对应 Redis SETEX / SSDB setx）。
 func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int64) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	defer p.writeLock()()
 	if err := p.check(); err != nil {
 		return err
@@ -794,7 +832,7 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 	if err := p.checkLen("setex", key); err != nil {
 		return err
 	}
-	args := []any{bs(key), value, core.AddTTL(core.NowUnix(), ttl)}
+	args := []any{bs(key), bv(value), core.AddTTL(core.NowUnix(), ttl)}
 	if p.hasNumCol {
 		args = append(args, numProjection(value))
 	}
@@ -807,6 +845,9 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 // SetExAt 写入 value 并让 key 在 at（unix 秒）过期；at 已过去则删除该 key。
 // expire_at 列本就是绝对秒，因此直接把 at 写进去。
 func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int64) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	defer p.writeLock()()
 	if err := p.check(); err != nil {
 		return err
@@ -820,7 +861,7 @@ func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int
 		}
 		return nil
 	}
-	args := []any{bs(key), value, at}
+	args := []any{bs(key), bv(value), at}
 	if p.hasNumCol {
 		args = append(args, numProjection(value))
 	}
@@ -831,6 +872,9 @@ func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int
 }
 
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	if err := core.CheckKey(key); err != nil {
+		return nil, false, err
+	}
 	if err := p.check(); err != nil {
 		return nil, false, err
 	}
@@ -840,12 +884,15 @@ func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 		return nil, false, nil
 	}
 	if err != nil {
-		return nil, false, fmt.Errorf("sqlstore: get: %w", err)
+		return nil, false, fmt.Errorf("sqlstore: get: %w", p.closedErr(err))
 	}
 	return v, true, nil
 }
 
 func (p *Provider) Del(ctx context.Context, key string) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	defer p.writeLock()()
 	if err := p.check(); err != nil {
 		return err
@@ -857,6 +904,9 @@ func (p *Provider) Del(ctx context.Context, key string) error {
 }
 
 func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
+	if err := core.CheckKey(key); err != nil {
+		return false, err
+	}
 	if err := p.check(); err != nil {
 		return false, err
 	}
@@ -872,6 +922,9 @@ func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 }
 
 func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, error) {
+	if err := core.CheckKey(key); err != nil {
+		return 0, err
+	}
 	defer p.writeLock()()
 	if err := p.check(); err != nil {
 		return 0, err
@@ -1051,6 +1104,9 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 }
 
 func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	defer p.writeLock()()
 	if err := p.check(); err != nil {
 		return err
@@ -1072,6 +1128,9 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 // ExpireAt 让 key 在 at（unix 秒）过期；at 已过去则立即删除该 key。
 // key 不存在/已过期时不处理（无匹配行即不生效，不复活过期键）。
 func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	defer p.writeLock()()
 	if err := p.check(); err != nil {
 		return err
@@ -1093,6 +1152,9 @@ func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
 }
 
 func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
+	if err := core.CheckKey(key); err != nil {
+		return 0, false, err
+	}
 	if err := p.check(); err != nil {
 		return 0, false, err
 	}
@@ -1124,11 +1186,17 @@ func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
 // 队头->队尾顺序，前后插入共用同一顺序轴。
 
 func (p *Provider) QPush(ctx context.Context, name string, value []byte) error {
+	if err := core.CheckKey(name); err != nil {
+		return err
+	}
 	defer p.writeLock()()
 	return p.qpush(ctx, name, value, false)
 }
 
 func (p *Provider) QPushFront(ctx context.Context, name string, value []byte) error {
+	if err := core.CheckKey(name); err != nil {
+		return err
+	}
 	defer p.writeLock()()
 	return p.qpush(ctx, name, value, true)
 }
@@ -1171,7 +1239,7 @@ func (p *Provider) qpushTx(ctx context.Context, tx *sql.Tx, name string, value [
 		if err := tx.QueryRowContext(ctx, bump, bs(name)).Scan(&seq); err != nil {
 			return fmt.Errorf("sqlstore: qpush bump: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx, p.st.qItemInsert, bs(name), seq, value); err != nil {
+		if _, err := tx.ExecContext(ctx, p.st.qItemInsert, bs(name), seq, bv(value)); err != nil {
 			return fmt.Errorf("sqlstore: qpush insert: %w", err)
 		}
 		return nil
@@ -1195,18 +1263,24 @@ func (p *Provider) qpushTx(ctx context.Context, tx *sql.Tx, name string, value [
 	if _, err := tx.ExecContext(ctx, p.st.qSeqUpdate, next, prev, bs(name)); err != nil {
 		return fmt.Errorf("sqlstore: qpush update seq: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, p.st.qItemInsert, bs(name), seq, value); err != nil {
+	if _, err := tx.ExecContext(ctx, p.st.qItemInsert, bs(name), seq, bv(value)); err != nil {
 		return fmt.Errorf("sqlstore: qpush insert: %w", err)
 	}
 	return nil
 }
 
 func (p *Provider) QPop(ctx context.Context, name string) ([]byte, bool, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, false, err
+	}
 	defer p.writeLock()()
 	return p.qpop(ctx, name, false)
 }
 
 func (p *Provider) QPopBack(ctx context.Context, name string) ([]byte, bool, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, false, err
+	}
 	defer p.writeLock()()
 	return p.qpop(ctx, name, true)
 }
@@ -1240,6 +1314,9 @@ func (p *Provider) qpop(ctx context.Context, name string, back bool) ([]byte, bo
 }
 
 func (p *Provider) QSize(ctx context.Context, name string) (int64, error) {
+	if err := core.CheckKey(name); err != nil {
+		return 0, err
+	}
 	if err := p.check(); err != nil {
 		return 0, err
 	}
@@ -1259,6 +1336,9 @@ func (p *Provider) QBack(ctx context.Context, name string) ([]byte, bool, error)
 }
 
 func (p *Provider) qpeek(ctx context.Context, name string, back bool) ([]byte, bool, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, false, err
+	}
 	if err := p.check(); err != nil {
 		return nil, false, err
 	}
@@ -1281,6 +1361,9 @@ func (p *Provider) qpeek(ctx context.Context, name string, back bool) ([]byte, b
 // 见 qpush），故 seq ASC 恰好是队头 → 队尾。出队是直接 DELETE q_items 行，
 // 没有"待弹出"列，无需额外过滤。
 func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) ([][]byte, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	if err := p.check(); err != nil {
 		return nil, err
 	}
@@ -1346,6 +1429,9 @@ func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) (
 // ---- ZSet ----
 
 func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) error {
+	if err := core.CheckKeys(name, key); err != nil {
+		return err
+	}
 	defer p.writeLock()()
 	if err := p.check(); err != nil {
 		return err
@@ -1360,6 +1446,9 @@ func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) erro
 }
 
 func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, error) {
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, false, err
+	}
 	if err := p.check(); err != nil {
 		return 0, false, err
 	}
@@ -1375,6 +1464,9 @@ func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, err
 }
 
 func (p *Provider) ZDel(ctx context.Context, name, key string) error {
+	if err := core.CheckKeys(name, key); err != nil {
+		return err
+	}
 	defer p.writeLock()()
 	if err := p.check(); err != nil {
 		return err
@@ -1389,6 +1481,9 @@ func (p *Provider) ZDel(ctx context.Context, name, key string) error {
 }
 
 func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
+	if err := core.CheckKey(name); err != nil {
+		return 0, err
+	}
 	if err := p.check(); err != nil {
 		return 0, err
 	}
@@ -1400,6 +1495,9 @@ func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
 }
 
 func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, error) {
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, false, err
+	}
 	if err := p.check(); err != nil {
 		return 0, false, err
 	}
@@ -1420,6 +1518,9 @@ func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, er
 }
 
 func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) ([]core.ZItem, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	if err := p.check(); err != nil {
 		return nil, err
 	}
@@ -1490,6 +1591,9 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 // limit <= 0 表示不限，此时语句里根本没有 LIMIT 子句——绝不把 0/负数交给
 // SQL（SQLite 视负 LIMIT 为不限、MySQL/PostgreSQL 直接报错，语义会按方言分叉）。
 func (p *Provider) ZRangeByScore(ctx context.Context, name string, min, max int64, limit int, desc bool) ([]core.ZItem, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	if err := p.check(); err != nil {
 		return nil, err
 	}
@@ -1530,6 +1634,9 @@ func (p *Provider) ZRangeByScore(ctx context.Context, name string, min, max int6
 }
 
 func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (int64, error) {
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, err
+	}
 	defer p.writeLock()()
 	if err := p.check(); err != nil {
 		return 0, err
@@ -1585,6 +1692,9 @@ func (p *Provider) BatchComposed() bool { return true }
 var _ core.BatchComposedProvider = (*Provider)(nil)
 
 func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
+	if err := checkBatchOps(ops); err != nil {
+		return err
+	}
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -1621,6 +1731,29 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 	return nil
 }
 
+// checkBatchOps 在开事务之前校验整批的 key/队列名/zset 名/成员。
+//
+// 与空 key 一样，这里也在**取写锁之前**完成：非法参数不需要排队等锁。
+// zset 类操作（Key 是集合名、Member 是成员）要同时校验两者，与
+// ZSet/ZGet/ZDel/ZRank/ZIncr 单键路径同一口径（core.CheckKeys）。
+// 非 zset 类操作的 Member 字段按契约被忽略（见 core.BatchOp 注释），
+// 因此不参与校验——否则会给一条本来合法的 BatchSet 平添无谓的失败。
+func checkBatchOps(ops []core.BatchOp) error {
+	for _, op := range ops {
+		switch op.Kind {
+		case core.BatchZSet, core.BatchZDel, core.BatchZIncr:
+			if err := core.CheckKeys(op.Key, op.Member); err != nil {
+				return err
+			}
+		default:
+			if err := core.CheckKey(op.Key); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // batchOp 在事务内执行单条批操作。
 func (p *Provider) batchOp(ctx context.Context, tx *sql.Tx, op core.BatchOp, now int64) error {
 	switch op.Kind {
@@ -1628,7 +1761,7 @@ func (p *Provider) batchOp(ctx context.Context, tx *sql.Tx, op core.BatchOp, now
 		if err := p.checkLen("batch set", op.Key); err != nil {
 			return err
 		}
-		args := []any{bs(op.Key), op.Value}
+		args := []any{bs(op.Key), bv(op.Value)}
 		if p.hasNumCol {
 			args = append(args, numProjection(op.Value))
 		}
@@ -1639,7 +1772,7 @@ func (p *Provider) batchOp(ctx context.Context, tx *sql.Tx, op core.BatchOp, now
 		if err := p.checkLen("batch setex", op.Key); err != nil {
 			return err
 		}
-		args := []any{bs(op.Key), op.Value, core.AddTTL(now, op.TTL)}
+		args := []any{bs(op.Key), bv(op.Value), core.AddTTL(now, op.TTL)}
 		if p.hasNumCol {
 			args = append(args, numProjection(op.Value))
 		}

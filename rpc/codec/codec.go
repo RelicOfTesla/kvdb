@@ -75,6 +75,15 @@ const (
 	StatusNotInteger
 	// StatusInvalidTTL 表示 TTL<=0，映射为 core.ErrInvalidTTL。
 	StatusInvalidTTL
+	// StatusInvalidKey 表示 key/队列名/zset 名/成员为空串，
+	// 映射为 core.ErrInvalidKey。
+	//
+	// 单独给一个状态而不是落到通用 StatusError，是因为 StatusError 过线后
+	// 客户端只能还原出 errors.New(消息文本) —— 文本虽然与哨兵一字不差，
+	// 但**哨兵身份丢失**，errors.Is(err, core.ErrInvalidKey) 为 false，
+	// 直接破坏"远程基座与本地基座行为一致"的合同。这里与 StatusInvalidTTL /
+	// StatusNotInteger 同一手法：给需要判等的哨兵各配一个专属状态。
+	StatusInvalidKey
 	// StatusNotFound 表示目标不存在且该命令以错误形态上报，映射为 core.ErrNotFound。
 	StatusNotFound
 	// StatusAuthRequired 表示命令在认证完成之前被拒。
@@ -100,6 +109,8 @@ func (s Status) String() string {
 		return "not_integer"
 	case StatusInvalidTTL:
 		return "invalid_ttl"
+	case StatusInvalidKey:
+		return "invalid_key"
 	case StatusNotFound:
 		return "not_found"
 	case StatusAuthRequired:

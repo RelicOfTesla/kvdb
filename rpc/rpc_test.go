@@ -53,9 +53,16 @@ func memBackend(t *testing.T) func(context.Context) (core.KvProvider, error) {
 }
 
 // TestContractOverRPC 把合同用例跑在 RPC 通道上。
+//
+// 每条子用例各起一个 server（因此各有一份独立的 mem 基座）：kvdbtest 的
+// newDB 会为每条子用例调用一次 factory，语义就是"全新的一只库"。若把
+// startServer 提到外面只起一次，所有子用例就会共用同一份服务端数据——
+// 那些"空库前提下"的断言（如 TestScanBoundaries 的 Scan("","") 应为空）
+// 会看到前面子用例写入的残留而失败。本地直连的对照用例每条子用例都新建
+// 基座，这里必须对齐同一隔离语义，否则 RPC 通道测的就不是同一件事。
 func TestContractOverRPC(t *testing.T) {
-	_, addr := startServer(t, rpc.ServerConfig{Opener: memBackend(t)})
 	kvdbtest.RunWithOptions(t, kvdbtest.VirtualClock(t), func(t *testing.T) core.KvProvider {
+		_, addr := startServer(t, rpc.ServerConfig{Opener: memBackend(t)})
 		p, err := rpc.Open(t.Context(), addr)
 		if err != nil {
 			t.Fatalf("rpc.Open: %v", err)

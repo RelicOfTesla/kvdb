@@ -616,32 +616,63 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 }
 
 // toRecord 把契约批操作翻译成日志记录（与单条写路径共用同一记录格式，
-// 回放逻辑因此完全一致）。批内均为无条件写，此处只需校验 TTL。
+// 回放逻辑因此完全一致）。批内均为无条件写，此处校验 TTL 与空 key：
+// 空 key 必须在此被拒（而不是"跳过该条"），否则会写出回放时必然被 mem
+// 拒绝的记录——日志先行就变成了毒化日志。jsonl 的回放也经由此函数，
+// 因此这里校验不会与回放路径的行为冲突（合法记录照常通过）。
 func toRecord(o core.BatchOp, now int64) (op, error) {
 	switch o.Kind {
 	case core.BatchSet:
+		if err := core.CheckKey(o.Key); err != nil {
+			return op{}, err
+		}
 		return encOp(op{Op: opSet}, o.Key, "", o.Value), nil
 	case core.BatchSetEx:
+		if err := core.CheckKey(o.Key); err != nil {
+			return op{}, err
+		}
 		if o.TTL <= 0 {
 			return op{}, core.ErrInvalidTTL
 		}
 		return encOp(op{Op: opSetEx, At: core.AddTTL(now, o.TTL)}, o.Key, "", o.Value), nil
 	case core.BatchDel:
+		if err := core.CheckKey(o.Key); err != nil {
+			return op{}, err
+		}
 		return encOp(op{Op: opDel}, o.Key, "", nil), nil
 	case core.BatchExpire:
+		if err := core.CheckKey(o.Key); err != nil {
+			return op{}, err
+		}
 		if o.TTL <= 0 {
 			return op{}, core.ErrInvalidTTL
 		}
 		return encOp(op{Op: opExpire, At: core.AddTTL(now, o.TTL)}, o.Key, "", nil), nil
 	case core.BatchQPush:
+		if err := core.CheckKey(o.Key); err != nil {
+			return op{}, err
+		}
 		return encOp(op{Op: opQPush}, o.Key, "", o.Value), nil
 	case core.BatchQPushFront:
+		if err := core.CheckKey(o.Key); err != nil {
+			return op{}, err
+		}
 		return encOp(op{Op: opQPush, F: true}, o.Key, "", o.Value), nil
 	case core.BatchZSet:
+		// zset 操作同时带 zset 名（o.Key）与成员（o.Member），两者都要非空。
+		if err := core.CheckKeys(o.Key, o.Member); err != nil {
+			return op{}, err
+		}
 		return encOp(op{Op: opZSet, S: o.Score}, o.Key, o.Member, nil), nil
 	case core.BatchZDel:
+		if err := core.CheckKeys(o.Key, o.Member); err != nil {
+			return op{}, err
+		}
 		return encOp(op{Op: opZDel}, o.Key, o.Member, nil), nil
 	case core.BatchZIncr:
+		if err := core.CheckKeys(o.Key, o.Member); err != nil {
+			return op{}, err
+		}
 		return encOp(op{Op: opZIncr, D: o.Delta}, o.Key, o.Member, nil), nil
 	default:
 		return op{}, fmt.Errorf("jsonl: unknown batch op %d", o.Kind)
@@ -651,6 +682,9 @@ func toRecord(o core.BatchOp, now int64) (op, error) {
 // ---- KV ----
 
 func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.writeCheck(); err != nil {
@@ -667,6 +701,9 @@ func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 // SetEx 写入 value 并覆盖 TTL（对应 Redis SETEX / SSDB setx）；
 // 日志记录绝对过期时间，回放可确定性还原。
 func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int64) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.writeCheck(); err != nil {
@@ -685,6 +722,9 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 // 日志里记录的本就是绝对到期时刻，因此这里直接把 at 写进去即可——这也是
 // jsonl 用绝对戳记录过期时间的好处：回放不受"何时重放"影响。
 func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int64) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.writeCheck(); err != nil {
@@ -696,7 +736,13 @@ func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int
 	return p.mem.SetExAt(ctx, key, value, at)
 }
 
+// Get 委托内嵌 mem 基座读取。空 key 在此显式拒绝（而不是靠 mem 的校验兜底）：
+// jsonl 自己也是 Provider，直接持有 *jsonl.Provider 的调用方必须得到与
+// mem/bolt 一致的行为，读路径不能因为"只是转发"就漏掉契约。
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	if err := core.CheckKey(key); err != nil {
+		return nil, false, err
+	}
 	if p.closed.Load() {
 		return nil, false, core.ErrClosed
 	}
@@ -704,6 +750,9 @@ func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 }
 
 func (p *Provider) Del(ctx context.Context, key string) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.writeCheck(); err != nil {
@@ -715,7 +764,11 @@ func (p *Provider) Del(ctx context.Context, key string) error {
 	return p.mem.Del(ctx, key)
 }
 
+// Exists 委托内嵌 mem 基座读取；空 key 在此显式拒绝（理由同 Get）。
 func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
+	if err := core.CheckKey(key); err != nil {
+		return false, err
+	}
 	if p.closed.Load() {
 		return false, core.ErrClosed
 	}
@@ -723,6 +776,9 @@ func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 }
 
 func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, error) {
+	if err := core.CheckKey(key); err != nil {
+		return 0, err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.writeCheck(); err != nil {
@@ -758,6 +814,9 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 }
 
 func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.writeCheck(); err != nil {
@@ -774,6 +833,9 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 
 // ExpireAt 让 key 在 at（unix 秒）过期；at 已过去则立即删除。
 func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.writeCheck(); err != nil {
@@ -785,7 +847,11 @@ func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
 	return p.mem.ExpireAt(ctx, key, at)
 }
 
+// TTL 委托内嵌 mem 基座读取；空 key 在此显式拒绝（理由同 Get）。
 func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
+	if err := core.CheckKey(key); err != nil {
+		return 0, false, err
+	}
 	if p.closed.Load() {
 		return 0, false, core.ErrClosed
 	}
@@ -802,7 +868,12 @@ func (p *Provider) QPushFront(ctx context.Context, name string, value []byte) er
 	return p.qpush(ctx, name, value, true)
 }
 
+// qpush 是 QPush/QPushFront 的共用实现：空名校验放在这里，两个公开入口
+// 都必经此处（且先于写日志，避免把必然被拒的操作写进 WAL）。
 func (p *Provider) qpush(ctx context.Context, name string, value []byte, front bool) error {
+	if err := core.CheckKey(name); err != nil {
+		return err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.writeCheck(); err != nil {
@@ -825,7 +896,11 @@ func (p *Provider) QPopBack(ctx context.Context, name string) ([]byte, bool, err
 	return p.qpop(ctx, name, true)
 }
 
+// qpop 是 QPop/QPopBack 的共用实现：空名校验放在这里，两个公开入口都必经此处。
 func (p *Provider) qpop(ctx context.Context, name string, back bool) ([]byte, bool, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, false, err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.writeCheck(); err != nil {
@@ -851,21 +926,33 @@ func (p *Provider) qpop(ctx context.Context, name string, back bool) ([]byte, bo
 	return p.mem.QPop(ctx, name)
 }
 
+// QSize 委托内嵌 mem 基座读取；空队列名在此显式拒绝（理由同 Get）。
 func (p *Provider) QSize(ctx context.Context, name string) (int64, error) {
+	if err := core.CheckKey(name); err != nil {
+		return 0, err
+	}
 	if p.closed.Load() {
 		return 0, core.ErrClosed
 	}
 	return p.mem.QSize(ctx, name)
 }
 
+// QFront 委托内嵌 mem 基座读取；空队列名在此显式拒绝（理由同 Get）。
 func (p *Provider) QFront(ctx context.Context, name string) ([]byte, bool, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, false, err
+	}
 	if p.closed.Load() {
 		return nil, false, core.ErrClosed
 	}
 	return p.mem.QFront(ctx, name)
 }
 
+// QBack 委托内嵌 mem 基座读取；空队列名在此显式拒绝（理由同 Get）。
 func (p *Provider) QBack(ctx context.Context, name string) ([]byte, bool, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, false, err
+	}
 	if p.closed.Load() {
 		return nil, false, core.ErrClosed
 	}
@@ -875,6 +962,9 @@ func (p *Provider) QBack(ctx context.Context, name string) ([]byte, bool, error)
 // QRange 只读返回 [start, stop] 区间内的元素（队头 → 队尾）。
 // 状态层就是 mem，直接委托——队列在日志里没有独立索引，只按 op 顺序回放。
 func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) ([][]byte, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	if p.closed.Load() {
 		return nil, core.ErrClosed
 	}
@@ -884,6 +974,9 @@ func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) (
 // ---- ZSet ----
 
 func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) error {
+	if err := core.CheckKeys(name, key); err != nil {
+		return err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.writeCheck(); err != nil {
@@ -895,7 +988,11 @@ func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) erro
 	return p.mem.ZSet(ctx, name, key, score)
 }
 
+// ZGet 委托内嵌 mem 基座读取；空 zset 名/成员在此显式拒绝（理由同 Get）。
 func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, error) {
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, false, err
+	}
 	if p.closed.Load() {
 		return 0, false, core.ErrClosed
 	}
@@ -903,6 +1000,9 @@ func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, err
 }
 
 func (p *Provider) ZDel(ctx context.Context, name, key string) error {
+	if err := core.CheckKeys(name, key); err != nil {
+		return err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.writeCheck(); err != nil {
@@ -914,21 +1014,33 @@ func (p *Provider) ZDel(ctx context.Context, name, key string) error {
 	return p.mem.ZDel(ctx, name, key)
 }
 
+// ZSize 委托内嵌 mem 基座读取；空 zset 名在此显式拒绝（理由同 Get）。
 func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
+	if err := core.CheckKey(name); err != nil {
+		return 0, err
+	}
 	if p.closed.Load() {
 		return 0, core.ErrClosed
 	}
 	return p.mem.ZSize(ctx, name)
 }
 
+// ZRank 委托内嵌 mem 基座读取；空 zset 名/成员在此显式拒绝（理由同 Get）。
 func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, error) {
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, false, err
+	}
 	if p.closed.Load() {
 		return 0, false, core.ErrClosed
 	}
 	return p.mem.ZRank(ctx, name, key)
 }
 
+// ZRange 委托内嵌 mem 基座读取；空 zset 名在此显式拒绝（理由同 Get）。
 func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) ([]core.ZItem, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	if p.closed.Load() {
 		return nil, core.ErrClosed
 	}
@@ -937,6 +1049,9 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 
 // ZRangeByScore 委托内存基座：jsonl 的 zset 状态就存在 p.mem 里，读取语义与 mem 一致。
 func (p *Provider) ZRangeByScore(ctx context.Context, name string, min, max int64, limit int, desc bool) ([]core.ZItem, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	if p.closed.Load() {
 		return nil, core.ErrClosed
 	}
@@ -944,6 +1059,9 @@ func (p *Provider) ZRangeByScore(ctx context.Context, name string, min, max int6
 }
 
 func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (int64, error) {
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.writeCheck(); err != nil {

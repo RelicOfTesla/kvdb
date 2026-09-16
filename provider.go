@@ -52,6 +52,7 @@ var (
 	ErrNotInteger  = core.ErrNotInteger
 	ErrInvalidTTL  = core.ErrInvalidTTL
 	ErrNotFound    = core.ErrNotFound
+	ErrInvalidKey  = core.ErrInvalidKey
 )
 
 // Open 按 URI 的 scheme 选择基座并返回适配器接口 DB（注册表见 registry.go）。

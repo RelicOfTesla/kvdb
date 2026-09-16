@@ -893,6 +893,9 @@ func zRankTx(tx *bolt.Tx, name, member string) (int64, bool) {
 
 func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	// now 在事务内采样：等待 bbolt 单写者锁期间若跨过键的过期点，
 	// 事务外的陈旧 now 会让 kvSetTx 保留已失效的 TTL（写成功却不可见）。
 	return p.update(func(tx *bolt.Tx) error {
@@ -902,12 +905,18 @@ func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 
 func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int64) error {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	return p.update(func(tx *bolt.Tx) error { return kvSetExTx(tx, key, value, ttl) })
 }
 
 // SetExAt 写入 value 并让 key 在 at（unix 秒）过期；at 已过去则删除该 key。
 func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int64) error {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	return p.update(func(tx *bolt.Tx) error {
 		now := core.NowUnix()
 		if at <= now {
@@ -922,6 +931,9 @@ func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int
 
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return nil, false, err
+	}
 	var out []byte
 	var ok bool
 	err := p.view(func(tx *bolt.Tx) error {
@@ -939,11 +951,17 @@ func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 
 func (p *Provider) Del(ctx context.Context, key string) error {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	return p.update(func(tx *bolt.Tx) error { return kvDelTx(tx, key) })
 }
 
 func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return false, err
+	}
 	var ok bool
 	err := p.view(func(tx *bolt.Tx) error {
 		now := core.NowUnix()
@@ -957,6 +975,9 @@ func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 
 func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, error) {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return 0, err
+	}
 	var out int64
 	err := p.update(func(tx *bolt.Tx) error {
 		n, err := kvIncrTx(tx, key, delta, core.NowUnix())
@@ -1020,17 +1041,26 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 
 func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	return p.update(func(tx *bolt.Tx) error { return kvExpireTx(tx, key, ttl, core.NowUnix()) })
 }
 
 // ExpireAt 让 key 在 at（unix 秒）过期；at 已过去则立即删除。
 func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	return p.update(func(tx *bolt.Tx) error { return kvExpireAtTx(tx, key, at, core.NowUnix()) })
 }
 
 func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return 0, false, err
+	}
 	var secs int64
 	var ok bool
 	err := p.view(func(tx *bolt.Tx) error {
@@ -1056,11 +1086,17 @@ func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
 
 func (p *Provider) QPush(ctx context.Context, name string, value []byte) error {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return err
+	}
 	return p.update(func(tx *bolt.Tx) error { return qPushTx(tx, name, value, false) })
 }
 
 func (p *Provider) QPushFront(ctx context.Context, name string, value []byte) error {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return err
+	}
 	return p.update(func(tx *bolt.Tx) error { return qPushTx(tx, name, value, true) })
 }
 
@@ -1072,8 +1108,12 @@ func (p *Provider) QPopBack(ctx context.Context, name string) ([]byte, bool, err
 	return p.qpop(ctx, name, true)
 }
 
+// qpop 是 QPop/QPopBack 的共用实现：空名校验放在这里，两个公开入口都必经此处。
 func (p *Provider) qpop(ctx context.Context, name string, back bool) ([]byte, bool, error) {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return nil, false, err
+	}
 	var out []byte
 	var ok bool
 	err := p.update(func(tx *bolt.Tx) error {
@@ -1089,6 +1129,9 @@ func (p *Provider) qpop(ctx context.Context, name string, back bool) ([]byte, bo
 
 func (p *Provider) QSize(ctx context.Context, name string) (int64, error) {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return 0, err
+	}
 	var n int64
 	err := p.view(func(tx *bolt.Tx) error {
 		n = int64(qCountersGet(tx, name).count)
@@ -1108,6 +1151,9 @@ func (p *Provider) QBack(ctx context.Context, name string) ([]byte, bool, error)
 // QRange 只读返回 [start, stop] 区间内的元素，方向为队头 → 队尾。
 func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) ([][]byte, error) {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	var out [][]byte
 	err := p.view(func(tx *bolt.Tx) error {
 		items, err := qRangeTx(tx, name, start, stop)
@@ -1120,8 +1166,12 @@ func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) (
 	return out, err
 }
 
+// qpeek 是 QFront/QBack 的共用实现：空名校验放在这里，两个公开入口都必经此处。
 func (p *Provider) qpeek(ctx context.Context, name string, back bool) ([]byte, bool, error) {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return nil, false, err
+	}
 	var out []byte
 	var ok bool
 	err := p.view(func(tx *bolt.Tx) error {
@@ -1136,11 +1186,17 @@ func (p *Provider) qpeek(ctx context.Context, name string, back bool) ([]byte, b
 
 func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) error {
 	_ = ctx
+	if err := core.CheckKeys(name, key); err != nil {
+		return err
+	}
 	return p.update(func(tx *bolt.Tx) error { return zSetTx(tx, name, key, score) })
 }
 
 func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, error) {
 	_ = ctx
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, false, err
+	}
 	var score int64
 	var ok bool
 	err := p.view(func(tx *bolt.Tx) error {
@@ -1152,11 +1208,17 @@ func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, err
 
 func (p *Provider) ZDel(ctx context.Context, name, key string) error {
 	_ = ctx
+	if err := core.CheckKeys(name, key); err != nil {
+		return err
+	}
 	return p.update(func(tx *bolt.Tx) error { return zDelTx(tx, name, key) })
 }
 
 func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return 0, err
+	}
 	var n int64
 	err := p.view(func(tx *bolt.Tx) error {
 		n = zCountGet(tx, name)
@@ -1167,6 +1229,9 @@ func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
 
 func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, error) {
 	_ = ctx
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, false, err
+	}
 	var rank int64
 	var ok bool
 	err := p.view(func(tx *bolt.Tx) error {
@@ -1178,6 +1243,9 @@ func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, er
 
 func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) ([]core.ZItem, error) {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	var out []core.ZItem
 	err := p.view(func(tx *bolt.Tx) error {
 		items, err := zRangeTx(tx, name, start, stop)
@@ -1193,6 +1261,9 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 // ZRangeByScore 返回分数落在闭区间 [min, max] 内的成员；desc 只改遍历方向。
 func (p *Provider) ZRangeByScore(ctx context.Context, name string, min, max int64, limit int, desc bool) ([]core.ZItem, error) {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	if min > max {
 		return nil, nil // 空区间：与 mem 一致地返回 nil 且不报错
 	}
@@ -1206,6 +1277,9 @@ func (p *Provider) ZRangeByScore(ctx context.Context, name string, min, max int6
 
 func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (int64, error) {
 	_ = ctx
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, err
+	}
 	var score int64
 	err := p.update(func(tx *bolt.Tx) error {
 		s, err := zIncrTx(tx, name, key, delta)
@@ -1235,10 +1309,25 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 	}
 	for _, op := range ops {
 		switch op.Kind {
+		case core.BatchSet, core.BatchDel, core.BatchQPush, core.BatchQPushFront:
+			// 单 key 的无条件写：只校验 op.Key。
+			if err := core.CheckKey(op.Key); err != nil {
+				return err
+			}
 		case core.BatchSetEx, core.BatchExpire:
+			if err := core.CheckKey(op.Key); err != nil {
+				return err
+			}
 			if op.TTL <= 0 {
 				return core.ErrInvalidTTL
 			}
+		case core.BatchZSet, core.BatchZDel, core.BatchZIncr:
+			// zset 操作同时带 zset 名（op.Key）与成员（op.Member），两者都要非空。
+			if err := core.CheckKeys(op.Key, op.Member); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("bolt: unknown batch op %d", op.Kind)
 		}
 	}
 	return p.update(func(tx *bolt.Tx) error {

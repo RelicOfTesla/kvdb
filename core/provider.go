@@ -7,20 +7,10 @@ package core
 import (
 	"context"
 	"errors"
-	"math"
 )
 
 // DefaultScanLimit 是 Scan 在 limit<=0 时采用的页大小，避免无上限全表扫描。
 const DefaultScanLimit = 100
-
-// AddTTL 返回 now+ttl 的饱和和：ttl 大到溢出 int64 时钳制到 MaxInt64，
-// 避免各基座把 expire_at 包绕成负数（键立即过期或永不过期的分歧）。
-func AddTTL(now, ttl int64) int64 {
-	if ttl > 0 && now > math.MaxInt64-ttl {
-		return math.MaxInt64
-	}
-	return now + ttl
-}
 
 // 哨兵错误：仅用于 errors.Is 判等，不携带额外状态。
 var (
@@ -36,6 +26,14 @@ var (
 	// ErrNotFound 表示 key/成员不存在：Get 族以 ok=false 表达缺失，
 	// 经 D/DMust 合并为 (T, error) 形态时转为该哨兵。
 	ErrNotFound = errors.New("kvdb: key not found")
+	// ErrInvalidKey 表示 key/队列名/zset 名为空串。
+	//
+	// 契约把空 key 定义为**非法**，且**读写一致地拒绝**：若只拒写不拒读，就会出现
+	// "写不进去却读得到"（或反过来）的自相矛盾状态，调用方无从判断。此前仅 ssdb
+	// 基座在写路径上拒绝（真实 SSDB 对空 key 返回 ok 但静默丢弃写入），
+	// 其余基座两种都接受——现统一为拒绝。
+	// 空串不在删除集合（无 TTL/无成员）语义内，因此不会与 ErrNotFound 混淆。
+	ErrInvalidKey = errors.New("kvdb: key must not be empty")
 )
 
 // KeyValue 是 Scan 返回的一个键值对。

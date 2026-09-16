@@ -12,7 +12,7 @@ Measured throughput, cost model, and selection guidance for each `kvdb` backend.
 
 Only one methodology is used: **saturate the backend with concurrent load over a fixed time
 window and count what actually completes** (ops/s; batch writes are converted to per-item
-items/s). The basis is `BenchmarkThroughput*` in `bench/throughput_test.go`, with 8
+items/s). The basis is `BenchmarkThroughput*` in `example/bench/throughput_test.go`, with 8
 goroutines by default and `-benchtime` controlling the window length.
 
 **Why not use per-step latency (`ns/op`) as the basis**: the write path generally involves
@@ -339,7 +339,7 @@ implementation), so a CGO dependency is not introduced.
 ## 7. Reproducing
 
 ```bash
-cd bench   # standalone module; changing the directory changes the medium
+cd example/bench   # standalone module; changing the directory changes the medium
 
 D=/dev/shm/bt            # tmpfs; or ~/test/tmp (ext4/WSL vhdx), ./tmp (drvfs 9p)
 mkdir -p "$D"

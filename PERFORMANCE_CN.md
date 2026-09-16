@@ -10,7 +10,7 @@
 ## 1. 口径与方法
 
 只使用一种口径：**固定时间窗内跑满并发负载，统计实际完成量**（ops/s；批写折算到
-条目级 items/s）。基准为 `bench/throughput_test.go` 的 `BenchmarkThroughput*`，
+条目级 items/s）。基准为 `example/bench/throughput_test.go` 的 `BenchmarkThroughput*`，
 默认 8 个 goroutine、`-benchtime` 控制窗口长度。
 
 **为什么不以单步长（`ns/op`）为基准**：写入路径普遍带合并与异步成分——SQL 组提交、
@@ -277,7 +277,7 @@ drvfs(9p) 3.8–5.5 ms。**本环境的"常规磁盘"是 WSL vhdx，一次 fsync
 ## 7. 复现
 
 ```bash
-cd bench   # 独立模块；换目录即换介质
+cd example/bench   # 独立模块；换目录即换介质
 
 D=/dev/shm/bt            # tmpfs；或 ~/test/tmp（ext4/WSL vhdx）、./tmp（drvfs 9p）
 mkdir -p "$D"

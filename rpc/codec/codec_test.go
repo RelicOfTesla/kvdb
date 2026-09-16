@@ -179,6 +179,29 @@ func TestOversizedLengthRejected(t *testing.T) {
 	}
 }
 
+// TestEmptyRequestLineRejected: 空行必须被**拒绝**，绝不能 panic。
+//
+// 回归：resp codec 的 ReadRequest 曾直接取 line[0] 而不判空，于是任何客户端
+// 只要发一个换行（例如 `echo >/dev/tcp/host/port` 探端口）就会 panic。
+// 该 panic 发生在服务端的连接 goroutine 里，会直接打死整个进程——
+// 一个换行即可远程 DoS。三个 codec 都必须以错误收场。
+func TestEmptyRequestLineRejected(t *testing.T) {
+	for _, name := range codecNames() {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("空行导致 panic: %v", r)
+				}
+			}()
+			src := strings.NewReader("\n")
+			_, err := newCodec(name, src, io.Discard).ReadRequest(src)
+			if err == nil {
+				t.Fatal("空行应报错")
+			}
+		})
+	}
+}
+
 // TestRESPResponseShapeIsSelfChecking: 状态行必须自洽（数字与名字同类），
 // 否则视为协议错误——两端实现分歧应当立刻暴露。
 func TestRESPResponseShapeIsSelfChecking(t *testing.T) {

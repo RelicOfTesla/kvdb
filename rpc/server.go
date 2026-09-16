@@ -154,6 +154,14 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 		go func() {
 			defer s.wg.Done()
 			defer s.untrackConn(c)
+			// 每条连接兜一层 recover：面向网络的进程里，单个连接的解析/处理
+			// panic 绝不能打死整个服务端（一个畸形报文就能远程打崩它）。
+			// 只隔离当前连接——该连接被关闭，客户端看到断连，服务继续可用。
+			//
+			// 这是**兜底**而不是许可证：codec 仍必须自行校验输入
+			//（resp 曾因未判空行而 line[0] panic，已单独修复）。
+			// 包内不引日志依赖：调用方要记录的话，从 Close/Err 侧自行观测。
+			defer func() { _ = recover() }()
 			s.serveConn(ctx, c)
 		}()
 	}

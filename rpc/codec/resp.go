@@ -108,6 +108,13 @@ func (c *respCodec) ReadRequest(r io.Reader) ([][]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(line) == 0 {
+		// 空行必须报错而不是继续：客户端探测端口（如 `echo >/dev/tcp/host/port`）
+		// 或误发空行都会命中这里。少了这个判断，下面 line[0] 会 panic，
+		// 而 panic 发生在 serveConn 的 goroutine 里，会直接**打死整个服务端**
+		// ——一个换行就能远程打崩进程。
+		return nil, fmt.Errorf("resp: empty request line")
+	}
 	if line[0] != '$' {
 		return nil, fmt.Errorf("resp: request must start with bulk command name, got %q", truncate(line))
 	}

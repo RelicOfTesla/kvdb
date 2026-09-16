@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"strconv"
@@ -1002,6 +1003,73 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 	if st != "ok" {
 		return nil, fmt.Errorf("ssdb: zrange: status %q", st)
 	}
+	return zitems(recs)
+}
+
+// maxZRangeLimit 是发往 zscan/zrscan 的 limit 上限，用于表达"不限量"。
+// SSDB 服务端 limit 是 32 位有符号整数（源码 net/proc_zset.cpp 把它交给
+// SSDBImpl::zscan 的 int limit 形参），传更大的值会被截断/报错，故取
+// math.MaxInt32 作为哨兵：扫描在游标真正越界时自然结束，返回全部命中。
+const maxZRangeLimit = math.MaxInt32
+
+// ZRangeByScore 返回分数落在闭区间 [min, max] 内的成员。
+//
+// 依赖的原生命令（均在 SSDB wiki 的 zset 命令表 / 源码 src/proc_zset.cpp 中定义）：
+//   - 升序：`zscan name key_start score_start score_end limit`
+//   - 降序：`zrscan name key_start score_start score_end limit`
+//
+// key_start 的约定：SSDB 的 scan 族是**开区间游标**——结果从"严格大于 key_start"
+// 的成员开始。这里必须返回区间内**全部**成员，因此传空串 ""；SSDB 中不存在空成员名
+// （本文件的 ZSet/ZIncr 也拒绝空成员），空串即"从头开始"的合法游标。
+// 同理 score_start/score_end 是**闭区间**（score_start <= score <= score_end），
+// 与契约要求的闭区间一致，故直接传 min、max，不传 (min,/max 之类的开区间写法。
+//
+// desc=false/true 都传 score_start=min、score_end=max：SSDB 的 *_start/_end 是
+// **区间**而非 Redis ZREVRANGEBYSCORE 的 (max, min) 参数顺序，方向由命令本身
+// （zrscan）决定，不存在升降序需要交换参数的问题。
+//
+// 同分成员的次序：zscan 按 (score 升序, key 升序) 返回；zrscan 是 zscan 的
+// **完整逆序**，同分成员因此是 key **降序**。契约要求 desc 时同分仍按 key 升序，
+// 故对结果按同分组就地反转一次（见 fixDescTieOrder）。
+func (p *Provider) ZRangeByScore(ctx context.Context, name string, min, max int64, limit int, desc bool) ([]core.ZItem, error) {
+	if err := p.check(); err != nil {
+		return nil, err
+	}
+	// min > max 是空区间：直接返回，不发命令（与 zrangeArgs 对 start>stop 的处理一致）。
+	if min > max {
+		return nil, nil
+	}
+	name = p.k(name)
+	// limit<=0 表示不限：SSDB 无"无上限"约定，用 maxZRangeLimit 哨兵。
+	n := limit
+	if n <= 0 {
+		n = maxZRangeLimit
+	}
+	cmd := "zscan"
+	if desc {
+		cmd = "zrscan"
+	}
+	st, recs, err := p.do(ctx, cmd, name, "",
+		strconv.FormatInt(min, 10), strconv.FormatInt(max, 10), strconv.Itoa(n))
+	if err != nil {
+		return nil, err
+	}
+	if st != "ok" {
+		return nil, fmt.Errorf("ssdb: %s: status %q", cmd, st)
+	}
+	out, err := zitems(recs)
+	if err != nil {
+		return nil, err
+	}
+	if desc {
+		fixDescTieOrder(out)
+	}
+	return out, nil
+}
+
+// zitems 把 zset 命令返回的扁平记录 [key, score, key, score, ...] 转成 []core.ZItem。
+// 记录成对出现，落单的尾部记录（协议异常）被忽略。
+func zitems(recs [][]byte) ([]core.ZItem, error) {
 	out := make([]core.ZItem, 0, len(recs)/2)
 	for i := 0; i+1 < len(recs); i += 2 {
 		s, err := strconv.ParseInt(string(recs[i+1]), 10, 64)
@@ -1011,6 +1079,22 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 		out = append(out, core.ZItem{Key: string(recs[i]), Score: s})
 	}
 	return out, nil
+}
+
+// fixDescTieOrder 就地反转 out 中每个**同分连续段**：zrscan 返回"分数降序、同分
+// key 降序"，逐段反转后同分回到 key 升序，段间仍是分数降序，满足 ZRangeByScore
+// 对 desc 的契约（同分次序不翻转）。
+func fixDescTieOrder(out []core.ZItem) {
+	for i := 0; i < len(out); {
+		j := i + 1
+		for j < len(out) && out[j].Score == out[i].Score {
+			j++
+		}
+		for l, r := i, j-1; l < r; l, r = l+1, r-1 {
+			out[l], out[r] = out[r], out[l]
+		}
+		i = j
+	}
 }
 
 // zrangeArgs 把 redis 风格索引换算为 SSDB zrange 的 offset/limit。

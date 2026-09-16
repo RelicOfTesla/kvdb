@@ -35,9 +35,13 @@ const (
 	mZSize    = "ZSIZE"
 	mZRank    = "ZRANK"
 	mZRange   = "ZRANGE"
-	mZIncr    = "ZINCR"
-	mCaps     = "CAPS"
-	mHello    = "HELLO"
+	// mZRangeByScore 比 ZRANGE 多 min/max/limit/desc 四个参数：
+	// min/max/limit 是十进制文本（与 ZRANGE 的 start/stop 同规），
+	// desc 也按十进制文本编码（0/1），与 decInt 的唯一 int 编码一致。
+	mZRangeByScore = "ZRANGEBYSCORE"
+	mZIncr         = "ZINCR"
+	mCaps          = "CAPS"
+	mHello         = "HELLO"
 )
 
 // 编码约定（与 codec 无关，纯粹是"参数怎么摆"）：
@@ -51,6 +55,9 @@ const (
 //   - map（MGet）：块序列 [k1 v1 k2 v2 ...]，顺序不保证
 //   - []KeyValue（Scan）：块序列 [k1 v1 k2 v2 ...] 且**保序**
 //   - []ZItem（ZRange）：块序列 [member1 score1 member2 score2 ...] 且**保序**
+//   - []ZItem（ZRangeByScore）：与 ZRange **同一编码**（同样保序）；只是请求多带
+//     min、max（十进制文本的分数闭区间）、limit（十进制文本，<=0 表示不限）、
+//     desc（十进制文本 0/1，只翻转分数方向，不改 min<=max 的参数含义）
 //   - [][]byte（QRange）：块序列 [v1 v2 v3 ...] 且**保序**
 //   - 可选 int64（如 TTL、ZGet、ZRank）：命中时首块为十进制值，未命中走 StatusEmpty
 //   - BatchOp：单块内自描述序列，见下方编码表

@@ -541,6 +541,61 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 	if err != nil {
 		return nil, fmt.Errorf("redis: zrange: %w", err)
 	}
+	return zitems(zs), nil
+}
+
+// ZRangeByScore 返回分数落在闭区间 [min, max] 内的成员。
+//
+// desc 只改遍历方向，不交换 min/max：go-redis 的 ZRevRangeByScoreWithScores
+// 对外虽以 (&ZRangeBy{Max: ..., Min: ...}) 命名参数，但其内部把它拼成
+// `ZREVRANGEBYSCORE key <Max> <Min>`（Max 在前），所以这里传 Max=max、Min=min，
+// 命令实际发出 `ZREVRANGEBYSCORE key max min`，区间仍是 [min, max]——参数含义
+// 与升序分支完全一致。
+//
+// 同分成员的次序：Redis 的 ZREVRANGEBYSCORE 在同分时按成员**降序**返回（升序命令
+// ZRANGEBYSCORE 才是成员升序），因此 desc 分支需要对每个同分组做一次反转，
+// 才能满足"desc 时同分成员仍按成员字节序升序"的契约（见 core.ZSetProvider 注释）。
+// 顺带一提：升序分支的 [min, max] 闭区间由 Redis 的 "min<=score<=max" 语义天然满足。
+func (p *Provider) ZRangeByScore(ctx context.Context, name string, min, max int64, limit int, desc bool) ([]core.ZItem, error) {
+	if err := p.check(); err != nil {
+		return nil, err
+	}
+	// min > max 是空区间：直接返回，不打扰服务端（与 mem 参考实现一致）。
+	if min > max {
+		return nil, nil
+	}
+	name = p.pfx.z + name
+	// 分数是 float64，本 SDK 契约是 int64：必须按整数格式化，否则大整数的
+	// 十进制往返会因浮点表示不精确而落到区间之外（闭区间边界要求精确）。
+	by := &goredis.ZRangeBy{
+		Min: strconv.FormatInt(min, 10),
+		Max: strconv.FormatInt(max, 10),
+	}
+	if limit > 0 {
+		by.Offset = 0
+		by.Count = int64(limit)
+	}
+	var (
+		zs  []goredis.Z
+		err error
+	)
+	if desc {
+		zs, err = p.rd.ZRevRangeByScoreWithScores(ctx, name, by).Result()
+	} else {
+		zs, err = p.rd.ZRangeByScoreWithScores(ctx, name, by).Result()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("redis: zrangebyscore: %w", err)
+	}
+	out := zitems(zs)
+	if desc {
+		fixDescTieOrder(out)
+	}
+	return out, nil
+}
+
+// zitems 把 go-redis 的 []Z 转成 []core.ZItem（成员非 string 时跳过）。
+func zitems(zs []goredis.Z) []core.ZItem {
 	out := make([]core.ZItem, 0, len(zs))
 	for _, z := range zs {
 		member, ok := z.Member.(string)
@@ -549,7 +604,22 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 		}
 		out = append(out, core.ZItem{Key: member, Score: i64(z.Score)})
 	}
-	return out, nil
+	return out
+}
+
+// fixDescTieOrder 就地反转 out 中每个**同分连续段**。ZREVRANGEBYSCORE 返回的是
+// 分数降序、同分成员降序；逐段反转后同分成员回到升序，段间仍是分数降序。
+func fixDescTieOrder(out []core.ZItem) {
+	for i := 0; i < len(out); {
+		j := i + 1
+		for j < len(out) && out[j].Score == out[i].Score {
+			j++
+		}
+		for l, r := i, j-1; l < r; l, r = l+1, r-1 {
+			out[l], out[r] = out[r], out[l]
+		}
+		i = j
+	}
 }
 
 func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (int64, error) {

@@ -647,6 +647,21 @@ func (p *Provider) ZRange(_ context.Context, name string, start, stop int64) ([]
 	if err := p.checkOpen(); err != nil {
 		return nil, err
 	}
+	return sliceRange(p.zsortedLocked(name), start, stop), nil
+}
+
+// ZRangeByScore 返回分数落在闭区间 [min, max] 内的成员；desc 只改遍历方向。
+func (p *Provider) ZRangeByScore(_ context.Context, name string, min, max int64, limit int, desc bool) ([]core.ZItem, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if err := p.checkOpen(); err != nil {
+		return nil, err
+	}
+	return zScoreWindow(p.zsortedLocked(name), min, max, limit, desc), nil
+}
+
+// zsortedLocked 返回按 (score 升序, key 升序) 排好的成员快照，调用方需持有 p.mu。
+func (p *Provider) zsortedLocked(name string) []core.ZItem {
 	m := p.zset[name]
 	items := make([]core.ZItem, 0, len(m))
 	for k, s := range m {
@@ -658,7 +673,47 @@ func (p *Provider) ZRange(_ context.Context, name string, start, stop int64) ([]
 		}
 		return items[i].Key < items[j].Key
 	})
-	return sliceRange(items, start, stop), nil
+	return items
+}
+
+// zScoreWindow 在**升序**快照 items 上取分数属于 [min, max] 的窗口。
+// desc=true 时先按方向截取 limit 个，再按**分数段**倒序输出。
+//
+// 关键点：倒序不能简单地把整段反转——那会把同分成员的次序也翻过来
+// （b,f 变成 f,b），而契约要求同分成员**恒按 key 升序**（与 Redis 一致）。
+// 因此以"分数段"为单位倒序：同分的一组整体搬过去，组内保持升序。
+// limit 也必须在倒序**之前**按方向截取：desc 要取的是最高分那一端。
+func zScoreWindow(items []core.ZItem, min, max int64, limit int, desc bool) []core.ZItem {
+	if min > max {
+		return nil
+	}
+	// 升序快照可直接二分定位闭区间
+	lo := sort.Search(len(items), func(i int) bool { return items[i].Score >= min })
+	hi := sort.Search(len(items), func(i int) bool { return items[i].Score > max })
+	win := items[lo:hi]
+	if limit > 0 && len(win) > limit {
+		if desc {
+			win = win[len(win)-limit:]
+		} else {
+			win = win[:limit]
+		}
+	}
+	if !desc {
+		out := make([]core.ZItem, len(win))
+		copy(out, win)
+		return out
+	}
+	// 按分数段从后往前搬：每次取出一整段相同分数的成员，段内次序不变。
+	out := make([]core.ZItem, 0, len(win))
+	for i := len(win); i > 0; {
+		j := i - 1
+		for j > 0 && win[j-1].Score == win[i-1].Score {
+			j--
+		}
+		out = append(out, win[j:i]...)
+		i = j
+	}
+	return out
 }
 
 func (p *Provider) ZIncr(_ context.Context, name, key string, delta int64) (int64, error) {

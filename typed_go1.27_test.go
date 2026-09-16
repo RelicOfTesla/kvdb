@@ -495,6 +495,9 @@ func (s *storeOnlyStub) ZRank(context.Context, string, string) (int64, bool, err
 func (s *storeOnlyStub) ZRange(context.Context, string, int64, int64) ([]kvdb.ZItem, error) {
 	return nil, nil
 }
+func (s *storeOnlyStub) ZRangeByScore(context.Context, string, int64, int64, int, bool) ([]kvdb.ZItem, error) {
+	return nil, nil
+}
 func (s *storeOnlyStub) ZIncr(_ context.Context, name, key string, delta int64) (int64, error) {
 	if s.zset[name] == nil {
 		s.zset[name] = map[string]int64{}

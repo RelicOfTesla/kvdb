@@ -452,6 +452,71 @@ func (f *fakeSSDB) dispatch(req [][]byte) [][]byte {
 		n := len(f.zset[arg(1)])
 		f.mu.Unlock()
 		return [][]byte{[]byte("ok"), []byte(strconv.Itoa(n))}
+	case "zscan", "zrscan":
+		// zscan  name key_start score_start score_end limit
+		// zrscan name key_start score_start score_end limit
+		//
+		// 复刻真实 SSDB 的 zscan/zrscan（src/proc_zset.cpp:proc_zscan/proc_zrscan
+		// -> SSDBImpl::zscan：先按分数定位迭代器，再按 key 游标过滤）：
+		//   - score_start/score_end 是**闭区间**，两端都含；
+		//   - key_start 是**开区间**游标：只返回 key 严格大于（zscan）/
+		//     严格小于（zrscan）它的成员，空串表示不设游标；
+		//   - 遍历顺序：zscan = (score 升序, key 升序)；zrscan = 其**完整逆序**，
+		//     即 (score 降序, key 降序)——同分成员在逆序下确实是 key 降序，
+		//     这正是客户端需要对同分段做一次反转的原因；
+		//   - limit 是 32 位有符号数，<=0 视为不限；越界读到缺失即停（不报错）。
+		f.mu.Lock()
+		keyStart := arg(2)
+		scoreStart, err1 := strconv.ParseInt(arg(3), 10, 64)
+		scoreEnd, err2 := strconv.ParseInt(arg(4), 10, 64)
+		limit, err3 := strconv.Atoi(arg(5))
+		if err1 != nil || err2 != nil || err3 != nil {
+			f.mu.Unlock()
+			return [][]byte{[]byte("client_error"), []byte("bad range or limit")}
+		}
+		rev := cmd == "zrscan"
+		type kv struct {
+			k  string
+			sc int64
+		}
+		var items []kv
+		for k, sc := range f.zset[arg(1)] {
+			if scoreStart > scoreEnd { // 空区间
+				continue
+			}
+			if sc < scoreStart || sc > scoreEnd {
+				continue
+			}
+			if rev {
+				if keyStart != "" && k >= keyStart {
+					continue
+				}
+			} else if keyStart != "" && k <= keyStart {
+				continue
+			}
+			items = append(items, kv{k, sc})
+		}
+		sort.Slice(items, func(i, j int) bool {
+			if items[i].sc != items[j].sc {
+				if rev {
+					return items[i].sc > items[j].sc
+				}
+				return items[i].sc < items[j].sc
+			}
+			if rev {
+				return items[i].k > items[j].k
+			}
+			return items[i].k < items[j].k
+		})
+		out := [][]byte{[]byte("ok")}
+		for i, it := range items {
+			if limit > 0 && i >= limit {
+				break
+			}
+			out = append(out, []byte(it.k), []byte(strconv.FormatInt(it.sc, 10)))
+		}
+		f.mu.Unlock()
+		return out
 	default:
 		return [][]byte{[]byte("error"), []byte("unknown command: " + cmd)}
 	}

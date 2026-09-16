@@ -768,6 +768,108 @@ func zRangeTx(tx *bolt.Tx, name string, start, stop int64) ([]core.ZItem, error)
 	return out, nil
 }
 
+// zScoreWindowTx 在**有序索引** bZ 上按分数闭区间 [min, max] 取窗口。
+//
+// desc 只改遍历方向，不改变参数含义：始终 min<=max，min>max 直接判空。
+// limit>0 时"按遍历方向取前 limit 个"——降序即**最高分**那一端，因此这里
+// 是边走边截断（而非先取完再截），与 mem.zScoreWindow 的截断方向一致。
+//
+// 键为 lp(name)+be64(ordered(score))+member，键序即 (分数升序, 成员升序)，
+// 因此升序直接正序遍历即可；降序时反向游标会把整个区间（含同分数段）整体
+// 倒转，故额外把**每个同分数段**内部翻回升序，满足"同分不随方向翻转"的契约。
+func zScoreWindowTx(tx *bolt.Tx, name string, min, max int64, limit int, desc bool) []core.ZItem {
+	if min > max {
+		return nil
+	}
+	prefix := lp(name)
+	// 区间起点：分区间的第一个键（该分数下成员为空时它也 > 区间内任何键）。
+	lo := cat(prefix, be64(ordered(min)))
+	// 区间终点（闭）：分数 max 的最大成员键 = be64(ordered(max)) + 0xff；
+	// 反向游标可直接 Seek 到它，因为不存在比它更大的同分数键。
+	hiInc := append(cat(prefix, be64(ordered(max))), 0xff)
+
+	c := tx.Bucket(bZ).Cursor()
+	// 预分配上界：limit>0 时不会超过 limit，否则不超过集合大小（两者都只是估计，
+	// append 会自行扩容）。
+	capHint := zCountGet(tx, name)
+	if limit > 0 && int64(limit) < capHint {
+		capHint = int64(limit)
+	}
+	if capHint < 0 {
+		capHint = 0
+	}
+	if !desc {
+		out := make([]core.ZItem, 0, capHint)
+		for k, _ := c.Seek(lo); k != nil && bytes.HasPrefix(k, prefix) && bytes.Compare(k, hiInc) <= 0; k, _ = c.Next() {
+			rest := k[len(prefix):]
+			if len(rest) < be64Len {
+				continue // 键损坏：跳过该条，不中断整次查询
+			}
+			out = append(out, core.ZItem{
+				Key:   string(rest[be64Len:]),
+				Score: unorder(binary.BigEndian.Uint64(rest[:be64Len])),
+			})
+			if limit > 0 && len(out) >= limit {
+				break
+			}
+		}
+		return out
+	}
+
+	// 降序：从桶内最后一个键（本 zset 的最大键）出发反向遍历，边走边截断
+	//（取到的是最高分那一端）。
+	//
+	// 起点必须用 Last() 而不是 Seek(hiInc)：Seek 会落到桶内的**全局**后继
+	// 位置，当该 zset 不是桶内最后一个命名空间时 k 直接为 nil（循环一次都不
+	// 执行，结果恒为空）。Last() 再靠区间条件过滤则与桶内其他命名空间无关。
+	out := make([]core.ZItem, 0, capHint)
+	var run []core.ZItem // 紧随其后、尚未输出的**同分数**已收集成员（当前为降序）
+	flush := func() {
+		// 同分成员反转为成员升序后再追加（与 Redis 同分行为一致）
+		for i, j := 0, len(run)-1; i < j; i, j = i+1, j-1 {
+			run[i], run[j] = run[j], run[i]
+		}
+		out = append(out, run...)
+	}
+	for k, _ := c.Last(); k != nil; k, _ = c.Prev() {
+		if bytes.Compare(k, lo) < 0 {
+			break // 已越过区间下界
+		}
+		if !bytes.HasPrefix(k, prefix) {
+			continue // 其他 zset / 其他命名空间的键：继续往前找
+		}
+		if bytes.Compare(k, hiInc) > 0 {
+			continue // 本 zset 中分数高于 max 的成员
+		}
+		rest := k[len(prefix):]
+		if len(rest) < be64Len {
+			continue
+		}
+		score := unorder(binary.BigEndian.Uint64(rest[:be64Len]))
+		if len(run) > 0 && run[0].Score != score {
+			flush()
+			run = run[:0]
+			if limit > 0 && len(out) >= limit {
+				break
+			}
+		}
+		run = append(run, core.ZItem{Key: string(rest[be64Len:]), Score: score})
+		if limit > 0 && len(out)+len(run) >= limit {
+			// 本分数段已经凑满：翻正后截断到 limit 即可，无需再往前扫
+			flush()
+			run = run[:0]
+			break
+		}
+	}
+	if len(run) > 0 {
+		flush()
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
 // zRankTx 通过有序索引计数得到名次（O(rank)）。
 func zRankTx(tx *bolt.Tx, name, member string) (int64, bool) {
 	score, ok := zScoreGet(tx, name, member)
@@ -1083,6 +1185,20 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 			return err
 		}
 		out = items
+		return nil
+	})
+	return out, err
+}
+
+// ZRangeByScore 返回分数落在闭区间 [min, max] 内的成员；desc 只改遍历方向。
+func (p *Provider) ZRangeByScore(ctx context.Context, name string, min, max int64, limit int, desc bool) ([]core.ZItem, error) {
+	_ = ctx
+	if min > max {
+		return nil, nil // 空区间：与 mem 一致地返回 nil 且不报错
+	}
+	var out []core.ZItem
+	err := p.view(func(tx *bolt.Tx) error {
+		out = zScoreWindowTx(tx, name, min, max, limit, desc)
 		return nil
 	})
 	return out, err

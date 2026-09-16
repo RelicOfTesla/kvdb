@@ -281,6 +281,37 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 	return out, nil
 }
 
+// ZRangeByScore 返回分数闭区间 [min, max] 内的成员（保序）。
+//
+// 编码与 ZRANGE 相同，另带 min/max/limit/desc 四个十进制文本参数；
+// desc 编成 0/1（与其它 int 参数同一 decInt 口径），只翻转分数方向。
+func (p *Provider) ZRangeByScore(ctx context.Context, name string, min, max int64, limit int, desc bool) ([]core.ZItem, error) {
+	d := int64(0)
+	if desc {
+		d = 1
+	}
+	st, payload, err := p.call(ctx, []byte(mZRangeByScore), []byte(name),
+		encInt(min), encInt(max), encInt(int64(limit)), encInt(d))
+	if err != nil {
+		return nil, err
+	}
+	if st != codec.StatusOK {
+		return nil, errorForStatus(st, payload)
+	}
+	if len(payload)%2 != 0 {
+		return nil, fmt.Errorf("rpc: ZRANGEBYSCORE payload has odd block count %d", len(payload))
+	}
+	out := make([]core.ZItem, 0, len(payload)/2)
+	for i := 0; i+1 < len(payload); i += 2 {
+		score, err := decInt(payload[i+1])
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, core.ZItem{Key: string(payload[i]), Score: score})
+	}
+	return out, nil
+}
+
 // ZIncr 累加分数。
 func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (int64, error) {
 	st, payload, err := p.call(ctx, []byte(mZIncr), []byte(name), []byte(key), encInt(delta))

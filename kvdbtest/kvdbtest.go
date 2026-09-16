@@ -779,6 +779,78 @@ func TestZSet(t *testing.T, db kvdb.DB) {
 	if n, _ := db.ZSize(ctx, "r"); n != 4 {
 		t.Fatalf("ZDel 后 ZSize = %d", n)
 	}
+
+	// ---- ZRangeByScore：按分数闭区间取成员，desc 只改方向 ----
+	// 单独用一个集合，并**故意造同分**（b 与 f 同为 2），才能钉住"同分按成员升序、
+	// 且 desc 时该次序不翻转"这条容易写错的规则。
+	for _, m := range []struct {
+		key   string
+		score int64
+	}{{"a", 1}, {"b", 2}, {"f", 2}, {"c", 3}, {"d", 4}, {"e", 5}} {
+		if err := db.ZSet(ctx, "rbs", m.key, m.score); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keys := func(items []core.ZItem) []string {
+		out := make([]string, len(items))
+		for i, it := range items {
+			out[i] = it.Key
+		}
+		return out
+	}
+	eq := func(got []string, want []string) bool {
+		if len(got) != len(want) {
+			return false
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				return false
+			}
+		}
+		return true
+	}
+	for _, tc := range []struct {
+		name     string
+		min, max int64
+		limit    int
+		desc     bool
+		want     []string
+	}{
+		{"全区间升序", 0, 10, 0, false, []string{"a", "b", "f", "c", "d", "e"}},
+		{"全区间降序", 0, 10, 0, true, []string{"e", "d", "c", "b", "f", "a"}},
+		{"区间[2,4]升序", 2, 4, 0, false, []string{"b", "f", "c", "d"}},
+		{"区间[2,4]降序", 2, 4, 0, true, []string{"d", "c", "b", "f"}},
+		{"limit=2 升序取最低端", 0, 10, 2, false, []string{"a", "b"}},
+		{"limit=2 降序取最高端", 0, 10, 2, true, []string{"e", "d"}},
+		{"区间内 limit=2 降序", 2, 4, 2, true, []string{"d", "c"}},
+		{"单点 min==max", 3, 3, 0, false, []string{"c"}},
+		{"空区间 min>max", 5, 1, 0, false, nil},
+		{"无匹配", 100, 200, 0, false, nil},
+		{"空区间降序", 5, 1, 0, true, nil},
+	} {
+		items, err := db.ZRangeByScore(ctx, "rbs", tc.min, tc.max, tc.limit, tc.desc)
+		if err != nil {
+			t.Fatalf("ZRangeByScore(%s): %v", tc.name, err)
+		}
+		if got := keys(items); !eq(got, tc.want) {
+			t.Fatalf("ZRangeByScore(%s, min=%d max=%d limit=%d desc=%v) = %v, want %v",
+				tc.name, tc.min, tc.max, tc.limit, tc.desc, got, tc.want)
+		}
+		// 分数必须落在闭区间内（顺带验证边界是闭的）
+		for _, it := range items {
+			if it.Score < tc.min || it.Score > tc.max {
+				t.Fatalf("ZRangeByScore(%s) 返回越界分数 %s=%d", tc.name, it.Key, it.Score)
+			}
+		}
+	}
+	// 不存在的集合：空且无错
+	if items, err := db.ZRangeByScore(ctx, "rbs-absent", 0, 10, 0, false); err != nil || len(items) != 0 {
+		t.Fatalf("不存在的集合应为空且无错, got %v,%v", items, err)
+	}
+	// 只读：不应改动集合
+	if n, _ := db.ZSize(ctx, "rbs"); n != 6 {
+		t.Fatalf("ZRangeByScore 后 ZSize = %d, want 6", n)
+	}
 }
 
 // TestBatch 覆盖批量写契约：一次提交内混合 KV/Queue/ZSet 操作，

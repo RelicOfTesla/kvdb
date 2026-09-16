@@ -440,6 +440,128 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 	return out, nil
 }
 
+// zEachReverse 按 (score 降序, member 降序) 反向遍历某 zset 的成员。
+// badger 的反向迭代器（opts.Reverse）仍按 key 的逆序输出，故同分数内的成员
+// 也是逆序——调用方若需要同分升序，需自行翻正（见 zScoreWindow）。
+func zEachReverse(txn *badgerdb.Txn, name string, fn func(score int64, member string) bool) error {
+	prefix := keyOf(nsZScore, lp(name))
+	opts := badgerdb.DefaultIteratorOptions
+	opts.Prefix = prefix
+	opts.Reverse = true
+	opts.PrefetchValues = false
+	it := txn.NewIterator(opts)
+	defer it.Close()
+	// 反向迭代必须 seek 到前缀的上界才能落到最后一个元素；同前缀末元素 = 前缀+0xff。
+	start := append(append([]byte(nil), prefix...), 0xff)
+	for it.Seek(start); it.Valid(); it.Next() {
+		k := it.Item().Key()
+		if len(k) < len(prefix)+be64Len {
+			break
+		}
+		body := k[len(prefix):]
+		score := unorder(binary.BigEndian.Uint64(body[:be64Len]))
+		if !fn(score, string(body[be64Len:])) {
+			return nil
+		}
+	}
+	return nil
+}
+
+// zScoreWindow 在排序侧索引 nsZScore 上按**分数闭区间** [min, max] 取窗口。
+//
+// 注意 normalizeRange 是 ZRANGE 的**索引**区间，这里是**分数**区间，不可互换。
+// desc 只改遍历方向，不改变参数含义：始终 min<=max，min>max 直接判空。
+// limit>0 时"按遍历方向取前 limit 个"——降序即**最高分**那一端，因此降序
+// 边走边截断（而非先取完再截），与 mem.zScoreWindow 的截断方向一致。
+//
+// 键为 lp(name)+be64(ordered(score))+member，键序即 (分数升序, 成员升序)；
+// 降序时反向迭代会把同分数段也倒转，故把**每个同分数段**内部翻回升序。
+func (p *Provider) zScoreWindow(txn *badgerdb.Txn, name string, min, max int64, limit int, desc bool) ([]core.ZItem, error) {
+	if min > max {
+		return nil, nil
+	}
+	out := []core.ZItem{}
+	if !desc {
+		out = make([]core.ZItem, 0, minCap(limit))
+		err := zEach(txn, name, func(s int64, m string) bool {
+			if s < min {
+				return true // 还没进入区间
+			}
+			if s > max {
+				return false // 越过上界：升序遍历可安全提前结束
+			}
+			out = append(out, core.ZItem{Key: m, Score: s})
+			return limit <= 0 || len(out) < limit
+		})
+		if err != nil {
+			return nil, err
+		}
+		if limit > 0 && len(out) > limit {
+			out = out[:limit]
+		}
+		return out, nil
+	}
+
+	out = make([]core.ZItem, 0, minCap(limit))
+	var run []core.ZItem // 刚收集到、尚未输出的同分数成员（当前为降序）
+	flush := func() {
+		for i, j := 0, len(run)-1; i < j; i, j = i+1, j-1 {
+			run[i], run[j] = run[j], run[i]
+		}
+		out = append(out, run...)
+	}
+	err := zEachReverse(txn, name, func(s int64, m string) bool {
+		if s > max {
+			return true // 还没进入区间
+		}
+		if s < min {
+			return false // 越过下界：降序遍历可安全提前结束
+		}
+		if len(run) > 0 && run[0].Score != s {
+			flush()
+			run = run[:0]
+			if limit > 0 && len(out) >= limit {
+				return false
+			}
+		}
+		run = append(run, core.ZItem{Key: m, Score: s})
+		if limit > 0 && len(out)+len(run) >= limit {
+			flush() // 本分数段已凑满：翻正后截断即可，无需再往前扫
+			run = run[:0]
+			return false
+		}
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(run) > 0 {
+		flush()
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// ZRangeByScore 返回分数落在闭区间 [min, max] 内的成员；desc 只改遍历方向。
+func (p *Provider) ZRangeByScore(ctx context.Context, name string, min, max int64, limit int, desc bool) ([]core.ZItem, error) {
+	_ = ctx
+	var out []core.ZItem
+	err := p.view("zrangebyscore", func(txn *badgerdb.Txn) error {
+		items, err := p.zScoreWindow(txn, name, min, max, limit, desc)
+		if err != nil {
+			return err
+		}
+		out = items
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // normalizeRange 把 Redis ZRANGE 式索引（0 起闭区间、负数从末尾数）折算成
 // 正向下标区间；返回 ok=false 表示区间为空。
 func normalizeRange(start, stop, n int64) (lo, hi int64, ok bool) {

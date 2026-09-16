@@ -272,6 +272,17 @@ type ZSetProvider interface {
 	// ZRange 返回 [start, stop] 索引区间（0 起闭区间）的成员，按升序；
 	// 负索引表示从末尾数（-1 为最后一个），与 Redis ZRANGE 一致。
 	ZRange(ctx context.Context, name string, start, stop int64) ([]ZItem, error)
+	// ZRangeByScore 返回**分数落在闭区间 [min, max]** 内的成员。
+	//
+	// desc 只改变**遍历方向**（false=分数升序、true=分数降序），**不改变参数含义**：
+	// 始终要求 min <= max，调用方不必在逆序时把两个参数对调（Redis 的
+	// ZREVRANGEBYSCORE 要求传 max,min，容易写错；此处刻意不沿用那个约定）。
+	// min > max 视为空区间，返回空且不报错。
+	// limit > 0 时最多返回 limit 个（按遍历方向取前 limit 个）；limit <= 0 表示不限。
+	//
+	// 排序与 ZRange 一致：分数相同时按成员字节序升序（desc 时该次序**不翻转**，
+	// 与 Redis 同分成员的行为一致）。
+	ZRangeByScore(ctx context.Context, name string, min, max int64, limit int, desc bool) ([]ZItem, error)
 	// ZIncr 原子地对成员分数加 delta（不存在按 0 起算），返回新分数。
 	ZIncr(ctx context.Context, name, key string, delta int64) (int64, error)
 }

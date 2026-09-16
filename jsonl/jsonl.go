@@ -935,6 +935,14 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 	return p.mem.ZRange(ctx, name, start, stop)
 }
 
+// ZRangeByScore 委托内存基座：jsonl 的 zset 状态就存在 p.mem 里，读取语义与 mem 一致。
+func (p *Provider) ZRangeByScore(ctx context.Context, name string, min, max int64, limit int, desc bool) ([]core.ZItem, error) {
+	if p.closed.Load() {
+		return nil, core.ErrClosed
+	}
+	return p.mem.ZRangeByScore(ctx, name, min, max, limit, desc)
+}
+
 func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (int64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

@@ -355,7 +355,7 @@ func (s *Server) dispatchQueue(ctx context.Context, cmd string, args [][]byte) r
 // dispatchZSet 处理 sorted-set 命令。
 func (s *Server) dispatchZSet(ctx context.Context, cmd string, args [][]byte) reply {
 	switch cmd {
-	case mZSet, mZGet, mZDel, mZSize, mZRank, mZRange, mZIncr:
+	case mZSet, mZGet, mZDel, mZSize, mZRank, mZRange, mZRangeByScore, mZIncr:
 	default:
 		return unhandled()
 	}
@@ -411,6 +411,38 @@ func (s *Server) dispatchZSet(ctx context.Context, cmd string, args [][]byte) re
 		}
 		out := make([][]byte, 0, len(items)*2)
 		for _, it := range items { // ZRange 保序
+			out = append(out, []byte(it.Key), encInt(it.Score))
+		}
+		return ok(out...)
+	case mZRangeByScore:
+		// args: name min max limit desc —— limit 与 desc 都是十进制文本
+		// （desc 用 0/1；非 0 视为逆序，与 mem 基座的真值判定一致）。
+		if len(args) != 5 {
+			return argErrReply(mZRangeByScore, "name", "min", "max", "limit", "desc")
+		}
+		min, err := decInt(args[1])
+		if err != nil {
+			return fail(err)
+		}
+		max, err := decInt(args[2])
+		if err != nil {
+			return fail(err)
+		}
+		limit, err := decInt(args[3])
+		if err != nil {
+			return fail(err)
+		}
+		desc, err := decInt(args[4])
+		if err != nil {
+			return fail(err)
+		}
+		items, err := z.ZRangeByScore(ctx, string(args[0]), min, max, int(limit), desc != 0)
+		if err != nil {
+			return fail(err)
+		}
+		// 与 mZRange 同一编码：[member score ...]，保序。
+		out := make([][]byte, 0, len(items)*2)
+		for _, it := range items {
 			out = append(out, []byte(it.Key), encInt(it.Score))
 		}
 		return ok(out...)

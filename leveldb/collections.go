@@ -435,6 +435,140 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 	return out, nil
 }
 
+// zScoreWindow 在排序侧索引 nsZScore 上按**分数闭区间** [min, max] 取窗口。
+//
+// 注意与 normalizeRange 的区别：那个是 ZRANGE 的**索引**区间，这里是**分数**
+// 区间，两者不可互换（分数范围无法折算成下标，除非先全量扫描计数）。
+//
+// desc 只改遍历方向，不改变参数含义：始终 min<=max，min>max 直接判空。
+// limit>0 时"按遍历方向取前 limit 个"——降序即**最高分**那一端，因此降序
+// 是边走边截断（而非先取完再截），与 mem.zScoreWindow 的截断方向一致。
+//
+// 键为 lp(name)+be64(ordered(score))+member，键序即 (分数升序, 成员升序)。
+// 升序时直接用 zEach 正序遍历；降序时 goleveldb 没有反向迭代器，
+// 故由 zScoreWindowReverse 用"正向 Seek + Prev"自建反向遍历，
+// 再把**每个同分数段**内部翻回升序以满足"同分不随方向翻转"。
+func (p *Provider) zScoreWindow(name string, min, max int64, limit int, desc bool) ([]core.ZItem, error) {
+	if min > max {
+		return nil, nil
+	}
+	if !desc {
+		out := make([]core.ZItem, 0, minCap(limit))
+		err := p.zEach(name, func(s int64, m string) bool {
+			if s < min {
+				return true // 还没进入区间
+			}
+			if s > max {
+				return false // 已越过区间上界（升序遍历可安全提前结束）
+			}
+			out = append(out, core.ZItem{Key: m, Score: s})
+			return limit <= 0 || len(out) < limit
+		})
+		if err != nil {
+			return nil, err
+		}
+		if limit > 0 && len(out) > limit {
+			out = out[:limit]
+		}
+		return out, nil
+	}
+	return p.zScoreWindowReverse(name, min, max, limit)
+}
+
+// zScoreWindowReverse 是 desc=true 的实现：按分数降序输出区间内成员，
+// 同一分数内的成员仍按成员升序（与 Redis 同分行为一致）。
+//
+// goleveldb 的迭代器**只有正向 Seek**（没有 Reverse 选项，也没有反向 Seek），
+// 因此降序分两步：先正向 Seek 到区间上界定位到区间内**最大**的键，再连续
+// Prev() 向前遍历；每当跨入新的（更低的）分数段，就从该分数的段尾继续
+// Prev() 走完整段，把整段收集后翻转为成员升序再输出。
+func (p *Provider) zScoreWindowReverse(name string, min, max int64, limit int) ([]core.ZItem, error) {
+	prefix := lp(name)
+	r := nsRange(nsZScore, prefix...)
+	it := p.db.NewIterator(r, nil)
+	defer it.Release()
+
+	out := make([]core.ZItem, 0, minCap(limit))
+
+	// 区间上界（开）：分数 max 的所有成员键都小于它；向前越过它即是区间内最大键。
+	hiOpen := keyOf(nsZScore, prefix, be64(ordered(max)+1))
+
+	// 定位到区间内最大的键：Seek(hiOpen) 落到第一个 >= hiOpen 的键，Prev 一步
+	// 即区间内（或低于区间的）最大键。Seek 越界返回 false 时迭代器仍停在末尾，
+	// 此时 Prev 依然有效，故不依赖 Seek 的返回值。
+	it.Seek(hiOpen)
+	ok := it.Prev()
+	for ok {
+		k := it.Key()
+		if len(k) == 0 || k[0] != nsZScore {
+			break
+		}
+		if !hasPrefixBytes(k[1:], prefix) {
+			// 其他 zset 的键：继续向前找（不 break，因为键序在 prefix 之外仍有序）
+			ok = it.Prev()
+			continue
+		}
+		body := k[1+len(prefix):]
+		if len(body) < be64Len {
+			ok = it.Prev()
+			continue
+		}
+		score := unorder(binary.BigEndian.Uint64(body[:be64Len]))
+		if score < min {
+			break // 已低于区间下界，且分数单调递减
+		}
+		// 收集本分数段的全部成员：从段尾（当前）向前走完同分键。
+		run := append(out[:0:0], core.ZItem{Key: string(body[be64Len:]), Score: score})
+		for {
+			ok = it.Prev()
+			if !ok {
+				break
+			}
+			nk := it.Key()
+			if len(nk) == 0 || nk[0] != nsZScore {
+				ok = false
+				break
+			}
+			nbody := nk[1+len(prefix):]
+			if len(nbody) < be64Len {
+				continue
+			}
+			nscore := unorder(binary.BigEndian.Uint64(nbody[:be64Len]))
+			if nscore != score {
+				break // 下一段（分数更低）：游标已停在该段最大键上
+			}
+			run = append(run, core.ZItem{Key: string(nbody[be64Len:]), Score: nscore})
+		}
+		// run 当前是成员降序，翻正为成员升序（同分不随方向翻转）
+		for i, j := 0, len(run)-1; i < j; i, j = i+1, j-1 {
+			run[i], run[j] = run[j], run[i]
+		}
+		out = append(out, run...)
+		if !ok {
+			break
+		}
+		if limit > 0 && len(out) >= limit {
+			break // 已凑满 limit：同分段的完整成员已全部输出，直接截断
+		}
+	}
+	if err := it.Error(); err != nil {
+		return nil, fmt.Errorf("leveldb: zrangebyscore: %w", err)
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// ZRangeByScore 返回分数落在闭区间 [min, max] 内的成员；desc 只改遍历方向。
+func (p *Provider) ZRangeByScore(ctx context.Context, name string, min, max int64, limit int, desc bool) ([]core.ZItem, error) {
+	_ = ctx
+	if err := p.check(); err != nil {
+		return nil, err
+	}
+	return p.zScoreWindow(name, min, max, limit, desc)
+}
+
 // normalizeRange 把 Redis ZRANGE 式索引（0 起闭区间、负数从末尾数）折算成
 // 正向下标区间；返回 ok=false 表示区间为空。
 func normalizeRange(start, stop, n int64) (lo, hi int64, ok bool) {

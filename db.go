@@ -224,6 +224,13 @@ func (a *adapter) ZRange(ctx context.Context, name string, start, stop int64) ([
 	return a.z.ZRange(ctx, name, start, stop)
 }
 
+func (a *adapter) ZRangeByScore(ctx context.Context, name string, min, max int64, limit int, desc bool) ([]core.ZItem, error) {
+	if a.z == nil {
+		return nil, ErrUnsupported
+	}
+	return a.z.ZRangeByScore(ctx, name, min, max, limit, desc)
+}
+
 func (a *adapter) ZIncr(ctx context.Context, name, key string, delta int64) (int64, error) {
 	if a.z == nil {
 		return 0, ErrUnsupported

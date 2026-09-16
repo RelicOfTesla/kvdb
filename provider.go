@@ -19,6 +19,7 @@ import (
 // 与常量身份均指向 core 中的同一实例。
 type (
 	KvProvider    = core.KvProvider
+	StoreProvider = core.StoreProvider
 	FullProvider  = core.FullProvider
 	QueueProvider = core.QueueProvider
 	ZSetProvider  = core.ZSetProvider

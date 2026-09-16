@@ -74,7 +74,13 @@ func (f *fakeKV) Set(_ context.Context, key string, value []byte) error {
 	return nil
 }
 
-func (f *fakeKV) SetEx(ctx context.Context, key string, value []byte, _ int64) error {
+// SetEx 与真实基座契约一致：ttl<=0 必须返回 core.ErrInvalidTTL（各基座均在
+// 写入侧校验），而不是静默当成无 TTL 的 Set。mock 若比基座宽松，会让依赖它的
+// 用例漏掉真实基座上必然发生的失败。
+func (f *fakeKV) SetEx(ctx context.Context, key string, value []byte, ttl int64) error {
+	if ttl <= 0 {
+		return core.ErrInvalidTTL
+	}
 	return f.Set(ctx, key, value)
 }
 

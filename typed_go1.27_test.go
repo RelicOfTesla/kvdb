@@ -76,7 +76,89 @@ func TestTypedGet(t *testing.T) {
 	}
 }
 
-// TestTypedQueue 验证队列读取的泛型形态。
+// TestTypedSet 验证写方向的泛型形态：Set/SetEx 接受 value T 并按 B[T] 编码。
+func TestTypedSet(t *testing.T) {
+	ctx := context.Background()
+	db, err := kvdb.Open(ctx, "stub://")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tdb := kvdb.Typed(db)
+
+	// 结构体：写入即可读回，且与手动 B[T] 编码的字节完全一致
+	u := tUser{ID: 7, Name: "alice", Tags: []string{"a"}}
+	if err := tdb.Set(ctx, "u:7", u); err != nil {
+		t.Fatalf("Set[tUser]: %v", err)
+	}
+	if v, ok, _ := db.Get(ctx, "u:7"); !ok || string(v) != string(kvdb.B(u)) {
+		t.Fatalf("Set 编码应等于 B[tUser]")
+	}
+	if got, err := tdb.Get[tUser](ctx, "u:7"); err != nil || got.Name != "alice" {
+		t.Fatalf("回读 = %+v, %v", got, err)
+	}
+
+	// 标量：与 Incr 互操作（文本编码）
+	if err := tdb.Set(ctx, "cnt", int64(41)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := db.Incr(ctx, "cnt", 1); err != nil || n != 42 {
+		t.Fatalf("Set(int64) 后 Incr = %d, %v", n, err)
+	}
+	if n, err := tdb.Get[int64](ctx, "cnt"); err != nil || n != 42 {
+		t.Fatalf("Get[int64] = %d, %v", n, err)
+	}
+
+	// SetEx 走基座的 SetEx（桩的 fakeKV.SetEx 不实现 TTL，只验证调用被正确透传；
+	// TTL 语义由各基座模块的用例覆盖）
+	if err := tdb.SetEx(ctx, "tmp", "v", 100); err != nil {
+		t.Fatalf("SetEx[string]: %v", err)
+	}
+	if v, ok, _ := db.Get(ctx, "tmp"); !ok || string(v) != "v" {
+		t.Fatalf("SetEx 后 Get = %q,%v", v, ok)
+	}
+	if err := tdb.SetEx(ctx, "tmp", "v2", 100); err != nil {
+		t.Fatalf("SetEx 覆盖: %v", err)
+	}
+	if v, ok, _ := db.Get(ctx, "tmp"); !ok || string(v) != "v2" {
+		t.Fatalf("SetEx 覆盖后 Get = %q,%v", v, ok)
+	}
+}
+
+// TestTypedSetBytes 验证 T=[]byte 时与直接调用基座方法**完全等价**：
+// B/encodeScalar 对 []byte 恒等透传，不引入任何包装或拷贝语义。
+func TestTypedSetBytes(t *testing.T) {
+	ctx := context.Background()
+	db, err := kvdb.Open(ctx, "stub://")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tdb := kvdb.Typed(db)
+
+	raw := []byte{0x00, 0xff, 0x01, 0xfe, 'x'} // 含非 UTF-8 字节
+	if err := tdb.Set(ctx, "bin", raw); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := db.Get(ctx, "bin")
+	if err != nil || !ok {
+		t.Fatalf("Get = %v,%v", ok, err)
+	}
+	if string(got) != string(raw) {
+		t.Fatalf("T=[]byte 应原样透传: got %x want %x", got, raw)
+	}
+
+	// 队列同理
+	if err := tdb.QPush(ctx, "q", raw); err != nil {
+		t.Fatal(err)
+	}
+	qv, ok, err := db.QPop(ctx, "q")
+	if err != nil || !ok || string(qv) != string(raw) {
+		t.Fatalf("QPush([]byte) 应原样透传: %x,%v,%v", qv, ok, err)
+	}
+}
+
+// TestTypedQueue 验证队列读写的泛型形态。
 func TestTypedQueue(t *testing.T) {
 	ctx := context.Background()
 	db, err := kvdb.Open(ctx, "stub://")
@@ -86,22 +168,27 @@ func TestTypedQueue(t *testing.T) {
 	defer db.Close()
 	tdb := kvdb.Typed(db)
 
-	// 元素为结构体
+	// 用泛型 QPush 入队（写方向），再用泛型读回
 	j1 := tUser{ID: 1, Name: "job-1"}
 	j2 := tUser{ID: 2, Name: "job-2"}
-	db.QPush(ctx, "jobs", kvdb.B(j1))
-	db.QPush(ctx, "jobs", kvdb.B(j2))
+	if err := tdb.QPush(ctx, "jobs", j1); err != nil {
+		t.Fatalf("QPush[tUser]: %v", err)
+	}
+	if err := tdb.QPushFront(ctx, "jobs", j2); err != nil {
+		t.Fatalf("QPushFront[tUser]: %v", err)
+	}
 
-	if got, err := tdb.QFront[tUser](ctx, "jobs"); err != nil || got.Name != "job-1" {
+	// 队头应为 QPushFront 的 j2
+	if got, err := tdb.QFront[tUser](ctx, "jobs"); err != nil || got.Name != "job-2" {
 		t.Fatalf("QFront = %+v, %v", got, err)
 	}
-	if got, err := tdb.QBack[tUser](ctx, "jobs"); err != nil || got.Name != "job-2" {
+	if got, err := tdb.QBack[tUser](ctx, "jobs"); err != nil || got.Name != "job-1" {
 		t.Fatalf("QBack = %+v, %v", got, err)
 	}
-	if got, err := tdb.QPop[tUser](ctx, "jobs"); err != nil || got.ID != 1 {
+	if got, err := tdb.QPop[tUser](ctx, "jobs"); err != nil || got.ID != 2 {
 		t.Fatalf("QPop = %+v, %v", got, err)
 	}
-	if got, err := tdb.QPopBack[tUser](ctx, "jobs"); err != nil || got.ID != 2 {
+	if got, err := tdb.QPopBack[tUser](ctx, "jobs"); err != nil || got.ID != 1 {
 		t.Fatalf("QPopBack = %+v, %v", got, err)
 	}
 	// 空队列 -> ErrNotFound
@@ -110,8 +197,8 @@ func TestTypedQueue(t *testing.T) {
 	}
 }
 
-// TestTypedPassthrough 验证薄壳未遮蔽的方法仍透传（Set/QPush/Batch/Close）。
-func TestTypedPassthrough(t *testing.T) {
+// TestTypedBatch 验证类型化批收集：收集时即编码，且**同一批可混装多种类型**。
+func TestTypedBatch(t *testing.T) {
 	ctx := context.Background()
 	db, err := kvdb.Open(ctx, "stub://")
 	if err != nil {
@@ -120,29 +207,226 @@ func TestTypedPassthrough(t *testing.T) {
 	defer db.Close()
 	tdb := kvdb.Typed(db)
 
-	// 透传内嵌 DB 的写方法
-	if err := tdb.Set(ctx, "k", []byte("v")); err != nil {
-		t.Fatalf("透传 Set: %v", err)
-	}
-	if err := tdb.QPush(ctx, "q", []byte("x")); err != nil {
-		t.Fatalf("透传 QPush: %v", err)
-	}
-	if err := tdb.Batch(ctx, func(b *kvdb.Batch) error {
-		b.Set("b1", []byte("v1"))
+	err = tdb.BatchT(ctx, func(b kvdb.TypedBatch) error {
+		b.Set("u:1", tUser{ID: 1, Name: "a"}) // T = tUser
+		b.Set("u:2", tUser{ID: 2, Name: "b"})
+		b.Set("cnt", 42) // T = int —— 同批混装
+		b.SetEx("u:3", tUser{ID: 3, Name: "c"}, 100)
+		b.QPush("jobs", tUser{ID: 4, Name: "d"})
+		// 不涉及 value 的方法经内嵌的 *Batch 直接可用（真正生效，不是摆设）
+		b.Del("nonexistent")
+		b.Expire("u:1", 50)
+		if b.Len() != 7 {
+			t.Fatalf("批内操作数 = %d, want 7", b.Len())
+		}
 		return nil
-	}); err != nil {
-		t.Fatalf("透传 Batch: %v", err)
-	}
-	if v, err := tdb.Get[string](ctx, "b1"); err != nil || v != "v1" {
-		t.Fatalf("Batch 写入后 Get = %q, %v", v, err)
+	})
+	if err != nil {
+		t.Fatalf("BatchT: %v", err)
 	}
 
-	// 泛型方法遮蔽后 TypedDB 不满足 DB，但可通过内嵌字段取回
-	var asDB kvdb.DB = tdb.DB
-	if v, ok, err := asDB.Get(ctx, "k"); err != nil || !ok || string(v) != "v" {
-		t.Fatalf("底层 DB Get = %q,%v,%v", v, ok, err)
+	for _, tc := range []struct {
+		key  string
+		want string
+	}{{"u:1", "a"}, {"u:2", "b"}, {"u:3", "c"}} {
+		got, err := tdb.Get[tUser](ctx, tc.key)
+		if err != nil || got.Name != tc.want {
+			t.Fatalf("批内 %s = %+v, %v", tc.key, got, err)
+		}
 	}
-	if err := tdb.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	if got, err := tdb.QPop[tUser](ctx, "jobs"); err != nil || got.ID != 4 {
+		t.Fatalf("批内 QPush 后 QPop = %+v, %v", got, err)
+	}
+	if n, err := tdb.Get[int](ctx, "cnt"); err != nil || n != 42 {
+		t.Fatalf("批内混装的 int = %d, %v", n, err)
 	}
 }
+
+// TestTypedBatchAtomic 验证批内错误语义仍由 Batch 负责（收集期报错导致整批不提交）。
+func TestTypedBatchAtomic(t *testing.T) {
+	ctx := context.Background()
+	db, err := kvdb.Open(ctx, "stub://")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tdb := kvdb.Typed(db)
+
+	sentinel := errors.New("abort")
+	if err := tdb.BatchT(ctx, func(b kvdb.TypedBatch) error {
+		b.Set("bk", "v")
+		return sentinel
+	}); !errors.Is(err, sentinel) {
+		t.Fatalf("回调错误应原样返回, got %v", err)
+	}
+	if ok, _ := db.Exists(ctx, "bk"); ok {
+		t.Fatal("回调出错时整批不应提交")
+	}
+}
+
+// TestTypedAcceptsStoreProvider 验证 Typed 只要求 StoreProvider：
+// 一个**没有** Batch/Close 的三能力存储也能被类型化（StoreProvider 不含这两者）。
+func TestTypedAcceptsStoreProvider(t *testing.T) {
+	ctx := context.Background()
+	store := newStoreOnlyStub()
+	tdb := kvdb.Typed(store)
+
+	if err := tdb.Set(ctx, "k", 42); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if n, err := tdb.Get[int](ctx, "k"); err != nil || n != 42 {
+		t.Fatalf("Get = %d, %v", n, err)
+	}
+	if err := tdb.QPush(ctx, "q", "job"); err != nil {
+		t.Fatalf("QPush: %v", err)
+	}
+	if v, err := tdb.QPop[string](ctx, "q"); err != nil || v != "job" {
+		t.Fatalf("QPop = %q, %v", v, err)
+	}
+	if err := tdb.ZSet(ctx, "z", "m", 1); err != nil {
+		t.Fatalf("ZSet: %v", err)
+	}
+
+	// 该存储不实现 Batcher：BatchT 必须报 ErrUnsupported（与 DB.Batch 契约一致），
+	// 而不是 panic。
+	err := tdb.BatchT(ctx, func(b kvdb.TypedBatch) error { return nil })
+	if !errors.Is(err, core.ErrUnsupported) {
+		t.Fatalf("无 Batch 能力时应 ErrUnsupported, got %v", err)
+	}
+}
+
+// storeOnlyStub 满足 StoreProvider（KV + Queue + ZSet），刻意**不实现**
+// Batch/Close，用于钉住"泛型壳不额外要求能力"。
+type storeOnlyStub struct {
+	kv    map[string][]byte
+	queue map[string][][]byte
+	zset  map[string]map[string]int64
+}
+
+func newStoreOnlyStub() *storeOnlyStub {
+	return &storeOnlyStub{
+		kv:    map[string][]byte{},
+		queue: map[string][][]byte{},
+		zset:  map[string]map[string]int64{},
+	}
+}
+
+func (s *storeOnlyStub) Set(_ context.Context, key string, value []byte) error {
+	s.kv[key] = value
+	return nil
+}
+func (s *storeOnlyStub) SetEx(ctx context.Context, key string, value []byte, ttl int64) error {
+	if ttl <= 0 {
+		return core.ErrInvalidTTL
+	}
+	return s.Set(ctx, key, value)
+}
+func (s *storeOnlyStub) Get(_ context.Context, key string) ([]byte, bool, error) {
+	v, ok := s.kv[key]
+	return v, ok, nil
+}
+func (s *storeOnlyStub) Del(_ context.Context, key string) error { delete(s.kv, key); return nil }
+func (s *storeOnlyStub) Exists(_ context.Context, key string) (bool, error) {
+	_, ok := s.kv[key]
+	return ok, nil
+}
+func (s *storeOnlyStub) Incr(context.Context, string, int64) (int64, error) {
+	return 0, core.ErrNotInteger
+}
+func (s *storeOnlyStub) MGet(context.Context, ...string) (map[string][]byte, error) {
+	return map[string][]byte{}, nil
+}
+func (s *storeOnlyStub) Scan(context.Context, string, string, int) ([]kvdb.KeyValue, error) {
+	return nil, nil
+}
+func (s *storeOnlyStub) Expire(context.Context, string, int64) error { return nil }
+func (s *storeOnlyStub) TTL(context.Context, string) (int64, bool, error) {
+	return -1, false, nil
+}
+
+func (s *storeOnlyStub) QPush(_ context.Context, name string, value []byte) error {
+	s.queue[name] = append(s.queue[name], value)
+	return nil
+}
+func (s *storeOnlyStub) QPushFront(_ context.Context, name string, value []byte) error {
+	s.queue[name] = append([][]byte{value}, s.queue[name]...)
+	return nil
+}
+func (s *storeOnlyStub) QPop(_ context.Context, name string) ([]byte, bool, error) {
+	q := s.queue[name]
+	if len(q) == 0 {
+		return nil, false, nil
+	}
+	s.queue[name] = q[1:]
+	return q[0], true, nil
+}
+func (s *storeOnlyStub) QPopBack(_ context.Context, name string) ([]byte, bool, error) {
+	q := s.queue[name]
+	if len(q) == 0 {
+		return nil, false, nil
+	}
+	s.queue[name] = q[:len(q)-1]
+	return q[len(q)-1], true, nil
+}
+func (s *storeOnlyStub) QSize(_ context.Context, name string) (int64, error) {
+	return int64(len(s.queue[name])), nil
+}
+func (s *storeOnlyStub) QFront(_ context.Context, name string) ([]byte, bool, error) {
+	q := s.queue[name]
+	if len(q) == 0 {
+		return nil, false, nil
+	}
+	return q[0], true, nil
+}
+func (s *storeOnlyStub) QBack(_ context.Context, name string) ([]byte, bool, error) {
+	q := s.queue[name]
+	if len(q) == 0 {
+		return nil, false, nil
+	}
+	return q[len(q)-1], true, nil
+}
+
+func (s *storeOnlyStub) ZSet(_ context.Context, name, key string, score int64) error {
+	if s.zset[name] == nil {
+		s.zset[name] = map[string]int64{}
+	}
+	s.zset[name][key] = score
+	return nil
+}
+func (s *storeOnlyStub) ZGet(_ context.Context, name, key string) (int64, bool, error) {
+	v, ok := s.zset[name][key]
+	return v, ok, nil
+}
+func (s *storeOnlyStub) ZDel(_ context.Context, name, key string) error {
+	delete(s.zset[name], key)
+	return nil
+}
+func (s *storeOnlyStub) ZSize(_ context.Context, name string) (int64, error) {
+	return int64(len(s.zset[name])), nil
+}
+func (s *storeOnlyStub) ZRank(context.Context, string, string) (int64, bool, error) {
+	return 0, false, nil
+}
+func (s *storeOnlyStub) ZRange(context.Context, string, int64, int64) ([]kvdb.ZItem, error) {
+	return nil, nil
+}
+func (s *storeOnlyStub) ZIncr(_ context.Context, name, key string, delta int64) (int64, error) {
+	if s.zset[name] == nil {
+		s.zset[name] = map[string]int64{}
+	}
+	s.zset[name][key] += delta
+	return s.zset[name][key], nil
+}
+
+// 编译期确认：storeOnlyStub 满足 StoreProvider 但**不**满足 FullProvider。
+var (
+	_ kvdb.StoreProvider = (*storeOnlyStub)(nil)
+	_                    = func() bool {
+		var p any = (*storeOnlyStub)(nil)
+		_, isFull := p.(kvdb.FullProvider)
+		if isFull {
+			panic("storeOnlyStub 不应满足 FullProvider（它没有 Batch/Close）")
+		}
+		return true
+	}
+)

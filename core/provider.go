@@ -168,13 +168,23 @@ type BatchComposedProvider interface {
 	BatchComposed() bool
 }
 
+// StoreProvider 是三种数据结构的聚合能力接口（KV + Queue + ZSet），
+// 不含 Batch 与生命周期：只要具备三种能力即可满足，是"一个存储"的完整读写面。
+//
+// kvdb.TypedDB 正面对照该接口（泛型壳只依赖它），因此任何满足 StoreProvider 的
+// 类型都能直接被类型化：kvdb.Typed(p)。
+// 需要连 Batch/Close 一起声明的完整基座用 FullProvider（它内嵌本接口）。
+type StoreProvider interface {
+	KvProvider
+	QueueProvider
+	ZSetProvider
+}
+
 // FullProvider 是集齐全部能力与生命周期的"完整基座"组合接口，
 // 供实现 KV + Queue + ZSet + Batch + Closer 的基座整体声明（编译期校验），
 // 或业务方按完整能力持有具体基座。
 type FullProvider interface {
-	KvProvider
-	QueueProvider
-	ZSetProvider
+	StoreProvider
 	BatchProvider
 	Closer
 }

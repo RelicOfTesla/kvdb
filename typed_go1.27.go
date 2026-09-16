@@ -9,44 +9,69 @@ import (
 	"fmt"
 )
 
-// TypedDB 是 DB 的薄壳，需要 Go 1.27.1+：方法级类型参数自 1.27 起支持，
-// 1.27.0 存在泛型方法相关的编译器缺陷（golang/go#81195，1.27.1 修复）。
+// 本文件是"类型化薄壳"层：把「取字节 + 解码」与「编码 + 写字节」合并为泛型方法。
+//
+// 需要 Go 1.27.1+：方法级类型参数自 1.27 起支持，1.27.0 存在泛型方法相关的
+// 编译器缺陷（golang/go#81195，1.27.1 修复）。
 //
 // 门禁说明：
-//   - 本文件带 //go:build go1.27：更低版本的工具链不编译它，kvdb.TypedDB / Typed
-//     不存在，其余 API 不受影响；
+//   - 本文件带 //go:build go1.27：更低版本的工具链不编译它，kvdb.TypedStore /
+//     TypedBatch / Typed 不存在，其余 API 不受影响；
 //   - 该行同时把本文件的 language version 抬到 go1.27（cmd/go 依文件内的 go1.N
 //     约束传 -lang），因此模块与消费方的 go 指令都无需抬高；
 //   - 构建标签只有系列级（没有 go1.27.0 / go1.27.1 这类补丁级标签），无法表达
 //     "1.27.1+"，只能按 1.27 系列放行。
 //
-// 薄壳把「取字节 + 解码」合并为泛型方法：
+// TypedStore 与 StoreProvider 一一对照（泛型壳只依赖这一个接口，不要求 Batch/Close）：
 //
-//	tdb := kvdb.Typed(db)
-//	u, err := tdb.Get[User](ctx, "user:1")    // = kvdb.D[User](db.Get(ctx, "user:1"))
+//	tdb := kvdb.Typed(store)                  // store 需满足 kvdb.StoreProvider
+//	u, err := tdb.Get[User](ctx, "user:1")    // = kvdb.D[User](store.Get(ctx, "user:1"))
+//	err = tdb.Set(ctx, "user:1", u)           // = store.Set(ctx, "user:1", kvdb.B(u))
 //	n, err := tdb.Get[int64](ctx, "visits")   // 标量走文本编码，与 Incr 互操作
 //	job, err := tdb.QPop[string](ctx, "jobs")
 //
-// 编码/解码沿用 B/P/D 的规则与可替换的 Marshal/Unmarshal（见 bytes.go）。
+// 编码/解码沿用 B/P/D 的规则与可替换的 Marshal/Unmarshal（见 bytes.go）：
+// 写方向一律 B[T]，读方向一律 P[T]/D[T]，因此 `T = []byte` 时行为与直接调用
+// 基座方法完全一致（B 对 []byte 原样透传，见 bytes.go），不引入额外拷贝语义。
 //
-// 注意：泛型方法 Get/GetOK/MGet/QPop/QPopBack/QFront/QBack 会遮蔽内嵌 DB 的同名
-// 方法，因此 TypedDB 不满足 DB 接口。其余方法（Set/QPush/ZSet/Batch/Close…）
-// 仍经内嵌字段直接透传；需要 DB 语义时用 tdb.DB 或保留原始 db。
-type TypedDB struct {
-	DB
+// 注意：带类型参数的方法（Get/GetOK/MGet/Set/SetEx/QPop/...）会遮蔽内嵌接口的
+// 同名方法，因此 TypedStore 不满足 StoreProvider（签名不同）。这是刻意取舍：
+// 泛型壳给业务用，原始接口由其内嵌字段 StoreProvider 直取。
+type TypedStore struct {
+	StoreProvider
 }
 
-// Typed 把 DB 包成带泛型方法的薄壳（仅在 Go 1.27+ 构建中可用）。
-func Typed(d DB) TypedDB { return TypedDB{DB: d} }
+// Typed 把具备三种能力的存储包成类型化薄壳（仅在 Go 1.27+ 构建中可用）。
+//
+// 参数是 StoreProvider 而非 FullProvider：后者要求 BatchProvider（原始 ApplyBatch），
+// 而 kvdb.Open 返回的 DB 并不实现它（DB 对外暴露的是回调式的 Batcher），
+// 用 FullProvider 会让最常见的 kvdb.Typed(db) 无法编译。
+func Typed(p StoreProvider) TypedStore { return TypedStore{StoreProvider: p} }
+
+// ---- KV：写 ----
+
+// Set 编码 value 并写入 key（不改变既有 TTL）。
+//
+// 类型参数在调用点由实参推出（tdb.Set(ctx, "k", u) 即 T=User），也可显式指定。
+func (t TypedStore) Set[T any](ctx context.Context, key string, value T) error {
+	return t.StoreProvider.Set(ctx, key, B(value))
+}
+
+// SetEx 编码 value 并写入，同时设置 ttl 秒存活（覆盖既有 TTL）。
+func (t TypedStore) SetEx[T any](ctx context.Context, key string, value T, ttl int64) error {
+	return t.StoreProvider.SetEx(ctx, key, B(value), ttl)
+}
+
+// ---- KV：读 ----
 
 // Get 读取 key 并解码为 T；key 不存在或已过期返回 ErrNotFound。
-func (t TypedDB) Get[T any](ctx context.Context, key string) (T, error) {
-	return D[T](t.DB.Get(ctx, key))
+func (t TypedStore) Get[T any](ctx context.Context, key string) (T, error) {
+	return D[T](t.StoreProvider.Get(ctx, key))
 }
 
 // GetOK 与 Get 相同，但保留 ok 语义：key 不存在时 ok=false 且 err=nil。
-func (t TypedDB) GetOK[T any](ctx context.Context, key string) (T, bool, error) {
-	val, ok, err := t.DB.Get(ctx, key)
+func (t TypedStore) GetOK[T any](ctx context.Context, key string) (T, bool, error) {
+	val, ok, err := t.StoreProvider.Get(ctx, key)
 	if err != nil || !ok {
 		var zero T
 		return zero, false, err
@@ -60,8 +85,8 @@ func (t TypedDB) GetOK[T any](ctx context.Context, key string) (T, bool, error) 
 }
 
 // MGet 批量读取并解码；不存在的 key 不出现在结果中。
-func (t TypedDB) MGet[T any](ctx context.Context, keys ...string) (map[string]T, error) {
-	raw, err := t.DB.MGet(ctx, keys...)
+func (t TypedStore) MGet[T any](ctx context.Context, keys ...string) (map[string]T, error) {
+	raw, err := t.StoreProvider.MGet(ctx, keys...)
 	if err != nil {
 		return nil, err
 	}
@@ -76,22 +101,107 @@ func (t TypedDB) MGet[T any](ctx context.Context, keys ...string) (map[string]T,
 	return out, nil
 }
 
+// ---- Queue：写 ----
+
+// QPush 编码 value 并追加到队尾。
+func (t TypedStore) QPush[T any](ctx context.Context, name string, value T) error {
+	return t.StoreProvider.QPush(ctx, name, B(value))
+}
+
+// QPushFront 编码 value 并插入到队头。
+func (t TypedStore) QPushFront[T any](ctx context.Context, name string, value T) error {
+	return t.StoreProvider.QPushFront(ctx, name, B(value))
+}
+
+// ---- Queue：读 ----
+
 // QPop 取出并解码队头；队列为空返回 ErrNotFound。
-func (t TypedDB) QPop[T any](ctx context.Context, name string) (T, error) {
-	return D[T](t.DB.QPop(ctx, name))
+func (t TypedStore) QPop[T any](ctx context.Context, name string) (T, error) {
+	return D[T](t.StoreProvider.QPop(ctx, name))
 }
 
 // QPopBack 取出并解码队尾；队列为空返回 ErrNotFound。
-func (t TypedDB) QPopBack[T any](ctx context.Context, name string) (T, error) {
-	return D[T](t.DB.QPopBack(ctx, name))
+func (t TypedStore) QPopBack[T any](ctx context.Context, name string) (T, error) {
+	return D[T](t.StoreProvider.QPopBack(ctx, name))
 }
 
 // QFront 只读查看并解码队头；队列为空返回 ErrNotFound。
-func (t TypedDB) QFront[T any](ctx context.Context, name string) (T, error) {
-	return D[T](t.DB.QFront(ctx, name))
+func (t TypedStore) QFront[T any](ctx context.Context, name string) (T, error) {
+	return D[T](t.StoreProvider.QFront(ctx, name))
 }
 
 // QBack 只读查看并解码队尾；队列为空返回 ErrNotFound。
-func (t TypedDB) QBack[T any](ctx context.Context, name string) (T, error) {
-	return D[T](t.DB.QBack(ctx, name))
+func (t TypedStore) QBack[T any](ctx context.Context, name string) (T, error) {
+	return D[T](t.StoreProvider.QBack(ctx, name))
+}
+
+// ---- Batch ----
+
+// TypedBatch 是 Batch 的类型化收集壳：收集时即完成编码（B[T]），因此批内容与
+// 直接调用基座写入的字节完全一致。**同一批可混装多种类型**——类型参数在方法上，
+// 每次调用各自推导：
+//
+//	b.Set("cnt", 42)          // T = int
+//	b.Set("user:1", u)        // T = User
+//	b.QPush("jobs", "job-1")  // T = string
+//
+// Del/Expire/ZSet/ZDel/ZIncr/Len/Ops/Err 经内嵌的 *Batch 直接可用（它们不涉及 value）。
+//
+// 为什么不像 TypedStore 那样嵌入 StoreProvider：那个接口要求持有 provider，
+// 而 Batch 是**零依赖收集器**（只往 ops 追加 core.BatchOp）。实测两个后果：
+//
+//  1. 涉及 value 的四个方法签名与语义都不同（这里 Set(key, v) 是"收集"，
+//     TypedStore 的 Set(ctx, key, v) 是"立即写 provider"），因此必然被本类型的方法
+//     遮蔽，嵌入进来的那四个方法一个都用不上，纯属形式；
+//  2. 未被遮蔽的方法（如 Del）会解析到嵌入里那个 nil 的 provider 字段，
+//     调用即 panic（实测 nil pointer dereference），而不是收集到批里。
+//
+// 所以二者只在**编码规则**上统一（都走 B[T]/P[T]/D[T]），不共享嵌入结构。
+type TypedBatch struct {
+	*Batch
+}
+
+// TypedBatchOf 把已存在的 Batch 包成类型化壳（复用同一个收集器）。
+func TypedBatchOf(b *Batch) TypedBatch { return TypedBatch{Batch: b} }
+
+// Set 收集一次写入（value 按 T 编码）。
+func (b TypedBatch) Set[T any](key string, value T) {
+	b.Batch.Set(key, B(value))
+}
+
+// SetEx 收集一次带 TTL 的写入（value 按 T 编码）。
+func (b TypedBatch) SetEx[T any](key string, value T, ttl int64) {
+	b.Batch.SetEx(key, B(value), ttl)
+}
+
+// QPush 收集一次队尾入队（value 按 T 编码）。
+func (b TypedBatch) QPush[T any](name string, value T) {
+	b.Batch.QPush(name, B(value))
+}
+
+// QPushFront 收集一次队头入队（value 按 T 编码）。
+func (b TypedBatch) QPushFront[T any](name string, value T) {
+	b.Batch.QPushFront(name, B(value))
+}
+
+// BatchT 与 DB.Batch 相同，但回调里拿到的是类型化收集壳：回调返回 nil 时整批
+// 提交，返回错误或收集期校验失败时整批不提交。批内可混装多种类型。
+//
+//	err := tdb.BatchT(ctx, func(b kvdb.TypedBatch) error {
+//		b.Set("cnt", 42)          // T = int
+//		b.Set("user:1", u)        // T = User
+//		b.QPush("jobs", "job-1")  // T = string
+//		return nil
+//	})
+//
+// 批写不是 StoreProvider 的能力（它是独立可选的 Batcher），因此这里运行时探测：
+// 基座/适配器不支持时返回 ErrUnsupported，与 DB.Batch 的契约一致。
+func (t TypedStore) BatchT(ctx context.Context, fn func(b TypedBatch) error) error {
+	b, ok := t.StoreProvider.(Batcher)
+	if !ok {
+		return fmt.Errorf("kvdb: typed batch: %w", ErrUnsupported)
+	}
+	return b.Batch(ctx, func(raw *Batch) error {
+		return fn(TypedBatch{Batch: raw})
+	})
 }

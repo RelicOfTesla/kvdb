@@ -6,11 +6,12 @@ A Go persistence adapter SDK. It exposes a unified **KV + Queue + ZSet** interfa
 pluggable persistence backend (in-memory / jsonl / SQL / Redis / SSDB / BoltDB), with built-in
 batched writes and byte codec helpers.
 
-Semantics follow the **SSDB/Redis family**, with the command *names* taken from SSDB
-(`qpush`/`qpop`/`zset`…) while KV behavior follows Redis where the two agree. A few points
-differ deliberately from Redis — see [Semantics](#semantics) for the exact list (notably
-`Set` preserving TTL, and `Scan` being a deterministic range query rather than Redis's
-cursor-based `SCAN`).
+Semantics follow the **SSDB/Redis family**: command *names* come from SSDB
+(`qpush`/`qpop`/`zset`…), while KV behavior follows Redis wherever the two agree. A few
+points differ deliberately from Redis (notably `Set` preserving TTL, and `Scan` being a
+deterministic range query rather than Redis's cursor-based `SCAN`); the exact per-command
+rules live in the `core` package docs, and [`core/provider.go`](core/provider.go) is the
+single source of truth for the contract.
 
 > This tool is AI-generated. Use at your own discretion.
 
@@ -301,95 +302,6 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
   use `tdb.StoreProvider` when the original interface is needed; the parameter is `StoreProvider` (excluding Batch/Close),
   so `kvdb.Typed(db)` works just as well on the value returned by `kvdb.Open`;
 - version and gating: method-level type parameters have been supported since Go 1.27, and the implementation lives in a file carrying `//go:build go1.27`
-## Semantics
-
-- **KV**: `Set / SetEx / SetExAt / Get / Del / Exists / Incr / MGet / Scan / Expire / ExpireAt / TTL`,
-  corresponding to SSDB `set/setx/get/del/exists/incr/multi_get/scan/expire/ttl`.
-  - Keys and values are binary-safe; `Scan(start, end, limit)` is **byte-ordered closed-interval**
-    ascending, an empty string means unbounded on that side, and `limit<=0` uses
-    `DefaultScanLimit` (100).
-  - `Set` preserves the existing TTL; `SetEx` overwrites the TTL, and `ttl<=0` returns `ErrInvalidTTL`.
-  - `SetExAt` / `ExpireAt` take an **absolute** deadline in unix seconds (Redis `SETEXAT` / `EXPIREAT`);
-    a deadline already in the past **deletes the key** rather than erroring. Use these when the deadline
-    must survive a restart or be shared across processes — `SetEx(ttl)` computes it from "now".
-  - A missing `Incr` key counts from 0; a value that is not a decimal integer returns `ErrNotInteger`.
-  - `TTL` returns `(remaining seconds, ok)`, where `ok=false` means the key does not exist /
-    has no TTL / has expired.
-- **Queue**: `QPush / QPushFront / QPop / QPopBack / QSize / QFront / QBack / QRange`,
-  first in first out. `QRange(name, start, stop)` reads a positional slice **without modifying the
-  queue** (0-based inclusive, negative indices from the end, out-of-range clamped — the same
-  convention as `ZRange`); this is what makes read-only queue traversal (e.g. migration) possible.
-- **ZSet**: `ZSet / ZGet / ZDel / ZSize / ZRank / ZRange / ZRangeByScore / ZIncr`, ordered by
-  `(score ascending, key ascending)`, ranks starting at 0; `ZRange(start, stop)` uses
-  0-based inclusive indices, and negative indices count from the end. **The score type is int64**
-  (aligned with SSDB); the Redis backend converts through float64, which is
-  lossless within `|score| ≤ 2^53`.
-  - `ZRangeByScore(min, max, limit, desc)` returns members whose score lies in the **closed
-    interval `[min, max]`**. `desc` changes only the **direction** (false = ascending,
-    true = descending) and **not the meaning of the arguments** — `min <= max` always holds,
-    unlike Redis's `ZREVRANGEBYSCORE`, which wants `max, min` swapped. Members with equal
-    scores stay in **ascending member order** in both directions (matching Redis).
-    `limit > 0` caps the result at that many entries taken from the direction-appropriate end
-    (so `desc` yields the *highest* scores); `limit <= 0` means unlimited. `min > max` is an
-    empty range, not an error.
-- **An empty key / queue name / zset name (or member) is rejected** on every path — reads as well
-  as writes — with `ErrInvalidKey`, so "written but unreadable" cannot happen. This is enforced in
-  each backend, not in the `DB` adapter, so it also holds when a `Provider` is used directly.
-- The namespaces of the three data types are independent of each other. Sentinel errors:
-  `ErrUnsupported` / `ErrClosed` / `ErrNotInteger` / `ErrInvalidTTL` / `ErrNotFound` /
-  `ErrInvalidKey`.
-
-### Differences from Redis
-
-Command **names** are SSDB's, not Redis's. The following points also differ in behavior —
-know them before porting Redis code:
-
-| Topic | Redis | kvdb |
-|---|---|---|
-| `Set` and TTL | **clears** the TTL (`KEEPTTL` needed to keep it) | **preserves** the TTL (SSDB `set` semantics); the Redis backend uses `SET ... KEEPTTL` internally |
-| Absolute deadlines | `SETEXAT` requires Redis ≥ 6.2; `EXPIREAT` in seconds | `SetExAt` / `ExpireAt` always available; SSDB has no absolute command, so its backend converts to a relative TTL client-side |
-| `Scan` | cursor-based iteration, unordered, only guarantees full coverage over a finite number of calls | deterministic **byte-ordered closed-interval** range query, ascending, with a limit |
-| `TTL` | `-2` = key missing, `-1` = exists without TTL | both collapse into `ok=false`; the two cases cannot be told apart |
-| `Del` / `Expire` | return how many keys were affected | return only `error` |
-| `Exists` | accepts multiple keys, returns a count | single key, returns `bool` |
-| `Incr` overflow | always errors | errors on SQL/Redis; **wraps around silently** on mem/bolt/jsonl/leveldb/badger/SSDB (probe via `Caps.IncrWraps`) |
-| ZSet score | IEEE-754 double (fractional values allowed) | `int64`; the Redis backend is lossless only within `\|score\| ≤ 2^53` |
-| `ZRevRangeByScore` args | takes `max, min` (larger first) | `ZRangeByScore` keeps `min <= max` in **both** directions; only `desc` flips the order |
-| List commands | `LPUSH`/`RPUSH`/`LPOP`/`RPOP`/`LLEN`/`LINDEX` | `QPush`/`QPushFront`/`QPop`/`QPopBack`/`QSize`/`QFront`/`QBack` |
-| Sorted-set commands | `ZADD`/`ZSCORE`/`ZREM`/`ZCARD`/`ZINCRBY` | `ZSet`/`ZGet`/`ZDel`/`ZSize`/`ZIncr` (only `ZRank`/`ZRange` keep the Redis names) |
-
-`ZRange`'s 0-based inclusive indices, negative indices counting from the end, and the
-`(score, key)` ordering all match Redis exactly.
-
-### Backend differences (unified externally)
-
-| Difference | Handling |
-|---|---|
-| SSDB `scan` uses an open start interval | The ssdb backend compensates with one get on an existing start key, so externally it is still a closed interval |
-| Redis has no byte-ordered range scan | The redis backend SCANs a KV prefix, then filters and sorts on the client; the cost scales with the number of KV keys |
-| Redis keyspace | The three data types automatically get the `kvdb:kv:` / `kvdb:q:` / `kvdb:z:` prefixes, guaranteeing namespace independence |
-| Redis `Set` | Uses `SET ... KEEPTTL` to preserve the existing TTL (requires Redis ≥ 6.0) |
-| SQL expired rows | Filtered on the read path, and cleaned up once when the database is opened |
-| SQLite concurrent writes | In-process write serialization (single writer), WAL keeps reads parallel |
-| BoltDB concurrent writes | Single writer, multiple readers (MVCC); writes are committed serially as bbolt transactions |
-| LevelDB has no buckets / no transactions | A single ordered keyspace, with the three data types isolated by first-byte namespace tags; `Write(batch)` is itself atomic, and all multi-key writes (including value+TTL and the zset two-sided index) are collected into one Batch. Queue/zset counters and member scores are composed in-batch via a per-batch pending state, so a batch is read-your-writes (`BatchComposed=true`) |
-| LevelDB concurrent Incr | LevelDB has no CAS primitive, so read-modify-write on the same key is serialized by a sharded lock (different keys still run in parallel) |
-| Badger has transactions | Multi-key writes are committed with a `db.Update` transaction, giving read-your-writes within the batch (`BatchComposed=true`). Read-modify-write on the same key is still first serialized by a sharded lock: the SSI conflict retry of transactions alone also guarantees correctness, but hot spots on the same key degenerate into a retry storm |
-| Badger TTL | Native `WithTTL` is not used (it follows real time); instead a separate TTL record plus an injectable clock is used for the decision, consistent with leveldb |
-| SQL key length | MySQL key columns are capped at 255 bytes (compatible with the 5.6 default index prefix); PG / SQLite use BYTEA/BLOB with no such limit |
-| Write semantics of expired keys | All backends uniformly treat "expired = nonexistent": `Set` does not inherit the old TTL, `Incr` counts from 0, and `Expire` does not revive |
-| Ownership of read return values | `Get`/`MGet`/`Scan`/`QFront`/`QBack` return copies, so the caller mutating them does not affect the store's state |
-
-### Injectables for testing and tuning
-
-| Entry point | Effect |
-|---|---|
-| `kvdb.Now` / `core.Now` | The sole entry point through which backends obtain the current instant (defaults to `time.Now`). Replacing it in tests deterministically triggers TTL boundaries without sleeping through real seconds |
-| `core.SweepInterval` | The minimum interval at which the write path also reclaims expired entries (seconds, default 60); 0 means reclaim on every write |
-| `ssdb.DialTimeout` / `redis.ScanCount` | Connection timeout, and the workload hint for each round of SCAN |
-
-Replacing global variables is not a concurrency-safe practice: set them during test
-initialization and restore them with `t.Cleanup`.
 
 ## Extending: custom backends
 
@@ -452,9 +364,8 @@ Key points:
 - **Capabilities pass through faithfully**: what `db.Capabilities()` reports is exactly the
   capability of the **server-side backend**, including `BatchComposed` — and it does not
   "become stronger" just because an RPC layer was wrapped around it.
-- **Sentinel errors cross the wire as-is**: on the client, `ErrUnsupported` / `ErrClosed` /
-  `ErrNotInteger` / `ErrInvalidTTL` / `ErrNotFound` / `ErrInvalidKey` can be compared normally
-  with `errors.Is` (each has its own wire status, so the sentinel identity survives).
+- **Sentinel errors survive the round trip**: each has its own wire status, so on the client they
+  can still be compared with `errors.Is` (see the `core` package docs for the full list).
 - **A batch write is one round trip**: `db.Batch(...)` sends the whole batch to the server, and the
   backend commits it once; visibility within the batch depends on the backend itself (the same as
   a local direct connection).

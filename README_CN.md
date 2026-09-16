@@ -7,9 +7,9 @@ Go 持久化适配器 SDK：对外提供统一的 **KV + Queue + ZSet** 接口�
 编解码辅助。
 
 语义以 **SSDB/Redis 家族**为准：命令**命名**取自 SSDB（`qpush`/`qpop`/`zset`…），
-KV 行为在两者一致处对齐 Redis。有若干点**刻意与 Redis 不同**——完整清单见
-[语义要点](#语义要点)（重点：`Set` 保留 TTL，以及 `Scan` 是确定性范围查询而非
-Redis 的游标式 `SCAN`）。
+KV 行为在两者一致处对齐 Redis。有若干点**刻意与 Redis 不同**（重点：`Set` 保留 TTL、
+`Scan` 是确定性范围查询而非 Redis 的游标式 `SCAN`）——逐条规则见 `core` 包文档，
+[`core/provider.go`](core/provider.go) 是契约的唯一出处。
 
 > 本工具由 AI 生成，不保证严谨与安全，使用需自酌。
 
@@ -289,85 +289,6 @@ ms, err := tdb.MGet[User](ctx, "user:1", "user:2")
   因此 `kvdb.Typed(db)` 对 `kvdb.Open` 的返回值同样可用；
 - 版本与门禁：方法级类型参数自 Go 1.27 起支持，实现在带 `//go:build go1.27` 的文件中
 
-## 语义要点
-
-- **KV**：`Set / SetEx / Get / Del / Exists / Incr / MGet / Scan / Expire / TTL`，
-  对应 SSDB `set/setx/get/del/exists/incr/multi_get/scan/expire/ttl`。
-  - 键与值二进制安全；`Scan(start, end, limit)` 为**字节序闭区间**升序，
-    空串表示该侧不限，`limit<=0` 取 `DefaultScanLimit`（100）。
-  - `Set` 保留既有 TTL；`SetEx` 覆盖 TTL，`ttl<=0` 返回 `ErrInvalidTTL`。
-  - `SetExAt` / `ExpireAt` 接受 **绝对**到期时刻（unix 秒，对应 Redis `SETEXAT` / `EXPIREAT`）；
-    传入已过去的时刻会**删除该 key** 而不是报错。需要到期时刻跨重启/跨进程一致时用它——
-    `SetEx(ttl)` 的到期时刻是按"当前"算出来的。
-  - `Incr` 缺失按 0 起算；值非十进制整数返回 `ErrNotInteger`。
-  - `TTL` 返回 `(剩余秒数, ok)`，`ok=false` 表示 key 不存在 / 无 TTL / 已过期。
-- **Queue**：`QPush / QPushFront / QPop / QPopBack / QSize / QFront / QBack / QRange`，
-  先进先出。`QRange(name, start, stop)` 按位置读取且**不改动队列**（0 起闭区间、负索引从末尾数、
-  越界裁剪，与 `ZRange` 同一套规矩）——这正是"只读遍历队列"（如迁移）得以实现的前提。
-- **ZSet**：`ZSet / ZGet / ZDel / ZSize / ZRank / ZRange / ZRangeByScore / ZIncr`，排序
-  `(score 升序, key 升序)`，排名 0 起；`ZRange(start, stop)` 为 0 起闭区间索引，
-  负索引从末尾数。**分数类型为 int64**（对齐 SSDB）；Redis 基座经 float64 换算，
-  `|score| ≤ 2^53` 内无损。
-  - `ZRangeByScore(min, max, limit, desc)` 返回分数落在**闭区间 `[min, max]`** 内的成员。
-    `desc` 只改**遍历方向**（false=升序、true=降序），**不改参数含义**——恒有
-    `min <= max`，不同于 Redis `ZREVRANGEBYSCORE` 要求把 `max, min` 对调。同分成员在两个
-    方向下都保持**按成员升序**（与 Redis 一致）。`limit > 0` 按方向取前若干条
-    （故 `desc` 取到的是**最高分**那端）；`limit <= 0` 不限。`min > max` 视为空区间而非错误。
-- **空 key / 空队列名 / 空 zset 名（含空成员）在所有路径上都被拒绝**——读与写一致，返回
-  `ErrInvalidKey`，从而不会出现"写不进去却读得到"的自相矛盾。校验位于**各基座实现**而非
-  `DB` 适配层，因此绕过适配层直接用 `Provider` 时同样成立。
-- 三类数据的命名空间相互独立。哨兵错误：`ErrUnsupported` / `ErrClosed` /
-  `ErrNotInteger` / `ErrInvalidTTL` / `ErrNotFound` / `ErrInvalidKey`。
-
-### 与 Redis 的差异
-
-命令**命名**取自 SSDB 而非 Redis。以下行为点也与 Redis 不同——从 Redis 迁移代码前请先了解：
-
-| 主题 | Redis | kvdb |
-|---|---|---|
-| `Set` 与 TTL | **清除** TTL（要保留需 `KEEPTTL`） | **保留** TTL（SSDB `set` 语义）；Redis 基座内部用 `SET ... KEEPTTL` 对齐 |
-| 绝对到期时刻 | `SETEXAT` 需 Redis ≥ 6.2；`EXPIREAT` 秒级 | `SetExAt` / `ExpireAt` 恒可用；SSDB 无绝对时间命令，其基座在客户端换算为相对 TTL |
-| `Scan` | 游标式遍历，无序，只保证有限次遍历内覆盖全部 | 确定性**字节序闭区间**范围查询，升序，带 limit |
-| `TTL` | `-2` 表示 key 不存在、`-1` 表示存在但无 TTL | 两者都收敛为 `ok=false`，无法区分 |
-| `Del` / `Expire` | 返回受影响 key 数 | 只返回 `error` |
-| `Exists` | 可传多 key，返回计数 | 单 key，返回 `bool` |
-| `Incr` 溢出 | 始终报错 | SQL/Redis 报错；mem/bolt/jsonl/leveldb/badger/SSDB **静默回绕**（经 `Caps.IncrWraps` 显式探测） |
-| ZSet 分数 | IEEE-754 double（可有小数） | `int64`；Redis 基座在 `\|score\| ≤ 2^53` 内无损 |
-| `ZREVRANGEBYSCORE` 参数 | 传 `max, min`（大的在前） | `ZRangeByScore` 在**两个方向**下都保持 `min <= max`，仅由 `desc` 决定方向 |
-| 列表命令 | `LPUSH`/`RPUSH`/`LPOP`/`RPOP`/`LLEN`/`LINDEX` | `QPush`/`QPushFront`/`QPop`/`QPopBack`/`QSize`/`QFront`/`QBack` |
-| 有序集命令 | `ZADD`/`ZSCORE`/`ZREM`/`ZCARD`/`ZINCRBY` | `ZSet`/`ZGet`/`ZDel`/`ZSize`/`ZIncr`（仅 `ZRank`/`ZRange` 沿用 Redis 名） |
-
-`ZRange` 的 0 起闭区间索引、负索引从末尾数、以及 `(score, key)` 排序均与 Redis 完全一致。
-
-### 各基座差异（对外已统一）
-
-| 差异点 | 处理 |
-|---|---|
-| SSDB `scan` 是 start 开区间 | ssdb 基座对存在的 start 键做一次 get 补偿，对外仍为闭区间 |
-| Redis 无字节序范围扫描 | redis 基座 SCAN KV 前缀 + 客户端过滤排序，代价与 KV 键数量相关 |
-| Redis keyspace | 三类数据自动加 `kvdb:kv:` / `kvdb:q:` / `kvdb:z:` 前缀，保证命名空间独立 |
-| Redis 的 `Set` | 用 `SET ... KEEPTTL` 保持既有 TTL（需 Redis ≥ 6.0） |
-| SQL 过期行 | 读取路径过滤，开库时清理一次 |
-| SQLite 并发写 | 进程内写串行化（单写者），WAL 保留读并行 |
-| BoltDB 并发写 | 单写者、多读者（MVCC）；写操作按 bbolt 事务串行提交 |
-| LevelDB 无 bucket / 无事务 | 单一有序键空间，三类数据用首字节命名空间标签隔离；`Write(batch)` 本身原子，所有多键写（含值+TTL、zset 双侧索引）都收进一个 Batch。批内队列/zset 计数与成员分数经批内 pending 状态本地合成，批为 read-your-writes（`BatchComposed=true`） |
-| LevelDB 并发 Incr | LevelDB 无 CAS 原语，同 key 的读-改-写由分片锁串行化（不同 key 仍并行） |
-| Badger 有事务 | 多键写用 `db.Update` 事务提交，批内 read-your-writes（`BatchComposed=true`）。同 key 的读-改-写仍先用分片锁串行化：仅靠事务的 SSI 冲突重试也能保证正确，但同键热点会退化成重试风暴 |
-| Badger 的 TTL | 不用原生 `WithTTL`（走真实时间），改为独立 TTL 记录 + 可注入时钟判定，与 leveldb 一致 |
-| SQL 键长 | MySQL 键列上限 255 字节（兼容 5.6 默认索引前缀）；PG / SQLite 用 BYTEA/BLOB 无此限制 |
-| 过期键的写语义 | 所有基座统一"已过期 = 不存在"：`Set` 不继承旧 TTL、`Incr` 从 0 起算、`Expire` 不复活 |
-| 读返回值所有权 | `Get`/`MGet`/`Scan`/`QFront`/`QBack` 返回副本，调用方改写不影响库内状态 |
-
-### 测试与调优用的可注入项
-
-| 入口 | 作用 |
-|---|---|
-| `kvdb.Now` / `core.Now` | 基座取当前时刻的唯一入口（默认 `time.Now`）。测试里替换即可确定性触发 TTL 边界，不必 sleep 真实秒数 |
-| `core.SweepInterval` | 写路径顺带回收过期条目的最小间隔（秒，默认 60）；置 0 表示每次写都回收 |
-| `ssdb.DialTimeout` / `redis.ScanCount` | 连接超时、每轮 SCAN 的工作量提示 |
-
-替换全局变量不是并发安全的做法：请在测试初始化阶段设置并用 `t.Cleanup` 还原。
-
 ## 扩展：自定义基座
 
 实现 `core.KvProvider`（KV 必选）+ 可选能力接口，注册后即可经 `kvdb.Open` 使用：
@@ -423,9 +344,8 @@ go run ./example/rpcdemo -addr :7788 -backend jsonl://./data.jsonl -auth challen
 - **`rpc` 模块零第三方依赖**（仅标准库 + 根包），客户端侧只引入 `kvdb` + `kvdb/rpc`。
 - **能力如实透传**：`db.Capabilities()` 报告的正是**服务端底座**的能力，含
   `BatchComposed`——不会因为套了一层 RPC 而"变强"。
-- **哨兵错误原样过线**：`ErrUnsupported` / `ErrClosed` / `ErrNotInteger` /
-  `ErrInvalidTTL` / `ErrNotFound` / `ErrInvalidKey` 在客户端可用 `errors.Is` 正常判等
-  （各有独立 wire 状态，故哨兵身份不会丢失）。
+- **哨兵错误原样过线**：各有独立 wire 状态，故客户端仍可用 `errors.Is` 正常判等
+  （完整清单见 `core` 包文档）。
 - **批写一次往返**：`db.Batch(...)` 整批发给服务端，由底座一次提交；批内可见性
   取决于底座本身（与本地直连一致）。
 - **生命周期边界**：客户端 `Close()` 只关自己的连接，不会关掉服务端基座。

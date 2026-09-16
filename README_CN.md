@@ -23,7 +23,7 @@ n, err := db.Incr(ctx, "visits", 1)
 
 ## 特性
 
-- **10 个内置基座**，同一套 API：`mem` / `jsonl` / `bolt` / `leveldb` / `badger` / `sqlite` / `mysql` / `pg` / `redis` / `ssdb`
+- **11 个内置基座**，同一套 API：`mem` / `jsonl` / `bolt` / `leveldb` / `badger` / `sqlite` / `mysql` / `pg` / `mssql` / `redis` / `ssdb`
 - **能力可选、按需探测**：KV 必选；Queue / ZSet / Batch / 生命周期为可选能力，
   未实现时返回 `ErrUnsupported`，可用 `Capabilities()` 探测
 - **注册表默认空**：用哪个基座就 `import _` 哪个包，根包与mod不引入任何驱动依赖
@@ -46,6 +46,7 @@ n, err := db.Incr(ctx, "visits", 1)
 | `kvdb/ssdb`、`kvdb/leveldb` | 1.19 | 用到 `atomic.Bool` / `atomic.Pointer[T]` |
 | `kvdb/badger` | 1.24 | Badger v4 自身声明 `go 1.24.0` |
 | `kvdb/bolt`、`kvdb/sqlite`、`kvdb/mysql`、`kvdb/pg`、`kvdb/redis` | 1.25 | 由驱动及其传递依赖决定（如 `golang.org/x/sys` 要求 1.25） |
+| `kvdb/mssql` | 1.18 | `go-mssqldb` v1.8.2（更新的驱动线 v1.9+ 要求 `go 1.25`；本模块保持 1.18 基线与根包对齐） |
 | `kvdb/rpc` | 1.19 | 仅标准库 + 根包：**零第三方依赖**（客户端尤其重要） |
 | `kvdb/all`、`kvdb/bench`、`kvdb/example` | 1.25 | 聚合了上述模块 |
 | `kvdb/rpcserver` | 1.25 | 可直接运行的 RPC 服务端命令（import `all` 接入全部底座） |
@@ -103,26 +104,28 @@ db.ZSet(ctx, "rank", "alice", 90)
 top, _ := db.ZRange(ctx, "rank", 0, -1)
 ```
 
-URI 一览（各包也提供等价的直接构造函数，如 `sqlite.Open`）：
+URI 一览（同一基座 = 同一 scheme 或同一 `sqlstore` 味，合并成组展示；各包也提供等价的直接构造函数，如 `sqlite.Open`）：
 
 ```
 mem://
 jsonl://./data.jsonl?sync=1        # 缺省 flush 每 500ms、fsync 每 1s；sync=1 逐操作 flush+fsync（掉电不丢）
 jsonl://./data.jsonl?each_flush=1  # 逐操作 flush（fsync 仍按周期）；flush_interval/sync_interval 可调周期
+
+# ---- SQL 基座（同 sqlstore 基座，仅 scheme 与 DSN 形态不同；table_prefix 通用） ----
 sqlite://./data.db?sync=1          # 缺省 NORMAL（不逐提交 fsync，与其他本地基座一致）；sync=1 用 FULL（掉电不丢）
-sqlite://./data.db?table_prefix=app_       # 表名前缀（mysql/pg 同名参数）
+mysql://user:pass@host:3306/dbname?parseTime=true&table_prefix=app_
+pg://user:pass@host:5432/dbname?sslmode=disable&table_prefix=app_
+mssql://sa:pass@host:1433?database=dbname&encrypt=disable&table_prefix=app_   # 其余 query 参数照传 go-mssqldb
+
 bolt://./data.bolt?sync=1&sync_interval=1s   # 缺省不逐提交 fsync，但按 sync_interval 周期落盘（缺省 1s）；sync=1 逐提交 fsync
 leveldb://./data.dir?sync=1&cache=8&wb=4     # 目录型存储；默认不 fsync，sync=1 逐提交 fsync；cache/wb 单位 MiB
 badger://./data.dir?sync=1&cache=64&memtable=64   # 目录型存储；默认不 fsync，sync=1 逐提交 fsync；cache/memtable 单位 MiB
-mysql://user:pass@host:3306/dbname?parseTime=true&table_prefix=app_
-pg://user:pass@host:5432/dbname?sslmode=disable&table_prefix=app_
 redis://:password@host:6379/0?key_prefix=app:   # 键命名空间前缀
-ssdb://host:8888?key_prefix=app:              # SSDB 无 namespace，用逻辑前缀隔离
-ssdb://:password@host:8888         # 服务端启用 server.auth 时
+ssdb://[user:pass@]host:8888?key_prefix=app:   # SSDB 无 namespace，用逻辑前缀隔离；带 user:pass 为认证写法（server.auth 开启时；OpenWithConfig 亦支持在线 Auth）
 rpc://host:7788?auth=challenge&password=s3cret   # 连 RPC 服务端（详见「本地变远程」）
 ```
 
-**与其他应用共用一套存储时用前缀隔离**：`sqlite/mysql/pg` 的 `Config.TablePrefix`
+**与其他应用共用一套存储时用前缀隔离**：`sqlite/mysql/pg/mssql` 的 `Config.TablePrefix`
 给四张表和二级索引加前缀；`redis` 的 `Config.KeyPrefix` 派生 `<pfx>kv:` /
 `<pfx>q:` / `<pfx>z:` 三段；`ssdb` 的 `Config.KeyPrefix` 给三类数据的键名加逻辑
 前缀（读回时自动剥除，`Scan` 也夹在该前缀内）。默认值即当前布局，不配则不变。
@@ -141,6 +144,7 @@ rpc://host:7788?auth=challenge&password=s3cret   # 连 RPC 服务端（详见「
 | SQLite | `sqlite` | ✅ | ✅ | ✅ | 纯 Go 驱动（modernc），无 CGO |
 | MySQL | `mysql` | ✅ | ✅ | ✅ | 共享 `sqlstore` |
 | PostgreSQL | `pg` | ✅ | ✅ | ✅ | 共享 `sqlstore` |
+| SQL Server | `mssql` | ✅ | ✅ | ✅ | 共享 `sqlstore`；upsert 走 `MERGE`，行锁 `WITH (UPDLOCK, HOLDLOCK)`，分页 `OFFSET/FETCH NEXT`；无 `RETURNING`，Incr 走事务路径 |
 | Redis | `redis` | ✅ | ✅ | ✅ | String / List / Sorted Set 原生映射 |
 | SSDB | `ssdb` | ✅ | ✅ | ✅ | 原生文本协议客户端，连接池 + 认证 |
 | RPC | `rpc` | ✅ | ✅ | ✅ | 连远端 kvdb 服务端；能力随服务端底座，客户端不感知底座 |
@@ -484,6 +488,7 @@ rpc.Config{Codec: rpc.CodecBinary}          // 或 URI 加 ?codec=binary
 |---|---|
 | MySQL | 5.6.51、8.0.46 |
 | PostgreSQL | 9.6、10、12、16 |
+| SQL Server | 2022（mcr.microsoft.com/mssql/server） |
 | SQLite | modernc.org/sqlite（纯 Go，需 3.35+ 支持 `RETURNING`） |
 | Redis | 7.x |
 | SSDB | 原生协议，支持 `server.auth` |

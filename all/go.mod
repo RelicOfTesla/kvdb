@@ -9,12 +9,20 @@ require (
 	github.com/RelicOfTesla/kvdb/jsonl v0.0.0
 	github.com/RelicOfTesla/kvdb/leveldb v0.0.0
 	github.com/RelicOfTesla/kvdb/mem v0.0.0
+	github.com/RelicOfTesla/kvdb/mssql v0.0.0
 	github.com/RelicOfTesla/kvdb/mysql v0.0.0
 	github.com/RelicOfTesla/kvdb/pg v0.0.0
 	github.com/RelicOfTesla/kvdb/redis v0.0.0
 	github.com/RelicOfTesla/kvdb/rpc v0.0.0
 	github.com/RelicOfTesla/kvdb/sqlite v0.0.0
 	github.com/RelicOfTesla/kvdb/ssdb v0.0.0
+)
+
+require (
+	github.com/golang-sql/civil v0.0.0-20220223132316-b832511892a9 // indirect
+	github.com/golang-sql/sqlexp v0.1.0 // indirect
+	github.com/microsoft/go-mssqldb v1.8.2 // indirect
+	golang.org/x/crypto v0.24.0 // indirect
 )
 
 require (
@@ -63,6 +71,7 @@ replace (
 	github.com/RelicOfTesla/kvdb/jsonl => ../jsonl
 	github.com/RelicOfTesla/kvdb/leveldb => ../leveldb
 	github.com/RelicOfTesla/kvdb/mem => ../mem
+	github.com/RelicOfTesla/kvdb/mssql => ../mssql
 	github.com/RelicOfTesla/kvdb/mysql => ../mysql
 	github.com/RelicOfTesla/kvdb/pg => ../pg
 	github.com/RelicOfTesla/kvdb/redis => ../redis

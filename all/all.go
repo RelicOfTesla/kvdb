@@ -13,6 +13,7 @@ import (
 	_ "github.com/RelicOfTesla/kvdb/jsonl"
 	_ "github.com/RelicOfTesla/kvdb/leveldb"
 	_ "github.com/RelicOfTesla/kvdb/mem"
+	_ "github.com/RelicOfTesla/kvdb/mssql"
 	_ "github.com/RelicOfTesla/kvdb/mysql"
 	_ "github.com/RelicOfTesla/kvdb/pg"
 	_ "github.com/RelicOfTesla/kvdb/redis"

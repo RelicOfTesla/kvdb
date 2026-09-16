@@ -24,7 +24,7 @@ n, err := db.Incr(ctx, "visits", 1)
 
 ## Features
 
-- **10 built-in backends**, one single API: `mem` / `jsonl` / `bolt` / `leveldb` / `badger` / `sqlite` / `mysql` / `pg` / `redis` / `ssdb`
+- **11 built-in backends**, one single API: `mem` / `jsonl` / `bolt` / `leveldb` / `badger` / `sqlite` / `mysql` / `pg` / `mssql` / `redis` / `ssdb`
 - **Optional, probed-on-demand capabilities**: KV is mandatory; Queue / ZSet / Batch / lifecycle are optional capabilities,
   returning `ErrUnsupported` when unimplemented, and probeable via `Capabilities()`
 - **Empty registry by default**: use a backend and `import _` its package; the root package and mod pull in no driver dependencies
@@ -48,6 +48,7 @@ by the SQL / Redis drivers:
 | `kvdb/ssdb`, `kvdb/leveldb` | 1.19 | Uses `atomic.Bool` / `atomic.Pointer[T]` |
 | `kvdb/badger` | 1.24 | Badger v4 itself declares `go 1.24.0` |
 | `kvdb/bolt`, `kvdb/sqlite`, `kvdb/mysql`, `kvdb/pg`, `kvdb/redis` | 1.25 | Determined by the driver and its transitive dependencies (e.g. `golang.org/x/sys` requires 1.25) |
+| `kvdb/mssql` | 1.18 | `go-mssqldb` v1.8.2 (newer driver lines v1.9+ require `go 1.25`; this module keeps the 1.18 baseline to align with the root package) |
 | `kvdb/rpc` | 1.19 | Standard library + root package only: **zero third-party dependencies** (especially important for the client) |
 | `kvdb/all`, `kvdb/bench`, `kvdb/example` | 1.25 | Aggregates the modules above |
 | `kvdb/rpcserver` | 1.25 | A directly runnable RPC server command (imports `all` to wire in every backend) |
@@ -106,27 +107,30 @@ db.ZSet(ctx, "rank", "alice", 90)
 top, _ := db.ZRange(ctx, "rank", 0, -1)
 ```
 
-URI overview (each package also offers an equivalent direct constructor, such as `sqlite.Open`):
+URI overview (same backend = same scheme or the same `sqlstore` flavor, shown as one merged
+group; each package also offers an equivalent direct constructor, such as `sqlite.Open`):
 
 ```
 mem://
 jsonl://./data.jsonl?sync=1        # default flush every 500ms, fsync every 1s; sync=1 does flush+fsync per operation (nothing lost on power failure)
 jsonl://./data.jsonl?each_flush=1  # flush per operation (fsync still periodic); flush_interval/sync_interval tune the periods
+
+# ---- SQL 基座（同 sqlstore 基座，仅 scheme 与 DSN 形态不同；table_prefix 通用） ----
 sqlite://./data.db?sync=1          # default NORMAL (no fsync per commit, consistent with other local backends); sync=1 uses FULL (nothing lost on power failure)
-sqlite://./data.db?table_prefix=app_       # table name prefix (same-named parameter for mysql/pg)
+mysql://user:pass@host:3306/dbname?parseTime=true&table_prefix=app_
+pg://user:pass@host:5432/dbname?sslmode=disable&table_prefix=app_
+mssql://sa:pass@host:1433?database=dbname&encrypt=disable&table_prefix=app_   # 其余 query 参数照传 go-mssqldb
+
 bolt://./data.bolt?sync=1&sync_interval=1s   # by default no fsync per commit, but data is written out periodically per sync_interval (1s by default); sync=1 fsyncs per commit
 leveldb://./data.dir?sync=1&cache=8&wb=4     # directory-based storage; no fsync by default, sync=1 fsyncs per commit; cache/wb are in MiB
 badger://./data.dir?sync=1&cache=64&memtable=64   # directory-based storage; no fsync by default, sync=1 fsyncs per commit; cache/memtable are in MiB
-mysql://user:pass@host:3306/dbname?parseTime=true&table_prefix=app_
-pg://user:pass@host:5432/dbname?sslmode=disable&table_prefix=app_
 redis://:password@host:6379/0?key_prefix=app:   # key namespace prefix
-ssdb://host:8888?key_prefix=app:              # SSDB has no namespace; isolate with a logical prefix
-ssdb://:password@host:8888         # when the server enables server.auth
+ssdb://[user:pass@]host:8888?key_prefix=app:   # SSDB has no namespace; isolate with a logical prefix; with user:pass = the auth style (when server.auth is on; OpenWithConfig also supports online Auth)
 rpc://host:7788?auth=challenge&password=s3cret   # connect to an RPC server (see "Local becomes remote" for details)
 ```
 
 **Use prefix isolation when sharing one storage with other applications**: `TablePrefix` in
-`sqlite/mysql/pg`'s `Config` prefixes the four tables and secondary indexes; `KeyPrefix` in
+`sqlite/mysql/pg/mssql`'s `Config` prefixes the four tables and secondary indexes; `KeyPrefix` in
 `redis`'s `Config` derives the three segments `<pfx>kv:` / `<pfx>q:` / `<pfx>z:`; `KeyPrefix`
 in `ssdb`'s `Config` prefixes the key names of the three data kinds logically (stripped
 automatically on read-back, and `Scan` is confined to that prefix too). The defaults are the
@@ -146,6 +150,7 @@ See [`example/main.go`](example/main.go) for a complete demo.
 | SQLite | `sqlite` | ✅ | ✅ | ✅ | Pure Go driver (modernc), no CGO |
 | MySQL | `mysql` | ✅ | ✅ | ✅ | Shares `sqlstore` |
 | PostgreSQL | `pg` | ✅ | ✅ | ✅ | Shares `sqlstore` |
+| SQL Server | `mssql` | ✅ | ✅ | ✅ | Shares `sqlstore`; upsert via `MERGE`, row lock `WITH (UPDLOCK, HOLDLOCK)`, pagination `OFFSET/FETCH NEXT`; Incr takes the transactional path (no `RETURNING`) |
 | Redis | `redis` | ✅ | ✅ | ✅ | Native String / List / Sorted Set mapping |
 | SSDB | `ssdb` | ✅ | ✅ | ✅ | Native text protocol client, connection pool + authentication |
 | RPC | `rpc` | ✅ | ✅ | ✅ | Connects to a remote kvdb server; capabilities follow the server's backend, and the client is unaware of it |
@@ -516,6 +521,7 @@ immediate error (rather than the two sides waiting for each other until timeout)
 |---|---|
 | MySQL | 5.6.51, 8.0.46 |
 | PostgreSQL | 9.6, 10, 12, 16 |
+| SQL Server | 2022 (mcr.microsoft.com/mssql/server) |
 | SQLite | modernc.org/sqlite (pure Go, requires 3.35+ for `RETURNING` support) |
 | Redis | 7.x |
 | SSDB | Native protocol, supports `server.auth` |

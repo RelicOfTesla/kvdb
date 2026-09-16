@@ -65,8 +65,25 @@ type Dialect struct {
 	// TablePrefix 加在四张表名之前（如 "kvdb_" -> kvdb_kv_items），用于与其他应用
 	// 共用一个库/schema。空串表示用默认表名。索引名同样带前缀，不会与别的表的索引冲突。
 	TablePrefix string
+	// LimitStyle 控制"取前 n 行"的渲染方式：
+	//   ""（默认）     -> SELECT ... ORDER BY ... LIMIT {n}
+	//   "top"（MSSQL） -> SELECT TOP ({n}) ... ORDER BY ...
+	LimitStyle string
 	// DDL（占位符无需参数）。
 	KvDDL, QSeqDDL, QItemsDDL, ZDDL, ZIdxDDL string
+	// StmtOverrides 是"整条语句覆盖"：MSSQL 的 upsert 是 MERGE、行锁是
+	// WITH (UPDLOCK, HOLDLOCK)、分页是 OFFSET ... FETCH NEXT，都无法用
+	// "单一冲突子句 / 单一 FOR UPDATE 后缀"表达，这里按语句名整体替换。
+	// 模板仍是 {1}..{n} 占位符风格；{now} 照常经 withNowParam 替换。
+	// 键名与被替换对象一一对应：
+	//   kvUpsert / kvSetEx          —— Set / SetEx / SetExAt 的单条 upsert
+	//   kvIncrSeed / kvIncrSelect   —— Incr 事务路径的占位与锁行
+	//   qSeqEnsure / qSeqSelect     —— 队列计数器的占位与锁
+	//   qItemPop / qItemPopBack     —— 出队（队头 / 队尾）
+	//   qItemPeek / qItemPeekBack   —— 窥视（队头 / 队尾）
+	//   zUpsert / zIncrUpsert       —— ZSet 覆盖写 / 累加写
+	//   zRange                      —— ZRange（分页占位符序与 LIMIT 相反）
+	StmtOverrides map[string]string
 }
 
 // mysqlKeyLen 是 MySQL 键列（k / q / z）的字节上限，mysqlKeyCol 是由它生成的列类型。
@@ -75,6 +92,23 @@ type Dialect struct {
 const mysqlKeyLen = 255
 
 var mysqlKeyCol = fmt.Sprintf("VARBINARY(%d)", mysqlKeyLen)
+
+// StmtOverrides 的键名常量（与 stmts 字段一一对应，见 Dialect.StmtOverrides 注释）。
+const (
+	kvUpsertKey      = "kvUpsert"
+	kvSetExStmt      = "kvSetEx"
+	kvIncrSeedKey    = "kvIncrSeed"
+	kvIncrSelectKey  = "kvIncrSelect"
+	qSeqEnsureKey    = "qSeqEnsure"
+	qSeqSelectKey    = "qSeqSelect"
+	qItemPopKey      = "qItemPop"
+	qItemPopBackKey  = "qItemPopBack"
+	qItemPeekKey     = "qItemPeek"
+	qItemPeekBackKey = "qItemPeekBack"
+	zUpsertKey       = "zUpsert"
+	zIncrUpsertKey   = "zIncrUpsert"
+	zRangeKey        = "zRange"
+)
 
 // MySQLDialect / SQLiteDialect / PostgresDialect 是三个内置方言，
 // 供 kvdb/mysql、kvdb/sqlite、kvdb/pg 包装包实例化本基座。
@@ -174,6 +208,65 @@ var (
 		QItemsDDL: "CREATE TABLE IF NOT EXISTS q_items (q BYTEA NOT NULL, seq BIGINT NOT NULL, v BYTEA NOT NULL, PRIMARY KEY (q, seq))",
 		ZDDL:      "CREATE TABLE IF NOT EXISTS z_items (z BYTEA NOT NULL, k BYTEA NOT NULL, s BIGINT NOT NULL, PRIMARY KEY (z, k))",
 		ZIdxDDL:   "CREATE INDEX IF NOT EXISTS idx_z_items_s ON z_items (z, s, k)",
+	}
+	// mssqlKeyLen 取 255：MSSQL 索引键上限 900 字节，键列参与主键（聚集索引）与
+	// 二级索引，255 留有充足余量，并给出与 MySQL 相同的写入期校验口径。
+	MSSQLDialect = Dialect{
+		Name: "mssql",
+		Ph:   func(n int) string { return "?" }, // go-mssqldb 以位置 "?" 绑定（内部重写为 @pN）
+		// upsert/行锁/分页无法收敛进"单一冲突子句"，全部走整条语句覆盖（见 StmtOverrides）。
+		Returning: false, // MSSQL 无 UPDATE ... RETURNING，Incr 走事务路径（溢出在 Go 侧显式检查）
+		StmtOverrides: map[string]string{
+			kvUpsertKey: "MERGE kv_items WITH (HOLDLOCK) AS t " +
+				"USING (VALUES ({1}, {2}, {3})) AS src(k, v, now) ON t.k = src.k " +
+				// 与 MySQL/PG 的 KvUpsertTail 同义：既有行已过期时把 expire_at 归零，
+				// 否则 Set 成功了键仍会被读路径当过期过滤掉。
+				"WHEN MATCHED THEN UPDATE SET v = src.v, " +
+				"expire_at = CASE WHEN t.expire_at > 0 AND t.expire_at <= src.now THEN 0 ELSE t.expire_at END " +
+				"WHEN NOT MATCHED THEN INSERT (k, v, expire_at) VALUES (src.k, src.v, src.now)",
+			kvSetExStmt: "MERGE kv_items WITH (HOLDLOCK) AS t " +
+				"USING (VALUES ({1}, {2}, {3})) AS src(k, v, expire_at) ON t.k = src.k " +
+				"WHEN MATCHED THEN UPDATE SET v = src.v, expire_at = src.expire_at " +
+				"WHEN NOT MATCHED THEN INSERT (k, v, expire_at) VALUES (src.k, src.v, src.expire_at)",
+			kvIncrSeedKey: "MERGE kv_items WITH (HOLDLOCK) AS t " +
+				// 占位值 '0' 用二进制字面量避免隐式 varchar->varbinary 转换歧义。
+				"USING (VALUES ({1}, CAST(0x30 AS VARBINARY(MAX)))) AS src(k, v) ON t.k = src.k " +
+				// 已存在则原值写回（自赋值是合法 no-op），保证后续 UPDLOCK SELECT 锁到已存在行。
+				"WHEN MATCHED THEN UPDATE SET v = t.v " +
+				"WHEN NOT MATCHED THEN INSERT (k, v) VALUES (src.k, src.v)",
+			kvIncrSelectKey: "SELECT v, expire_at FROM kv_items WITH (UPDLOCK, HOLDLOCK) WHERE k = {1}",
+			qSeqEnsureKey: "MERGE q_seq WITH (HOLDLOCK) AS t " +
+				"USING (VALUES ({1}, 0, 0)) AS src(q, next, prev) ON t.q = src.q " +
+				"WHEN MATCHED THEN UPDATE SET next = t.next, prev = t.prev " +
+				"WHEN NOT MATCHED THEN INSERT (q, next, prev) VALUES (src.q, 0, 0)",
+			qSeqSelectKey: "SELECT next, prev FROM q_seq WITH (UPDLOCK, HOLDLOCK) WHERE q = {1}",
+			qItemPopKey:   "SELECT seq, v FROM q_items WITH (UPDLOCK, HOLDLOCK) WHERE q = {1} ORDER BY seq ASC OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY",
+			qItemPopBackKey: "SELECT seq, v FROM q_items WITH (UPDLOCK, HOLDLOCK) WHERE q = {1} " +
+				"ORDER BY seq DESC OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY",
+			qItemPeekKey:     "SELECT v FROM q_items WHERE q = {1} ORDER BY seq ASC OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY",
+			qItemPeekBackKey: "SELECT v FROM q_items WHERE q = {1} ORDER BY seq DESC OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY",
+			zUpsertKey: "MERGE z_items WITH (HOLDLOCK) AS t " +
+				"USING (VALUES ({1}, {2}, {3})) AS src(z, k, sc) ON t.z = src.z AND t.k = src.k " +
+				"WHEN MATCHED THEN UPDATE SET s = src.sc " +
+				"WHEN NOT MATCHED THEN INSERT (z, k, s) VALUES (src.z, src.k, src.sc)",
+			zIncrUpsertKey: "MERGE z_items WITH (HOLDLOCK) AS t " +
+				"USING (VALUES ({1}, {2}, {3})) AS src(z, k, delta) ON t.z = src.z AND t.k = src.k " +
+				"WHEN MATCHED THEN UPDATE SET s = t.s + src.delta " +
+				"WHEN NOT MATCHED THEN INSERT (z, k, s) VALUES (src.z, src.k, src.delta)",
+			zRangeKey: "SELECT k, s FROM z_items WHERE z = {1} ORDER BY s ASC, k ASC " +
+				"OFFSET {3} ROWS FETCH NEXT {2} ROWS ONLY",
+		},
+		// 键列 VARBINARY(255)：与 MySQL 同一口径（255 字节内索引安全，写入期校验超长）。
+		MaxKeyLen:  255,
+		LimitStyle: "top",
+		// MSSQL 无 CREATE TABLE IF NOT EXISTS：用 IF OBJECT_ID 守护；表名在
+		// 单引号内仍是独立标识符（前后是引号），applyTablePrefix 的 replaceIdent
+		// 会正常加上前缀。KEY 列 VARBINARY(255)，值列 VARBINARY(MAX)。
+		KvDDL:     "IF OBJECT_ID(N'kv_items') IS NULL CREATE TABLE kv_items (k VARBINARY(255) NOT NULL, v VARBINARY(MAX) NOT NULL, expire_at BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (k))",
+		QSeqDDL:   "IF OBJECT_ID(N'q_seq') IS NULL CREATE TABLE q_seq (q VARBINARY(255) NOT NULL, next BIGINT NOT NULL, prev BIGINT NOT NULL, PRIMARY KEY (q))",
+		QItemsDDL: "IF OBJECT_ID(N'q_items') IS NULL CREATE TABLE q_items (q VARBINARY(255) NOT NULL, seq BIGINT NOT NULL, v VARBINARY(MAX) NOT NULL, PRIMARY KEY (q, seq))",
+		ZDDL:      "IF OBJECT_ID(N'z_items') IS NULL CREATE TABLE z_items (z VARBINARY(255) NOT NULL, k VARBINARY(255) NOT NULL, s BIGINT NOT NULL, PRIMARY KEY (z, k))",
+		ZIdxDDL:   "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'idx_z_items_s') CREATE INDEX idx_z_items_s ON z_items (z, s, k)",
 	}
 )
 
@@ -388,14 +481,24 @@ func makeStmts(d Dialect) stmts {
 		}
 		return strings.Join(ps, ", ")
 	}
+	// ov 取整条语句覆盖模板：overrides 是方言级"整句替换"（MSSQL 的 MERGE /
+	// WITH(UPDLOCK,HOLDLOCK) / OFFSET-FETCH 无法表达为冲突子句或后缀），统一先 build
+	// 再 withNowParam，与普通模板同一装配管线。
+	ov := d.StmtOverrides
+	ovr := func(key, def string) string {
+		if o, ok := ov[key]; ok {
+			return withNowParam(d, build(d, o))
+		}
+		return def
+	}
 	s := stmts{
-		kvUpsert:     withNowParam(d, build(d, kvSetTemplate(d, false))),
-		kvSetEx:      build(d, kvSetTemplate(d, true)),
+		kvUpsert:     ovr(kvUpsertKey, withNowParam(d, build(d, kvSetTemplate(d, false)))),
+		kvSetEx:      ovr(kvSetExStmt, build(d, kvSetTemplate(d, true))),
 		kvGet:        build(d, "SELECT v FROM kv_items WHERE k = {1} AND (expire_at = 0 OR expire_at > {2})"),
 		kvExists:     build(d, "SELECT 1 FROM kv_items WHERE k = {1} AND (expire_at = 0 OR expire_at > {2})"),
 		kvDel:        build(d, "DELETE FROM kv_items WHERE k = {1}"),
-		kvIncrSelect: build(d, "SELECT v, expire_at FROM kv_items WHERE k = {1}"+d.ForUpdate),
-		kvIncrSeed:   build(d, "INSERT INTO kv_items (k, v) VALUES ({1}, '0') "+d.IncrSeedTail),
+		kvIncrSelect: ovr(kvIncrSelectKey, build(d, "SELECT v, expire_at FROM kv_items WHERE k = {1}"+d.ForUpdate)),
+		kvIncrSeed:   ovr(kvIncrSeedKey, build(d, "INSERT INTO kv_items (k, v) VALUES ({1}, '0') "+d.IncrSeedTail)),
 		// expire_at 一并写回：过期键按不存在处理时归零（{2}），未过期时保持原值。
 		kvIncrUpdate: build(d, "UPDATE kv_items SET v = {1}, expire_at = {2} WHERE k = {3}"),
 		kvIncrOne:    build(d, d.IncrSQL),
@@ -416,6 +519,11 @@ func makeStmts(d Dialect) stmts {
 			}
 			conds = append(conds, "(expire_at = 0 OR expire_at > "+d.Ph(i)+")")
 			i++
+			if d.LimitStyle == "top" {
+				// MSSQL：TOP 内联参数（TOP ({n})），无 LIMIT 语法。
+				return build(d, "SELECT TOP ({"+strconv.Itoa(i)+"}) k, v FROM kv_items WHERE "+
+					strings.Join(conds, " AND ")+" ORDER BY k")
+			}
 			return "SELECT k, v FROM kv_items WHERE " + strings.Join(conds, " AND ") +
 				" ORDER BY k LIMIT " + d.Ph(i)
 		},
@@ -424,42 +532,45 @@ func makeStmts(d Dialect) stmts {
 				") AND (expire_at = 0 OR expire_at > " + d.Ph(n+1) + ")"
 		},
 
-		qSeqEnsure:    build(d, "INSERT INTO q_seq (q, next, prev) VALUES ({1}, 0, 0) "+d.QSeqIgnoreTail),
-		qSeqSelect:    build(d, "SELECT next, prev FROM q_seq WHERE q = {1}"+d.ForUpdate),
+		qSeqEnsure:    ovr(qSeqEnsureKey, build(d, "INSERT INTO q_seq (q, next, prev) VALUES ({1}, 0, 0) "+d.QSeqIgnoreTail)),
+		qSeqSelect:    ovr(qSeqSelectKey, build(d, "SELECT next, prev FROM q_seq WHERE q = {1}"+d.ForUpdate)),
 		qSeqUpdate:    build(d, "UPDATE q_seq SET next = {1}, prev = {2} WHERE q = {3}"),
 		qSeqBumpBack:  build(d, qSeqBumpTemplate(d, false)),
 		qSeqBumpFront: build(d, qSeqBumpTemplate(d, true)),
 		qItemInsert:   build(d, "INSERT INTO q_items (q, seq, v) VALUES ({1}, {2}, {3})"),
 		qItemPop: func(desc bool) string {
 			ord := "ASC"
+			key := qItemPopKey
 			if desc {
-				ord = "DESC"
+				ord, key = "DESC", qItemPopBackKey
 			}
-			return build(d, "SELECT seq, v FROM q_items WHERE q = {1} ORDER BY seq "+ord+" LIMIT 1"+d.ForUpdate)
+			return ovr(key, build(d, "SELECT seq, v FROM q_items WHERE q = {1} ORDER BY seq "+ord+" LIMIT 1"+d.ForUpdate))
 		},
 		qItemDelete: build(d, "DELETE FROM q_items WHERE q = {1} AND seq = {2}"),
 		qItemCount:  build(d, "SELECT COUNT(*) FROM q_items WHERE q = {1}"),
 		qItemPeek: func(desc bool) string {
 			ord := "ASC"
+			key := qItemPeekKey
 			if desc {
-				ord = "DESC"
+				ord, key = "DESC", qItemPeekBackKey
 			}
-			return build(d, "SELECT v FROM q_items WHERE q = {1} ORDER BY seq "+ord+" LIMIT 1")
+			return ovr(key, build(d, "SELECT v FROM q_items WHERE q = {1} ORDER BY seq "+ord+" LIMIT 1"))
 		},
 
 		zUpsert: func(incr bool) string {
 			tail := d.ZSetUpsertTail
+			key := zUpsertKey
 			if incr {
-				tail = d.ZIncrUpsertTail
+				tail, key = d.ZIncrUpsertTail, zIncrUpsertKey
 			}
-			return build(d, "INSERT INTO z_items (z, k, s) VALUES ({1}, {2}, {3}) "+tail)
+			return ovr(key, build(d, "INSERT INTO z_items (z, k, s) VALUES ({1}, {2}, {3}) "+tail))
 		},
 		zGet:        build(d, "SELECT s FROM z_items WHERE z = {1} AND k = {2}"),
 		zDel:        build(d, "DELETE FROM z_items WHERE z = {1} AND k = {2}"),
 		zCount:      build(d, "SELECT COUNT(*) FROM z_items WHERE z = {1}"),
 		zRankMember: build(d, "SELECT s FROM z_items WHERE z = {1} AND k = {2}"),
 		zRankCount:  build(d, "SELECT COUNT(*) FROM z_items WHERE z = {1} AND (s < {2} OR (s = {3} AND k < {4}))"),
-		zRange:      build(d, "SELECT k, s FROM z_items WHERE z = {1} ORDER BY s ASC, k ASC LIMIT {2} OFFSET {3}"),
+		zRange:      ovr(zRangeKey, build(d, "SELECT k, s FROM z_items WHERE z = {1} ORDER BY s ASC, k ASC LIMIT {2} OFFSET {3}")),
 		zIncrSelect: build(d, "SELECT s FROM z_items WHERE z = {1} AND k = {2}"),
 	}
 	if d.Returning {

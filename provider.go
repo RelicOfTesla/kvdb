@@ -56,10 +56,10 @@ var (
 
 // Open 按 URI 的 scheme 选择基座并返回适配器接口 DB（注册表见 registry.go）。
 // 返回接口而非具体类型，便于业务依赖并在测试中替换为 mock。
+//
+// 当前时刻的注入点统一在 core.Now（基座一律经 core.NowUnix 采样）：
+// 测试替换 core/ 即可实现确定性过期，根包不再提供第二个别名，
+// 避免改写 kvdb.Now 对基座实际无效的误解。
 func Open(ctx context.Context, uri string) (DB, error) {
 	return open(ctx, uri)
 }
-
-// Now 是基座取当前时刻的唯一入口（可注入），等价于 core.Now。
-// 测试里 `defer func(old func() time.Time){ core.Now = old }(kvdb.Now)` 后改写 kvdb.Now 即可。
-var Now = core.Now

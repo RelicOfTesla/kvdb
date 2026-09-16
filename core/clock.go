@@ -1,5 +1,6 @@
 // 时钟注入点：所有基座一律通过 Now / NowUnix 取"当前时刻"，不直接调 time.Now。
-// 测试里替换 core.Now（或 kvdb.Now）即可确定性触发过期边界，无需 sleep 真实秒数。
+// 测试里替换 core.Now 即可确定性触发过期边界，无需 sleep 真实秒数。
+// 这是唯一的注入点：各基座一律经 Now / NowUnix 取时刻，根包不再提供别名。
 package core
 
 import "time"

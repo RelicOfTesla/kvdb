@@ -12,6 +12,8 @@ differ deliberately from Redis — see [Semantics](#semantics) for the exact lis
 `Set` preserving TTL, and `Scan` being a deterministic range query rather than Redis's
 cursor-based `SCAN`).
 
+> This tool is AI-generated. Use at your own discretion.
+
 ```go
 db, _ := kvdb.Open(ctx, "sqlite://./data.db")
 defer db.Close()

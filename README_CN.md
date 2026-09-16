@@ -11,6 +11,8 @@ KV 行为在两者一致处对齐 Redis。有若干点**刻意与 Redis 不同**
 [语义要点](#语义要点)（重点：`Set` 保留 TTL，以及 `Scan` 是确定性范围查询而非
 Redis 的游标式 `SCAN`）。
 
+> 本工具由 AI 生成，不保证严谨与安全，使用需自酌。
+
 ```go
 db, _ := kvdb.Open(ctx, "sqlite://./data.db")
 defer db.Close()

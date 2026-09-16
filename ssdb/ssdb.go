@@ -420,17 +420,20 @@ func firstOr(recs [][]byte, fallback string) string {
 }
 
 // ---- KV ----
+//
+// 空 key 一律以 core.ErrInvalidKey 拒绝，且**读写两侧同口径**：真实 SSDB 对空 key
+// 返回 ok 却静默丢弃写入（SSDBImpl::set 直接返回 0），若只拒写不拒读，就会出现
+// "写不进去却读得到"的自相矛盾。校验针对**调用方传入的 key**，因此在加前缀
+// （p.k）之前进行——前缀非空时空物理键并不代表调用方传了合法 key。
 
 func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	if err := p.check(); err != nil {
 		return err
 	}
 	key = p.k(key)
-	if key == "" {
-		// SSDB 对空 key 返回 ok 却不写数据（SSDBImpl::set 直接返回 0），
-		// 写入侧拒绝，避免"报成功但丢数据"。
-		return fmt.Errorf("ssdb: set: key must not be empty")
-	}
 	st, _, err := p.do(ctx, "set", key, string(value))
 	if err != nil {
 		return err
@@ -443,6 +446,9 @@ func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 
 // SetEx 写入 value 并设置 TTL（SSDB 原生命令 setx）。
 func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int64) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -450,10 +456,7 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
-	if key == "" {
-		return fmt.Errorf("ssdb: setx: key must not be empty")
-	}
-	st, _, err := p.do(ctx, "setx", key, string(value), strconv.FormatInt(ttl, 10))
+	st, _, err := p.do(ctx, "setx", key, string(value), strconv.FormatInt(core.ClampTTL(ttl), 10))
 	if err != nil {
 		return err
 	}
@@ -467,13 +470,13 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 //
 // 同 ExpireAt：SSDB 只有相对秒数命令，这里在客户端换算成剩余秒数再下发。
 func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int64) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	if err := p.check(); err != nil {
 		return err
 	}
 	key = p.k(key)
-	if key == "" {
-		return fmt.Errorf("ssdb: setxat: key must not be empty")
-	}
 	rem := at - core.NowUnix()
 	if rem <= 0 {
 		st, _, err := p.do(ctx, "del", key)
@@ -485,7 +488,7 @@ func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int
 		}
 		return nil
 	}
-	st, _, err := p.do(ctx, "setx", key, string(value), strconv.FormatInt(rem, 10))
+	st, _, err := p.do(ctx, "setx", key, string(value), strconv.FormatInt(core.ClampTTL(rem), 10))
 	if err != nil {
 		return err
 	}
@@ -496,6 +499,9 @@ func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int
 }
 
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	if err := core.CheckKey(key); err != nil {
+		return nil, false, err
+	}
 	if err := p.check(); err != nil {
 		return nil, false, err
 	}
@@ -520,6 +526,9 @@ func (p *Provider) getLocked(ctx context.Context, key string) ([]byte, bool, err
 }
 
 func (p *Provider) Del(ctx context.Context, key string) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -535,6 +544,9 @@ func (p *Provider) Del(ctx context.Context, key string) error {
 }
 
 func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
+	if err := core.CheckKey(key); err != nil {
+		return false, err
+	}
 	if err := p.check(); err != nil {
 		return false, err
 	}
@@ -550,13 +562,13 @@ func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 }
 
 func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, error) {
+	if err := core.CheckKey(key); err != nil {
+		return 0, err
+	}
 	if err := p.check(); err != nil {
 		return 0, err
 	}
 	key = p.k(key)
-	if key == "" {
-		return 0, fmt.Errorf("ssdb: incr: key must not be empty")
-	}
 	st, recs, err := p.do(ctx, "incr", key, strconv.FormatInt(delta, 10))
 	if err != nil {
 		return 0, err
@@ -644,6 +656,9 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 }
 
 func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -651,7 +666,7 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
-	st, _, err := p.do(ctx, "expire", key, strconv.FormatInt(ttl, 10))
+	st, _, err := p.do(ctx, "expire", key, strconv.FormatInt(core.ClampTTL(ttl), 10))
 	if err != nil {
 		return err
 	}
@@ -667,6 +682,9 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 // 秒数再下发；at 已过去时改为删除该 key（与 Redis EXPIREAT 一致）。
 // 换算依据本地时钟，与 SSDB 服务端时钟若有偏差会等量反映在到期时刻上。
 func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -682,7 +700,7 @@ func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
 		}
 		return nil
 	}
-	st, _, err := p.do(ctx, "expire", key, strconv.FormatInt(rem, 10))
+	st, _, err := p.do(ctx, "expire", key, strconv.FormatInt(core.ClampTTL(rem), 10))
 	if err != nil {
 		return err
 	}
@@ -693,6 +711,9 @@ func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
 }
 
 func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
+	if err := core.CheckKey(key); err != nil {
+		return 0, false, err
+	}
 	if err := p.check(); err != nil {
 		return 0, false, err
 	}
@@ -726,13 +747,13 @@ func (p *Provider) QPushFront(ctx context.Context, name string, value []byte) er
 }
 
 func (p *Provider) qpush(ctx context.Context, name string, value []byte, cmd string) error {
+	if err := core.CheckKey(name); err != nil {
+		return err
+	}
 	if err := p.check(); err != nil {
 		return err
 	}
 	name = p.k(name)
-	if name == "" {
-		return fmt.Errorf("ssdb: %s: queue name must not be empty", cmd)
-	}
 	st, _, err := p.do(ctx, cmd, name, string(value))
 	if err != nil {
 		return err
@@ -752,6 +773,9 @@ func (p *Provider) QPopBack(ctx context.Context, name string) ([]byte, bool, err
 }
 
 func (p *Provider) qpop(ctx context.Context, name, cmd string) ([]byte, bool, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, false, err
+	}
 	if err := p.check(); err != nil {
 		return nil, false, err
 	}
@@ -770,6 +794,9 @@ func (p *Provider) qpop(ctx context.Context, name, cmd string) ([]byte, bool, er
 }
 
 func (p *Provider) QSize(ctx context.Context, name string) (int64, error) {
+	if err := core.CheckKey(name); err != nil {
+		return 0, err
+	}
 	if err := p.check(); err != nil {
 		return 0, err
 	}
@@ -792,6 +819,9 @@ func (p *Provider) QBack(ctx context.Context, name string) ([]byte, bool, error)
 }
 
 func (p *Provider) qpeek(ctx context.Context, name, cmd string) ([]byte, bool, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, false, err
+	}
 	if err := p.check(); err != nil {
 		return nil, false, err
 	}
@@ -823,6 +853,9 @@ func (p *Provider) qpeek(ctx context.Context, name, cmd string) ([]byte, bool, e
 // （qslice 逐 seq 读到缺失即停，不会报错）。空队列 qslice 回 ok + 无负载，
 // 直接映射为空切片且无错误。
 func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) ([][]byte, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	if err := p.check(); err != nil {
 		return nil, err
 	}
@@ -898,13 +931,13 @@ func (p *Provider) qsliceArgs(ctx context.Context, name string, start, stop int6
 // ---- ZSet ----
 
 func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) error {
+	if err := core.CheckKeys(name, key); err != nil {
+		return err
+	}
 	if err := p.check(); err != nil {
 		return err
 	}
 	name = p.k(name)
-	if name == "" || key == "" {
-		return fmt.Errorf("ssdb: zset: zset name and member must not be empty")
-	}
 	st, _, err := p.do(ctx, "zset", name, key, strconv.FormatInt(score, 10))
 	if err != nil {
 		return err
@@ -916,6 +949,9 @@ func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) erro
 }
 
 func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, error) {
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, false, err
+	}
 	if err := p.check(); err != nil {
 		return 0, false, err
 	}
@@ -936,6 +972,9 @@ func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, err
 }
 
 func (p *Provider) ZDel(ctx context.Context, name, key string) error {
+	if err := core.CheckKeys(name, key); err != nil {
+		return err
+	}
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -951,6 +990,9 @@ func (p *Provider) ZDel(ctx context.Context, name, key string) error {
 }
 
 func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
+	if err := core.CheckKey(name); err != nil {
+		return 0, err
+	}
 	if err := p.check(); err != nil {
 		return 0, err
 	}
@@ -966,6 +1008,9 @@ func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
 }
 
 func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, error) {
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, false, err
+	}
 	if err := p.check(); err != nil {
 		return 0, false, err
 	}
@@ -986,6 +1031,9 @@ func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, er
 }
 
 func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) ([]core.ZItem, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	if err := p.check(); err != nil {
 		return nil, err
 	}
@@ -1032,6 +1080,9 @@ const maxZRangeLimit = math.MaxInt32
 // **完整逆序**，同分成员因此是 key **降序**。契约要求 desc 时同分仍按 key 升序，
 // 故对结果按同分组就地反转一次（见 fixDescTieOrder）。
 func (p *Provider) ZRangeByScore(ctx context.Context, name string, min, max int64, limit int, desc bool) ([]core.ZItem, error) {
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	if err := p.check(); err != nil {
 		return nil, err
 	}
@@ -1133,13 +1184,13 @@ func (p *Provider) zrangeArgs(ctx context.Context, name string, start, stop int6
 }
 
 func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (int64, error) {
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, err
+	}
 	if err := p.check(); err != nil {
 		return 0, err
 	}
 	name = p.k(name)
-	if name == "" || key == "" {
-		return 0, fmt.Errorf("ssdb: zincr: zset name and member must not be empty")
-	}
 	st, recs, err := p.do(ctx, "zincr", name, key, strconv.FormatInt(delta, 10))
 	if err != nil {
 		return 0, err
@@ -1210,17 +1261,20 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 
 // batchArgs 把契约批操作翻译为 SSDB 命令参数。
 func (p *Provider) batchArgs(op core.BatchOp) ([][]byte, error) {
-	// SSDB 对空 key/成员静默不写（set 对空 key 返回 ok 却不落数据），拒绝之。
+	// SSDB 对空 key/成员静默不写（set 对空 key 返回 ok 却不落数据），
+	// 与单条路径同口径整批拒绝，且不得静默跳过（见 core.ErrInvalidKey）。
 	switch op.Kind {
+	case core.BatchZSet, core.BatchZDel, core.BatchZIncr:
+		if err := core.CheckKeys(op.Key, op.Member); err != nil {
+			return nil, err
+		}
 	case core.BatchSet, core.BatchSetEx, core.BatchDel, core.BatchExpire,
 		core.BatchQPush, core.BatchQPushFront:
-		if op.Key == "" {
-			return nil, fmt.Errorf("ssdb: batch op %d: key must not be empty", op.Kind)
+		if err := core.CheckKey(op.Key); err != nil {
+			return nil, err
 		}
-	case core.BatchZSet, core.BatchZDel, core.BatchZIncr:
-		if op.Key == "" || op.Member == "" {
-			return nil, fmt.Errorf("ssdb: batch op %d: zset name and member must not be empty", op.Kind)
-		}
+	default:
+		// 未知 kind 由下面的 switch 统一报错，这里不重复判定。
 	}
 	b := func(parts ...string) [][]byte {
 		out := make([][]byte, len(parts))
@@ -1236,14 +1290,14 @@ func (p *Provider) batchArgs(op core.BatchOp) ([][]byte, error) {
 		if op.TTL <= 0 {
 			return nil, core.ErrInvalidTTL
 		}
-		return [][]byte{[]byte("setx"), []byte(p.k(op.Key)), op.Value, []byte(strconv.FormatInt(op.TTL, 10))}, nil
+		return [][]byte{[]byte("setx"), []byte(p.k(op.Key)), op.Value, []byte(strconv.FormatInt(core.ClampTTL(op.TTL), 10))}, nil
 	case core.BatchDel:
 		return b("del", p.k(op.Key)), nil
 	case core.BatchExpire:
 		if op.TTL <= 0 {
 			return nil, core.ErrInvalidTTL
 		}
-		return b("expire", p.k(op.Key), strconv.FormatInt(op.TTL, 10)), nil
+		return b("expire", p.k(op.Key), strconv.FormatInt(core.ClampTTL(op.TTL), 10)), nil
 	case core.BatchQPush:
 		return [][]byte{[]byte("qpush"), []byte(p.k(op.Key)), op.Value}, nil
 	case core.BatchQPushFront:

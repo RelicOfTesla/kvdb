@@ -321,8 +321,12 @@ func keyOf(ns byte, parts ...[]byte) []byte {
 	return out
 }
 
-func kvKey(key string) []byte  { return keyOf(nsKV, lp(key)) }
-func ttlKey(key string) []byte { return keyOf(nsTTL, lp(key)) }
+// kvKey / ttlKey 对用户 key **不加长度前缀**：让存储序等于用户 key 的字节序。
+// 加 lp 前缀会使排序变成 (长度, 字节)，于是 "pk2" 排在 "pk10" 之前，既不满足
+// Scan 承诺的"按 key 字节序升序"，也让闭区间 [start,end] 的过滤结果错乱。
+// KV/TTL 命名空间无"名字+子结构"的复合形态，靠 nsPrefix(nsKV) 划界即可。
+func kvKey(key string) []byte  { return keyOf(nsKV, []byte(key)) }
+func ttlKey(key string) []byte { return keyOf(nsTTL, []byte(key)) }
 func qItemKey(name string, seq int64) []byte {
 	return keyOf(nsQueue, lp(name), be64(ordered(seq)))
 }
@@ -363,12 +367,12 @@ func parseName(b []byte) (string, bool) {
 	return string(b[adv : adv+int(n)]), true
 }
 
-// parseKVEntry 从 'k' 前缀键还原用户键。
+// parseKVEntry 从 'k' 前缀键还原用户键（与 kvKey 对称：无长度前缀）。
 func parseKVEntry(k []byte) (string, bool) {
 	if len(k) < 2 || k[0] != nsKV {
 		return "", false
 	}
-	return parseName(k[1:])
+	return string(k[1:]), true
 }
 
 // ---- TTL ----
@@ -415,6 +419,9 @@ func kvLive(txn *badgerdb.Txn, key string, now int64) (bool, error) {
 // 否则会出现"写成功却读不到"。
 func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	now := core.NowUnix()
 	return p.update("set", func(txn *badgerdb.Txn) error {
 		if err := txn.Set(kvKey(key), value); err != nil {
@@ -434,6 +441,9 @@ func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 // SetEx 写入 value 并覆盖 TTL（对应 Redis SETEX / SSDB setx）。
 func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int64) error {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
@@ -449,6 +459,9 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 // SetExAt 写入 value 并让 key 在 at（unix 秒）过期；at 已过去则删除该 key。
 func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int64) error {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	return p.update("setexat", func(txn *badgerdb.Txn) error {
 		if at <= core.NowUnix() {
 			if err := txn.Delete(kvKey(key)); err != nil {
@@ -465,6 +478,9 @@ func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int
 
 func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return nil, false, err
+	}
 	var (
 		out []byte
 		ok  bool
@@ -493,6 +509,9 @@ func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 
 func (p *Provider) Del(ctx context.Context, key string) error {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	return p.update("del", func(txn *badgerdb.Txn) error {
 		if err := txn.Delete(kvKey(key)); err != nil {
 			return err
@@ -503,6 +522,9 @@ func (p *Provider) Del(ctx context.Context, key string) error {
 
 func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return false, err
+	}
 	var ok bool
 	now := core.NowUnix()
 	err := p.view("exists", func(txn *badgerdb.Txn) error {
@@ -517,6 +539,9 @@ func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 // （见 keyMutex）：已过期或值非整数的处理遵循契约。
 func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, error) {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return 0, err
+	}
 	mu := p.keyMutex(key)
 	mu.Lock()
 	defer mu.Unlock()
@@ -637,6 +662,9 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 
 func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	if ttl <= 0 {
 		return core.ErrInvalidTTL
 	}
@@ -655,6 +683,9 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 // key 不存在/已过期时不处理（不视为错误）。
 func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return err
+	}
 	now := core.NowUnix()
 	return p.update("expireat", func(txn *badgerdb.Txn) error {
 		live, err := kvLive(txn, key, now)
@@ -673,6 +704,9 @@ func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
 
 func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
 	_ = ctx
+	if err := core.CheckKey(key); err != nil {
+		return 0, false, err
+	}
 	var (
 		secs int64
 		ok   bool

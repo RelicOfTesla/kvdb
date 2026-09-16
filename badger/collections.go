@@ -57,6 +57,9 @@ func (p *Provider) QPushFront(ctx context.Context, name string, value []byte) er
 
 func (p *Provider) qpush(ctx context.Context, name string, value []byte, front bool) error {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return err
+	}
 	mu := p.keyMutex("q:" + name)
 	mu.Lock()
 	defer mu.Unlock()
@@ -120,6 +123,9 @@ func (p *Provider) QPopBack(ctx context.Context, name string) ([]byte, bool, err
 
 func (p *Provider) qpop(ctx context.Context, name string, back bool) ([]byte, bool, error) {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return nil, false, err
+	}
 	mu := p.keyMutex("q:" + name)
 	mu.Lock()
 	defer mu.Unlock()
@@ -155,6 +161,9 @@ func (p *Provider) qpop(ctx context.Context, name string, back bool) ([]byte, bo
 
 func (p *Provider) QSize(ctx context.Context, name string) (int64, error) {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return 0, err
+	}
 	var n int64
 	err := p.view("qsize", func(txn *badgerdb.Txn) error {
 		c, err := qCountersGet(txn, name)
@@ -174,6 +183,9 @@ func (p *Provider) QBack(ctx context.Context, name string) ([]byte, bool, error)
 
 func (p *Provider) qpeek(ctx context.Context, name string, back bool) ([]byte, bool, error) {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return nil, false, err
+	}
 	var (
 		v  []byte
 		ok bool
@@ -216,6 +228,9 @@ func qEach(txn *badgerdb.Txn, name string, fn func(v []byte) bool) error {
 // 索引语义与 ZRange 一致（0 起闭区间、负索引从末尾数、越界裁剪，空区间返回 nil）。
 func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) ([][]byte, error) {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	var out [][]byte
 	err := p.view("qrange", func(txn *badgerdb.Txn) error {
 		c, err := qCountersGet(txn, name) // 与 QSize 同源：计数器记录
@@ -300,6 +315,9 @@ func zPut(txn *badgerdb.Txn, name, member string, score int64) error {
 
 func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) error {
 	_ = ctx
+	if err := core.CheckKeys(name, key); err != nil {
+		return err
+	}
 	mu := p.keyMutex("z:" + name)
 	mu.Lock()
 	defer mu.Unlock()
@@ -311,6 +329,9 @@ func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) erro
 
 func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, error) {
 	_ = ctx
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, false, err
+	}
 	var (
 		score int64
 		ok    bool
@@ -325,6 +346,9 @@ func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, err
 
 func (p *Provider) ZDel(ctx context.Context, name, key string) error {
 	_ = ctx
+	if err := core.CheckKeys(name, key); err != nil {
+		return err
+	}
 	mu := p.keyMutex("z:" + name)
 	mu.Lock()
 	defer mu.Unlock()
@@ -353,6 +377,9 @@ func (p *Provider) ZDel(ctx context.Context, name, key string) error {
 
 func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return 0, err
+	}
 	var n int64
 	err := p.view("zsize", func(txn *badgerdb.Txn) error {
 		var err error
@@ -364,6 +391,9 @@ func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
 
 func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, error) {
 	_ = ctx
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, false, err
+	}
 	var (
 		rank int64
 		ok   bool
@@ -411,6 +441,9 @@ func zEach(txn *badgerdb.Txn, name string, fn func(score int64, member string) b
 
 func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) ([]core.ZItem, error) {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	out := []core.ZItem{}
 	err := p.view("zrange", func(txn *badgerdb.Txn) error {
 		total, err := zCountGet(txn, name)
@@ -547,6 +580,9 @@ func (p *Provider) zScoreWindow(txn *badgerdb.Txn, name string, min, max int64, 
 // ZRangeByScore 返回分数落在闭区间 [min, max] 内的成员；desc 只改遍历方向。
 func (p *Provider) ZRangeByScore(ctx context.Context, name string, min, max int64, limit int, desc bool) ([]core.ZItem, error) {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	var out []core.ZItem
 	err := p.view("zrangebyscore", func(txn *badgerdb.Txn) error {
 		items, err := p.zScoreWindow(txn, name, min, max, limit, desc)
@@ -585,6 +621,9 @@ func normalizeRange(start, stop, n int64) (lo, hi int64, ok bool) {
 
 func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (int64, error) {
 	_ = ctx
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, err
+	}
 	mu := p.keyMutex("z:" + name)
 	mu.Lock()
 	defer mu.Unlock()
@@ -659,6 +698,18 @@ func validateOps(ops []core.BatchOp) error {
 			core.BatchZSet, core.BatchZDel, core.BatchZIncr:
 		default:
 			return fmt.Errorf("badger: unknown batch op %d", op.Kind)
+		}
+		// 空 key/队列名/zset 名（以及 zset 成员）整批拒绝：与单条路径同口径，
+		// 且**不得静默跳过**（跳过会让调用方以为整批已写入，见 core.ErrInvalidKey）。
+		switch op.Kind {
+		case core.BatchZSet, core.BatchZDel, core.BatchZIncr:
+			if err := core.CheckKeys(op.Key, op.Member); err != nil {
+				return err
+			}
+		default:
+			if err := core.CheckKey(op.Key); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

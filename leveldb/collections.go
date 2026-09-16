@@ -64,6 +64,9 @@ func (p *Provider) QPushFront(ctx context.Context, name string, value []byte) er
 
 func (p *Provider) qpush(ctx context.Context, name string, value []byte, front bool) error {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return err
+	}
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -116,6 +119,9 @@ func (p *Provider) qSeek(name string, back bool) (k, v []byte, ok bool, err erro
 // 索引语义与 ZRange 一致（0 起闭区间、负索引从末尾数、越界裁剪）。
 func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) ([][]byte, error) {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	if err := p.check(); err != nil {
 		return nil, err
 	}
@@ -167,6 +173,9 @@ func (p *Provider) QPopBack(ctx context.Context, name string) ([]byte, bool, err
 
 func (p *Provider) qpop(ctx context.Context, name string, back bool) ([]byte, bool, error) {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return nil, false, err
+	}
 	if err := p.check(); err != nil {
 		return nil, false, err
 	}
@@ -196,6 +205,9 @@ func (p *Provider) qpop(ctx context.Context, name string, back bool) ([]byte, bo
 
 func (p *Provider) QSize(ctx context.Context, name string) (int64, error) {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return 0, err
+	}
 	if err := p.check(); err != nil {
 		return 0, err
 	}
@@ -216,6 +228,9 @@ func (p *Provider) QBack(ctx context.Context, name string) ([]byte, bool, error)
 
 func (p *Provider) qpeek(ctx context.Context, name string, back bool) ([]byte, bool, error) {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return nil, false, err
+	}
 	if err := p.check(); err != nil {
 		return nil, false, err
 	}
@@ -284,6 +299,9 @@ func (p *Provider) zCountGet(name string) (int64, error) {
 
 func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) error {
 	_ = ctx
+	if err := core.CheckKeys(name, key); err != nil {
+		return err
+	}
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -312,6 +330,9 @@ func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) erro
 
 func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, error) {
 	_ = ctx
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, false, err
+	}
 	if err := p.check(); err != nil {
 		return 0, false, err
 	}
@@ -320,6 +341,9 @@ func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, err
 
 func (p *Provider) ZDel(ctx context.Context, name, key string) error {
 	_ = ctx
+	if err := core.CheckKeys(name, key); err != nil {
+		return err
+	}
 	if err := p.check(); err != nil {
 		return err
 	}
@@ -346,6 +370,9 @@ func (p *Provider) ZDel(ctx context.Context, name, key string) error {
 
 func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return 0, err
+	}
 	if err := p.check(); err != nil {
 		return 0, err
 	}
@@ -354,6 +381,9 @@ func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
 
 func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, error) {
 	_ = ctx
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, false, err
+	}
 	if err := p.check(); err != nil {
 		return 0, false, err
 	}
@@ -406,6 +436,9 @@ func hasPrefixBytes(b, prefix []byte) bool { return bytes.HasPrefix(b, prefix) }
 
 func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) ([]core.ZItem, error) {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	if err := p.check(); err != nil {
 		return nil, err
 	}
@@ -563,6 +596,9 @@ func (p *Provider) zScoreWindowReverse(name string, min, max int64, limit int) (
 // ZRangeByScore 返回分数落在闭区间 [min, max] 内的成员；desc 只改遍历方向。
 func (p *Provider) ZRangeByScore(ctx context.Context, name string, min, max int64, limit int, desc bool) ([]core.ZItem, error) {
 	_ = ctx
+	if err := core.CheckKey(name); err != nil {
+		return nil, err
+	}
 	if err := p.check(); err != nil {
 		return nil, err
 	}
@@ -592,6 +628,9 @@ func normalizeRange(start, stop, n int64) (lo, hi int64, ok bool) {
 
 func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (int64, error) {
 	_ = ctx
+	if err := core.CheckKeys(name, key); err != nil {
+		return 0, err
+	}
 	if err := p.check(); err != nil {
 		return 0, err
 	}
@@ -759,6 +798,18 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 			core.BatchZSet, core.BatchZDel, core.BatchZIncr:
 		default:
 			return fmt.Errorf("leveldb: unknown batch op %d", op.Kind)
+		}
+		// 空 key/队列名/zset 名（以及 zset 成员）整批拒绝：与单条路径同口径，
+		// 且**不得静默跳过**——跳过会让调用方以为整批已写入（见 core.ErrInvalidKey）。
+		switch op.Kind {
+		case core.BatchZSet, core.BatchZDel, core.BatchZIncr:
+			if err := core.CheckKeys(op.Key, op.Member); err != nil {
+				return err
+			}
+		default:
+			if err := core.CheckKey(op.Key); err != nil {
+				return err
+			}
 		}
 	}
 	now := core.NowUnix()

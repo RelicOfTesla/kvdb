@@ -37,13 +37,12 @@ n, err := db.Incr(ctx, "visits", 1)
 
 | 模块 | 最低 Go |
 |---|---|
-| `kvdb`（根，含 `core`/`kvdbtest`）、`mem`、`jsonl`、`sqlstore`、`mssql` | 1.18 |
-| `ssdb`、`leveldb`、`rpc` | 1.19 |
-| `badger` | 1.24（Badger v4 自身声明 `go 1.24.0`） |
-| `bolt`、`sqlite`、`mysql`、`pg`、`redis`、`all`、`example` | 1.25（驱动/传递依赖决定） |
+| `kvdb`（根，含 `core`/`kvdbtest`）、`mem`、`jsonl`、`sqlstore`、`mssql`、`rpc` | **1.18** |
+| `ssdb`、`leveldb` | 1.19 |
+| `badger`、`mysql`、`redis` | 1.24 |
+| `bolt`、`pg`、`sqlite`、`all`、`example` | 1.25 |
 
-版本取各模块依赖图中**最大的 `go` 指令**（`go list -m -f '{{.GoVersion}}' all`）。根包、
-`mem`、`jsonl`、`rpc` 仅需标准库——只引入 `kvdb/mem` 的项目依赖闭包为空。
+只引入 `kvdb/mem`（或 `jsonl`/`rpc`）的项目在 Go 1.18 上即可构建，且依赖闭包为空。
 
 ## 引入方式
 
@@ -265,7 +264,8 @@ for m in $(find . -name go.mod -not -path './.*'); do (cd "$(dirname "$m")" && g
 core/                  契约：接口、哨兵错误、能力声明、共享辅助
 kvdbtest/              跨基座共享合同用例，一文件一主题
 mem/ jsonl/ bolt/ leveldb/ badger/ sqlite/ mysql/ pg/ mssql/ redis/ ssdb/   各基座模块
-rpc/                   RPC 客户端与服务端（+ rpc/codec：RESP / binary / textproto）
+rpc/                   RPC 客户端与服务端（+ rpc/codec：RESP / binary / textproto；
+                       rpc/rpc_test：跨基座线协议用例）
 sqlstore/              sqlite/mysql/pg/mssql 共享的 database/sql 实现
 all/                   聚合注册包（import _ 即接入全部基座）
 example/               rpcdemo（RPC 服务端）、cmd/cli、cmd/migration、bench

@@ -41,14 +41,13 @@ n, err := db.Incr(ctx, "visits", 1)
 
 | Module | Min Go |
 |---|---|
-| `kvdb` (root, incl. `core`/`kvdbtest`), `mem`, `jsonl`, `sqlstore`, `mssql` | 1.18 |
-| `ssdb`, `leveldb`, `rpc` | 1.19 |
-| `badger` | 1.24 (Badger v4 declares `go 1.24.0`) |
-| `bolt`, `sqlite`, `mysql`, `pg`, `redis`, `all`, `example` | 1.25 (driver / transitive deps) |
+| `kvdb` (root, incl. `core`/`kvdbtest`), `mem`, `jsonl`, `sqlstore`, `mssql`, `rpc` | **1.18** |
+| `ssdb`, `leveldb` | 1.19 |
+| `badger`, `mysql`, `redis` | 1.24 |
+| `bolt`, `pg`, `sqlite`, `all`, `example` | 1.25 |
 
-Taken as the largest `go` directive in each module's dependency graph
-(`go list -m -f '{{.GoVersion}}' all`). The root package, `mem`, `jsonl` and `rpc` need only the
-standard library: a project importing just `kvdb/mem` builds with an empty dependency closure.
+A project importing only `kvdb/mem` (or `jsonl` / `rpc`) builds on Go 1.18 with an empty
+dependency closure.
 
 ## Installation
 
@@ -278,7 +277,8 @@ server.
 core/         Contract: interfaces, sentinel errors, capability declaration, shared helpers
 kvdbtest/     Contract cases shared across backends, one file per topic
 mem/ jsonl/ bolt/ leveldb/ badger/ sqlite/ mysql/ pg/ mssql/ redis/ ssdb/   backend modules
-rpc/          RPC client and server (+ rpc/codec: RESP / binary / textproto)
+rpc/          RPC client and server (+ rpc/codec: RESP / binary / textproto;
+              rpc/rpc_test: cross-backend wire tests)
 sqlstore/     shared database/sql implementation behind sqlite/mysql/pg/mssql
 all/          aggregating registration package (import _ to wire in every backend)
 example/      rpcdemo (RPC server), cmd/cli, cmd/migration, bench

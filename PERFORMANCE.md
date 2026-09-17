@@ -37,6 +37,12 @@ comparisons between backends. Bare `write(16B)+fsync` for reference: tmpfs 2–4
 fsync, only ~1.5× faster than 9p, so it is not in the fast tier. Note also that this repository
 itself lives on a drvfs (9p) mount of `G:\`; measure ext4 on a WSL root disk such as `~/test/tmp`.
 
+**A slower medium is the more sensitive test.** On 9p every I/O pays a protocol round trip, so a
+change that adds I/O or dirty pages is amplified instead of hidden — the same durable `Set` costs
+~11 ms on 9p versus ~2.3 ms on ext4. When comparing storage-layer structure (key layout, page
+sizing, bucket/namespace organization), 9p and the write-amplification counters are what reveal a
+difference; tmpfs and even ext4 can bury it under fixed per-commit cost.
+
 ### 1.1 Durability modes
 
 | Backend | Default (fast) | `?sync=1` (durable) | Notes |

@@ -728,6 +728,15 @@ func (p *Provider) closedErr(err error) error {
 	return err
 }
 
+// wrapErr 是 closedErr 的带操作名前缀版本："sqlstore: <op>: <err>"。
+// **所有**可能来自 database/sql 的错误返回都应经由它（或 closedErr）——
+// check() 与 Close() 之间的窗口对每个方法都存在，只有 Set/Get 归一
+// 会让其余方法把驱动的 "sql: database is closed" 原样泄漏给调用方
+// （sqlstore/close_race_test.go 逐方法钉住这一点）。
+func (p *Provider) wrapErr(op string, err error) error {
+	return fmt.Errorf("sqlstore: %s: %w", op, p.closedErr(err))
+}
+
 // IncrWraps 能力声明：sqlstore 的 Incr 有显式溢出检查（事务与单语句路径都返回
 // ErrNotInteger，不回绕），见 core.IncrWrapsProvider 与 Caps.IncrWraps。
 func (p *Provider) IncrWraps() bool { return false }
@@ -802,7 +811,7 @@ func (p *Provider) Set(ctx context.Context, key string, value []byte) error {
 	}
 	args = append(args, core.NowUnix())
 	if _, err := p.db.ExecContext(ctx, p.st.kvUpsert, args...); err != nil {
-		return fmt.Errorf("sqlstore: set: %w", p.closedErr(err))
+		return p.wrapErr("set", err)
 	}
 	return nil
 }
@@ -837,7 +846,7 @@ func (p *Provider) SetEx(ctx context.Context, key string, value []byte, ttl int6
 		args = append(args, numProjection(value))
 	}
 	if _, err := p.db.ExecContext(ctx, p.st.kvSetEx, args...); err != nil {
-		return fmt.Errorf("sqlstore: setex: %w", err)
+		return p.wrapErr("setex", err)
 	}
 	return nil
 }
@@ -857,7 +866,7 @@ func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int
 	}
 	if at <= core.NowUnix() {
 		if _, err := p.db.ExecContext(ctx, p.st.kvDel, bs(key)); err != nil {
-			return fmt.Errorf("sqlstore: setexat: %w", err)
+			return p.wrapErr("setexat", err)
 		}
 		return nil
 	}
@@ -866,7 +875,7 @@ func (p *Provider) SetExAt(ctx context.Context, key string, value []byte, at int
 		args = append(args, numProjection(value))
 	}
 	if _, err := p.db.ExecContext(ctx, p.st.kvSetEx, args...); err != nil {
-		return fmt.Errorf("sqlstore: setexat: %w", err)
+		return p.wrapErr("setexat", err)
 	}
 	return nil
 }
@@ -884,7 +893,7 @@ func (p *Provider) Get(ctx context.Context, key string) ([]byte, bool, error) {
 		return nil, false, nil
 	}
 	if err != nil {
-		return nil, false, fmt.Errorf("sqlstore: get: %w", p.closedErr(err))
+		return nil, false, p.wrapErr("get", err)
 	}
 	return v, true, nil
 }
@@ -898,7 +907,7 @@ func (p *Provider) Del(ctx context.Context, key string) error {
 		return err
 	}
 	if _, err := p.db.ExecContext(ctx, p.st.kvDel, bs(key)); err != nil {
-		return fmt.Errorf("sqlstore: del: %w", err)
+		return p.wrapErr("del", err)
 	}
 	return nil
 }
@@ -916,7 +925,7 @@ func (p *Provider) Exists(ctx context.Context, key string) (bool, error) {
 		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("sqlstore: exists: %w", err)
+		return false, p.wrapErr("exists", err)
 	}
 	return true, nil
 }
@@ -940,21 +949,21 @@ func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, er
 	}
 	tx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("sqlstore: incr begin: %w", err)
+		return 0, p.wrapErr("incr begin", err)
 	}
 	defer tx.Rollback()
 
 	// 先占位插入（行不存在则建 '0'，存在则不动）：保证随后的 SELECT FOR UPDATE
 	// 锁到的是已存在行——并发 Incr 对缺失键不会再互相持有 gap 锁而死锁。
 	if _, err := tx.ExecContext(ctx, p.st.kvIncrSeed, bs(key)); err != nil {
-		return 0, fmt.Errorf("sqlstore: incr seed: %w", err)
+		return 0, p.wrapErr("incr seed", err)
 	}
 
 	now := core.NowUnix()
 	var raw []byte
 	var expireAt int64
 	if err := tx.QueryRowContext(ctx, p.st.kvIncrSelect, bs(key)).Scan(&raw, &expireAt); err != nil {
-		return 0, fmt.Errorf("sqlstore: incr select: %w", err)
+		return 0, p.wrapErr("incr select", err)
 	}
 	// 已过期的键契约上视为不存在：忽略陈旧值，从 0 起算并清除过期时间。
 	expired := expireAt > 0 && expireAt <= now
@@ -979,10 +988,10 @@ func (p *Provider) Incr(ctx context.Context, key string, delta int64) (int64, er
 	// 十进制文本；MSSQL 的 varbinary 列则必须由 Go 侧按二进制绑定（显式
 	// CONVERT(nvarchar->varbinary) 得到的是 UTF-16 编码，会静默写坏计数值）。
 	if _, err := tx.ExecContext(ctx, p.st.kvIncrUpdate, []byte(strconv.FormatInt(newVal, 10)), newExpire, bs(key)); err != nil {
-		return 0, fmt.Errorf("sqlstore: incr update: %w", err)
+		return 0, p.wrapErr("incr update", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("sqlstore: incr commit: %w", err)
+		return 0, p.wrapErr("incr commit", err)
 	}
 	return newVal, nil
 }
@@ -1007,7 +1016,7 @@ func (p *Provider) incrOne(ctx context.Context, key string, delta int64) (int64,
 		if isNotIntegerErr(err) {
 			return 0, core.ErrNotInteger
 		}
-		return 0, fmt.Errorf("sqlstore: incr: %w", err)
+		return 0, p.wrapErr("incr", err)
 	}
 	return newVal, nil
 }
@@ -1046,14 +1055,14 @@ func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte,
 		args = append(args, core.NowUnix())
 		rows, err := p.db.QueryContext(ctx, p.st.kvMGet(len(chunk)), args...)
 		if err != nil {
-			return nil, fmt.Errorf("sqlstore: mget: %w", err)
+			return nil, p.wrapErr("mget", err)
 		}
 		for rows.Next() {
 			var k []byte
 			var v []byte
 			if err := rows.Scan(&k, &v); err != nil {
 				rows.Close()
-				return nil, fmt.Errorf("sqlstore: mget scan: %w", err)
+				return nil, p.wrapErr("mget scan", err)
 			}
 			out[string(k)] = v
 		}
@@ -1061,10 +1070,10 @@ func (p *Provider) MGet(ctx context.Context, keys ...string) (map[string][]byte,
 		// 必须用 rows.Err() 捕获，否则会把部分结果当完整结果返回。
 		if err := rows.Err(); err != nil {
 			rows.Close()
-			return nil, fmt.Errorf("sqlstore: mget: %w", err)
+			return nil, p.wrapErr("mget", err)
 		}
 		if err := rows.Close(); err != nil {
-			return nil, err
+			return nil, p.wrapErr("mget close", err)
 		}
 	}
 	return out, nil
@@ -1087,7 +1096,7 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 	args = append(args, core.NowUnix(), limit)
 	rows, err := p.db.QueryContext(ctx, q, args...)
 	if err != nil {
-		return nil, fmt.Errorf("sqlstore: scan: %w", err)
+		return nil, p.wrapErr("scan", err)
 	}
 	defer rows.Close()
 	// 预分配按 1024 封顶：limit 是调用方入参，直接按 limit 分配会被
@@ -1096,11 +1105,11 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 	for rows.Next() {
 		var k, v []byte
 		if err := rows.Scan(&k, &v); err != nil {
-			return nil, fmt.Errorf("sqlstore: scan row: %w", err)
+			return nil, p.wrapErr("scan row", err)
 		}
 		out = append(out, core.KeyValue{Key: string(k), Value: v})
 	}
-	return out, rows.Err()
+	return out, p.closedErr(rows.Err())
 }
 
 func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
@@ -1120,7 +1129,7 @@ func (p *Provider) Expire(ctx context.Context, key string, ttl int64) error {
 	now := core.NowUnix()
 	// 参数：新过期时间、key、当前秒（用于把"已过期 = 不存在"写进 WHERE，不复活过期键）。
 	if _, err := p.db.ExecContext(ctx, p.st.kvExpire, core.AddTTL(now, ttl), bs(key), now); err != nil {
-		return fmt.Errorf("sqlstore: expire: %w", err)
+		return p.wrapErr("expire", err)
 	}
 	return nil
 }
@@ -1141,12 +1150,12 @@ func (p *Provider) ExpireAt(ctx context.Context, key string, at int64) error {
 	now := core.NowUnix()
 	if at <= now {
 		if _, err := p.db.ExecContext(ctx, p.st.kvDel, bs(key)); err != nil {
-			return fmt.Errorf("sqlstore: expireat: %w", err)
+			return p.wrapErr("expireat", err)
 		}
 		return nil
 	}
 	if _, err := p.db.ExecContext(ctx, p.st.kvExpire, at, bs(key), now); err != nil {
-		return fmt.Errorf("sqlstore: expireat: %w", err)
+		return p.wrapErr("expireat", err)
 	}
 	return nil
 }
@@ -1164,7 +1173,7 @@ func (p *Provider) TTL(ctx context.Context, key string) (int64, bool, error) {
 		return -1, false, nil
 	}
 	if err != nil {
-		return 0, false, fmt.Errorf("sqlstore: ttl: %w", err)
+		return 0, false, p.wrapErr("ttl", err)
 	}
 	now := core.NowUnix()
 	if exp == 0 || exp <= now {
@@ -1207,14 +1216,14 @@ func (p *Provider) qpush(ctx context.Context, name string, value []byte, front b
 	}
 	tx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("sqlstore: qpush begin: %w", err)
+		return p.wrapErr("qpush begin", err)
 	}
 	defer tx.Rollback()
 	if err := p.qpushTx(ctx, tx, name, value, front); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("sqlstore: qpush commit: %w", err)
+		return p.wrapErr("qpush commit", err)
 	}
 	return nil
 }
@@ -1229,7 +1238,7 @@ func (p *Provider) qpushTx(ctx context.Context, tx *sql.Tx, name string, value [
 	}
 	if p.st.qSeqBumpBack != "" {
 		if _, err := tx.ExecContext(ctx, p.st.qSeqEnsure, bs(name)); err != nil {
-			return fmt.Errorf("sqlstore: qpush ensure: %w", err)
+			return p.wrapErr("qpush ensure", err)
 		}
 		bump := p.st.qSeqBumpBack
 		if front {
@@ -1237,20 +1246,20 @@ func (p *Provider) qpushTx(ctx context.Context, tx *sql.Tx, name string, value [
 		}
 		var seq int64
 		if err := tx.QueryRowContext(ctx, bump, bs(name)).Scan(&seq); err != nil {
-			return fmt.Errorf("sqlstore: qpush bump: %w", err)
+			return p.wrapErr("qpush bump", err)
 		}
 		if _, err := tx.ExecContext(ctx, p.st.qItemInsert, bs(name), seq, bv(value)); err != nil {
-			return fmt.Errorf("sqlstore: qpush insert: %w", err)
+			return p.wrapErr("qpush insert", err)
 		}
 		return nil
 	}
 
 	if _, err := tx.ExecContext(ctx, p.st.qSeqEnsure, bs(name)); err != nil {
-		return fmt.Errorf("sqlstore: qpush ensure: %w", err)
+		return p.wrapErr("qpush ensure", err)
 	}
 	var next, prev int64
 	if err := tx.QueryRowContext(ctx, p.st.qSeqSelect, bs(name)).Scan(&next, &prev); err != nil {
-		return fmt.Errorf("sqlstore: qpush seq: %w", err)
+		return p.wrapErr("qpush seq", err)
 	}
 	var seq int64
 	if front {
@@ -1261,10 +1270,10 @@ func (p *Provider) qpushTx(ctx context.Context, tx *sql.Tx, name string, value [
 		next = seq + 1
 	}
 	if _, err := tx.ExecContext(ctx, p.st.qSeqUpdate, next, prev, bs(name)); err != nil {
-		return fmt.Errorf("sqlstore: qpush update seq: %w", err)
+		return p.wrapErr("qpush update seq", err)
 	}
 	if _, err := tx.ExecContext(ctx, p.st.qItemInsert, bs(name), seq, bv(value)); err != nil {
-		return fmt.Errorf("sqlstore: qpush insert: %w", err)
+		return p.wrapErr("qpush insert", err)
 	}
 	return nil
 }
@@ -1291,7 +1300,7 @@ func (p *Provider) qpop(ctx context.Context, name string, back bool) ([]byte, bo
 	}
 	tx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, false, fmt.Errorf("sqlstore: qpop begin: %w", err)
+		return nil, false, p.wrapErr("qpop begin", err)
 	}
 	defer tx.Rollback()
 
@@ -1302,13 +1311,13 @@ func (p *Provider) qpop(ctx context.Context, name string, back bool) ([]byte, bo
 		return nil, false, nil
 	}
 	if err != nil {
-		return nil, false, fmt.Errorf("sqlstore: qpop select: %w", err)
+		return nil, false, p.wrapErr("qpop select", err)
 	}
 	if _, err := tx.ExecContext(ctx, p.st.qItemDelete, bs(name), seq); err != nil {
-		return nil, false, fmt.Errorf("sqlstore: qpop delete: %w", err)
+		return nil, false, p.wrapErr("qpop delete", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, false, fmt.Errorf("sqlstore: qpop commit: %w", err)
+		return nil, false, p.wrapErr("qpop commit", err)
 	}
 	return v, true, nil
 }
@@ -1322,7 +1331,7 @@ func (p *Provider) QSize(ctx context.Context, name string) (int64, error) {
 	}
 	var n int64
 	if err := p.db.QueryRowContext(ctx, p.st.qItemCount, bs(name)).Scan(&n); err != nil {
-		return 0, fmt.Errorf("sqlstore: qsize: %w", err)
+		return 0, p.wrapErr("qsize", err)
 	}
 	return n, nil
 }
@@ -1348,7 +1357,7 @@ func (p *Provider) qpeek(ctx context.Context, name string, back bool) ([]byte, b
 		return nil, false, nil
 	}
 	if err != nil {
-		return nil, false, fmt.Errorf("sqlstore: qpeek: %w", err)
+		return nil, false, p.wrapErr("qpeek", err)
 	}
 	return v, true, nil
 }
@@ -1380,7 +1389,7 @@ func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) (
 		// 时也必须先真实取 n——maxZRangeLimit 与 ZRange 同一口径，防巨型预分配。
 		var n int64
 		if err := p.db.QueryRowContext(ctx, p.st.qItemCount, bs(name)).Scan(&n); err != nil {
-			return nil, fmt.Errorf("sqlstore: qrange size: %w", err)
+			return nil, p.wrapErr("qrange size", err)
 		}
 		// 裁剪规矩与 mem 基座的 indexRange 一致：start 负则加 n 并夹到 0，
 		// stop 负则加 n（再加一次也不会回正，故同时覆盖"负数过小"的情形）。
@@ -1410,7 +1419,7 @@ func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) (
 	}
 	rows, err := p.db.QueryContext(ctx, p.st.qRange, bs(name), prealloc, start)
 	if err != nil {
-		return nil, fmt.Errorf("sqlstore: qrange: %w", err)
+		return nil, p.wrapErr("qrange", err)
 	}
 	defer rows.Close()
 	// 不预分配 out（只给个 0 容量起手）：元素是 []byte，append 会自动扩容，
@@ -1419,11 +1428,11 @@ func (p *Provider) QRange(ctx context.Context, name string, start, stop int64) (
 	for rows.Next() {
 		var v []byte
 		if err := rows.Scan(&v); err != nil {
-			return nil, fmt.Errorf("sqlstore: qrange row: %w", err)
+			return nil, p.wrapErr("qrange row", err)
 		}
 		out = append(out, v)
 	}
-	return out, rows.Err()
+	return out, p.closedErr(rows.Err())
 }
 
 // ---- ZSet ----
@@ -1440,7 +1449,7 @@ func (p *Provider) ZSet(ctx context.Context, name, key string, score int64) erro
 		return err
 	}
 	if _, err := p.db.ExecContext(ctx, p.st.zUpsert(false), bs(name), bs(key), score); err != nil {
-		return fmt.Errorf("sqlstore: zset: %w", err)
+		return p.wrapErr("zset", err)
 	}
 	return nil
 }
@@ -1458,7 +1467,7 @@ func (p *Provider) ZGet(ctx context.Context, name, key string) (int64, bool, err
 		return 0, false, nil
 	}
 	if err != nil {
-		return 0, false, fmt.Errorf("sqlstore: zget: %w", err)
+		return 0, false, p.wrapErr("zget", err)
 	}
 	return s, true, nil
 }
@@ -1475,7 +1484,7 @@ func (p *Provider) ZDel(ctx context.Context, name, key string) error {
 		return err
 	}
 	if _, err := p.db.ExecContext(ctx, p.st.zDel, bs(name), bs(key)); err != nil {
-		return fmt.Errorf("sqlstore: zdel: %w", err)
+		return p.wrapErr("zdel", err)
 	}
 	return nil
 }
@@ -1489,7 +1498,7 @@ func (p *Provider) ZSize(ctx context.Context, name string) (int64, error) {
 	}
 	var n int64
 	if err := p.db.QueryRowContext(ctx, p.st.zCount, bs(name)).Scan(&n); err != nil {
-		return 0, fmt.Errorf("sqlstore: zsize: %w", err)
+		return 0, p.wrapErr("zsize", err)
 	}
 	return n, nil
 }
@@ -1507,12 +1516,12 @@ func (p *Provider) ZRank(ctx context.Context, name, key string) (int64, bool, er
 		return 0, false, nil
 	}
 	if err != nil {
-		return 0, false, fmt.Errorf("sqlstore: zrank member: %w", err)
+		return 0, false, p.wrapErr("zrank member", err)
 	}
 	var rank int64
 	// 参数按展开后的占位符顺序排列：z={1}, s={2}, s={3}（{2} 重复，需再传一次）, k={4}。
 	if err := p.db.QueryRowContext(ctx, p.st.zRankCount, bs(name), s, s, bs(key)).Scan(&rank); err != nil {
-		return 0, false, fmt.Errorf("sqlstore: zrank count: %w", err)
+		return 0, false, p.wrapErr("zrank count", err)
 	}
 	return rank, true, nil
 }
@@ -1528,7 +1537,7 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 	if start < 0 || stop < 0 {
 		var n int64
 		if err := p.db.QueryRowContext(ctx, p.st.zCount, bs(name)).Scan(&n); err != nil {
-			return nil, fmt.Errorf("sqlstore: zrange size: %w", err)
+			return nil, p.wrapErr("zrange size", err)
 		}
 		if start < 0 {
 			start = n + start
@@ -1547,7 +1556,7 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 		// 负 cap 的 make 直接 panic，重则按 cap 预清零巨型切片 OOM。
 		var n int64
 		if err := p.db.QueryRowContext(ctx, p.st.zCount, bs(name)).Scan(&n); err != nil {
-			return nil, fmt.Errorf("sqlstore: zrange size: %w", err)
+			return nil, p.wrapErr("zrange size", err)
 		}
 		if stop >= n {
 			stop = n - 1
@@ -1563,7 +1572,7 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 	offset := start
 	rows, err := p.db.QueryContext(ctx, p.st.zRange, bs(name), limit, offset)
 	if err != nil {
-		return nil, fmt.Errorf("sqlstore: zrange: %w", err)
+		return nil, p.wrapErr("zrange", err)
 	}
 	defer rows.Close()
 	// 预分配按 1024 封顶：limit 是调用方入参，直接按 limit 分配会被
@@ -1577,11 +1586,11 @@ func (p *Provider) ZRange(ctx context.Context, name string, start, stop int64) (
 		var k []byte
 		var s int64
 		if err := rows.Scan(&k, &s); err != nil {
-			return nil, fmt.Errorf("sqlstore: zrange row: %w", err)
+			return nil, p.wrapErr("zrange row", err)
 		}
 		out = append(out, core.ZItem{Key: string(k), Score: s})
 	}
-	return out, rows.Err()
+	return out, p.closedErr(rows.Err())
 }
 
 // ZRangeByScore 返回分数落在闭区间 [min, max] 内的成员，按 (s, k) 序。
@@ -1618,7 +1627,7 @@ func (p *Provider) ZRangeByScore(ctx context.Context, name string, min, max int6
 	}
 	rows, err := p.db.QueryContext(ctx, stmt, args...)
 	if err != nil {
-		return nil, fmt.Errorf("sqlstore: zrangebyscore: %w", err)
+		return nil, p.wrapErr("zrangebyscore", err)
 	}
 	defer rows.Close()
 	out := make([]core.ZItem, 0, prealloc)
@@ -1626,11 +1635,11 @@ func (p *Provider) ZRangeByScore(ctx context.Context, name string, min, max int6
 		var k []byte
 		var s int64
 		if err := rows.Scan(&k, &s); err != nil {
-			return nil, fmt.Errorf("sqlstore: zrangebyscore row: %w", err)
+			return nil, p.wrapErr("zrangebyscore row", err)
 		}
 		out = append(out, core.ZItem{Key: string(k), Score: s})
 	}
-	return out, rows.Err()
+	return out, p.closedErr(rows.Err())
 }
 
 func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (int64, error) {
@@ -1649,18 +1658,18 @@ func (p *Provider) ZIncr(ctx context.Context, name, key string, delta int64) (in
 	if p.st.zIncrOne != "" {
 		var s int64
 		if err := p.db.QueryRowContext(ctx, p.st.zIncrOne, bs(name), bs(key), delta).Scan(&s); err != nil {
-			return 0, fmt.Errorf("sqlstore: zincr: %w", err)
+			return 0, p.wrapErr("zincr", err)
 		}
 		return s, nil
 	}
 	// MySQL 无 RETURNING：upsert 本身原子，但并发下回读值可能包含其他
 	// 调用的增量（契约只承诺分数正确落库，不承诺返回值线性对应本次调用）。
 	if _, err := p.db.ExecContext(ctx, p.st.zUpsert(true), bs(name), bs(key), delta); err != nil {
-		return 0, fmt.Errorf("sqlstore: zincr: %w", err)
+		return 0, p.wrapErr("zincr", err)
 	}
 	var s int64
 	if err := p.db.QueryRowContext(ctx, p.st.zIncrSelect, bs(name), bs(key)).Scan(&s); err != nil {
-		return 0, fmt.Errorf("sqlstore: zincr select: %w", err)
+		return 0, p.wrapErr("zincr select", err)
 	}
 	return s, nil
 }
@@ -1715,18 +1724,18 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 
 	tx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("sqlstore: batch begin: %w", err)
+		return p.wrapErr("batch begin", err)
 	}
 	defer tx.Rollback()
 
 	now := core.NowUnix()
 	for i, op := range ops {
 		if err := p.batchOp(ctx, tx, op, now); err != nil {
-			return fmt.Errorf("sqlstore: batch op %d (kind %d): %w", i, op.Kind, err)
+			return fmt.Errorf("sqlstore: batch op %d (kind %d): %w", i, op.Kind, p.closedErr(err))
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("sqlstore: batch commit: %w", err)
+		return p.wrapErr("batch commit", err)
 	}
 	return nil
 }

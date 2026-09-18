@@ -30,6 +30,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/RelicOfTesla/kvdb"
@@ -196,6 +197,81 @@ func TestScanBoundaries(t *testing.T, db kvdb.DB) {
 }
 
 // TestTTLBoundaries 覆盖 TTL 的边界：无 TTL/不存在的区分、非正 TTL 拒绝、
+
+// TestScanPrefixKeyOrder 覆盖 Scan 键序的一个盲区：**一个键是另一个键的前缀，
+// 且后继字节很小（≤ 0x02）**。形如 "pko:a"、"pko:a\x00"、"pko:a\x01"、
+// "pko:a\x02"、"pko:ab" 的键集能把 KV 布局/比较实现里的几类错误逼出来：
+//
+//   - 用「长度前缀 + 内容」而非「直接以用户 key 字节为序」的布局，会先按长度
+//     分组，破坏纯字节序（本仓库各基座都直接把用户 key 字节拼进 KV 命名空间，
+//     见 badger/leveldb 的 kvKey 注释，故应当通过）；
+//   - 把 0x00/0x01/0x02 这类小后继字节截断（例如按 C 字符串语义处理 key）；
+//   - 以 < 而非 ≤ 实现闭区间上界、或前缀扫描的上界只 +1 一个字节。
+//
+// 专用前缀 "pko:" 而不是裸键 "a" 等，是为了在**共享同一实例**的测试夹具
+// （如 ssdb 的假服务端在多个子用例间复用）上仍能隔离本用例写入的键。
+// 顺序断言同时用两种范围做：Scan("", "", 100) 钉住"全局严格升序"，
+// 带前缀的闭区间扫描钉住"这组键的相对顺序与内容"。
+func TestScanPrefixKeyOrder(t *testing.T, db kvdb.DB) {
+	ctx := context.Background()
+	const p = "pko:"
+	seed := []struct {
+		key string
+		val string
+		ttl int64 // >0 用 SetEx（部分带 TTL）
+	}{
+		{p + "a", "va", 0},
+		{p + "a\x00", "v00", 100},
+		{p + "a\x01", "v01", 0},
+		{p + "a\x02", "v02", 100},
+		{p + "ab", "vab", 0},
+	}
+	for _, s := range seed {
+		var err error
+		if s.ttl > 0 {
+			err = db.SetEx(ctx, s.key, []byte(s.val), s.ttl)
+		} else {
+			err = db.Set(ctx, s.key, []byte(s.val))
+		}
+		if err != nil {
+			t.Fatalf("写入 %q: %v", s.key, err)
+		}
+	}
+
+	// 全局扫描：必须严格按字节序升序（不得出现相等/逆序项）。
+	all, err := db.Scan(ctx, "", "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i < len(all); i++ {
+		if c := strings.Compare(all[i-1].Key, all[i].Key); c >= 0 {
+			t.Fatalf("Scan(\"\",\"\",100) 必须严格按字节序升序: [%d]=%q 与 [%d]=%q 比较=%d; 全量=%q",
+				i-1, all[i-1].Key, i, all[i].Key, c, keysOf(all))
+		}
+	}
+
+	// 前缀闭区间：这 5 个键必须按字节序出现且内容正确。
+	got, err := db.Scan(ctx, p, p+"\xff", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := make([]string, 0, len(seed))
+	for _, s := range seed {
+		want = append(want, s.key)
+	}
+	if gotKeys := keysOf(got); !equalStrs(gotKeys, want) {
+		t.Fatalf("前缀键应字节序返回 %q, got %q（长度前缀布局/小后继字节截断会在此失败）", want, gotKeys)
+	}
+	byKey := make(map[string]string, len(got))
+	for _, kv := range got {
+		byKey[kv.Key] = string(kv.Value)
+	}
+	for _, s := range seed {
+		if byKey[s.key] != s.val {
+			t.Fatalf("键 %q 的值 = %q, want %q", s.key, byKey[s.key], s.val)
+		}
+	}
+}
 
 // keysOf 把 Scan 结果取成 key 序列，便于整体比较（保序）。
 func keysOf(kvs []core.KeyValue) []string {

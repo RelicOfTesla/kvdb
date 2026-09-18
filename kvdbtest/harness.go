@@ -100,6 +100,7 @@ func RunWithOptions(t *testing.T, opt Options, factory func(t *testing.T) core.K
 	t.Run("NamespacePrefixKeys", func(t *testing.T) { TestNamespacePrefixKeys(t, newDB(t, factory)) })
 	t.Run("EmptyName", func(t *testing.T) { TestEmptyName(t, newDB(t, factory)) })
 	t.Run("ScanBoundaries", func(t *testing.T) { TestScanBoundaries(t, newDB(t, factory)) })
+	t.Run("ScanPrefixKeyOrder", func(t *testing.T) { TestScanPrefixKeyOrder(t, newDB(t, factory)) })
 	t.Run("TTLBoundaries", func(t *testing.T) { TestTTLBoundaries(t, newDB(t, factory)) })
 	t.Run("IncrBoundaries", func(t *testing.T) { TestIncrBoundaries(t, newDB(t, factory)) })
 	t.Run("ZSetRangeBoundaries", func(t *testing.T) { TestZSetRangeBoundaries(t, newDB(t, factory)) })

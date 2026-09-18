@@ -801,22 +801,45 @@ func batchZDel(txn *badgerdb.Txn, name, member string) error {
 	return nil
 }
 
-// lockKeys 按稳定顺序加锁（避免不同批之间的死锁），返回一次性解锁函数。
+// lockKeys 为批内涉及的名称取分片锁，返回一次性解锁函数。
+//
+// 两个要点：
+//   - 名称不同 ≠ 分片不同：两个名字可能哈希到同一分片（例如 "q:q19" 与 "q:q20"
+//     都落在分片 19，"q:q4" 与 "z:z0" 都落在分片 23）。sync.Mutex 不可重入，
+//     对同一把锁二次 Lock 会**自死锁**，故按 mutex 指针去重、同一把锁只加一次；
+//   - 加锁次序必须全局一致：仅按**名字**字典序加锁并不构成锁对象的全序（哈希把
+//     名字序打乱），两个并发批各持一把、再互等对方那把就形成 ABBA 次序环。
+//     因此这里按**分片下标升序**加锁——下标即锁对象的全序，环在结构上不可能
+//     出现（名字序只用于收集，不决定加锁次序）。
+//
+// 参照 poc/kvstore 的 lockBatchNames（按名字序 + 指针去重，解决自死锁）；
+// 这里在同样去重的前提下把次序提升为分片全序，把次序环也一并消除。
 func (p *Provider) lockKeys(keys []string) func() {
-	mu := make([]*sync.Mutex, 0, len(keys))
+	shards := make([]int, 0, len(keys))
 	for _, k := range keys {
-		m := p.keyMutex(k)
+		shards = append(shards, int(keyShard(k)))
+	}
+	sort.Ints(shards)
+	held := make([]*sync.Mutex, 0, len(shards))
+	seen := make(map[*sync.Mutex]bool, len(shards))
+	for _, s := range shards {
+		m := &p.keyMu[s]
+		if seen[m] {
+			continue // 两个不同名字落到同一分片：同一把锁只加一次
+		}
+		seen[m] = true
 		m.Lock()
-		mu = append(mu, m)
+		held = append(held, m)
 	}
 	return func() {
-		for i := len(mu) - 1; i >= 0; i-- {
-			mu[i].Unlock()
+		for i := len(held) - 1; i >= 0; i-- {
+			held[i].Unlock()
 		}
 	}
 }
 
-// sortedKeys 返回稳定顺序，供 lockKeys 按同一次序加锁。
+// sortedKeys 把批内涉及的名称按键序收集成切片（去重由调用方的 map 完成）。
+// 加锁次序由 lockKeys 按**分片下标**决定，这里只保证输入确定性、便于调试。
 func sortedKeys(m map[string]bool) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

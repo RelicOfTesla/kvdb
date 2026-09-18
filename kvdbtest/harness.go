@@ -102,6 +102,9 @@ func RunWithOptions(t *testing.T, opt Options, factory func(t *testing.T) core.K
 	t.Run("TTLBoundaries", func(t *testing.T) { TestTTLBoundaries(t, newDB(t, factory)) })
 	t.Run("IncrBoundaries", func(t *testing.T) { TestIncrBoundaries(t, newDB(t, factory)) })
 	t.Run("ZSetRangeBoundaries", func(t *testing.T) { TestZSetRangeBoundaries(t, newDB(t, factory)) })
+	// 批写锁死锁用例放在最后：它用超时兜底把死锁表现为失败，但真死锁时会泄漏一个
+	// 永久阻塞的 goroutine 并持有该实例的分片锁，放末尾可避免连累前面的子用例。
+	t.Run("BatchManyNamesNoDeadlock", func(t *testing.T) { TestBatchManyNamesNoDeadlock(t, newDB(t, factory)) })
 }
 
 // waitExpired 轮询等待 key 过期（TTL 粒度为秒，不能只 sleep 固定时长：

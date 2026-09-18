@@ -225,11 +225,18 @@ func (p *Provider) Close() error {
 const keyShards = 64
 
 func (p *Provider) keyMutex(key string) *sync.Mutex {
+	return &p.keyMu[keyShard(key)]
+}
+
+// keyShard 是 key → 分片下标 的映射（FNV-1a），与 keyMutex 共用同一份算法：
+// 批写路径需要在下标上排序去重（见 lockKeys），因此把下标算出来单独暴露，
+// 避免两处哈希漂移。
+func keyShard(key string) uint32 {
 	var h uint32 = 2166136261
 	for i := 0; i < len(key); i++ {
 		h = (h ^ uint32(key[i])) * 16777619
 	}
-	return &p.keyMu[h%keyShards]
+	return h % keyShards
 }
 
 // ---- 事务封装 ----

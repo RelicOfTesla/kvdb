@@ -680,10 +680,15 @@ var _ core.BatchComposedProvider = (*Provider)(nil)
 // 合成（Incr/Pop自家的下一跳都基于上一条的结果），批写一次提交时把最终
 // 状态一次性写进同一个 batch，语义与"逐条应用到同一事务"等价。
 //
-// 缓存只覆盖三种复合结构：
+// 缓存只覆盖三类复合结构，外加 KV 侧的"存在性 + TTL"：
 //   - 队列计数器（per 队列名）：qCounters
 //   - zset 成员当前分数（per (zset, member)）与存在性
 //   - zset 成员数（per zset 名）
+//   - KV 键的"存在且未过期"与 TTL 记录（per 用户 key）：kvState
+//
+// KV 一侧同样需要这层覆盖：BatchExpire 的条件语义要求"知道键是否存在"，而
+// LevelDB 的 Batch 只写不读——若逐条 Expire 直接读库，同批内前序 Set 出来的键
+// 会被误判为不存在（批内可见性被破坏），而无条件写 TTL 又会复活过期键。
 type batchState struct {
 	p   *Provider
 	qc  map[string]qCounters // 队列名 -> 最新计数器（出现过才存）
@@ -692,6 +697,7 @@ type batchState struct {
 	zex map[string]bool      // "名\x00成员" -> 是否存在（批内视角）
 	zc  map[string]int64     // zset 名 -> 最新成员数
 	zct map[string]bool      // 批内被修改过的 zset 名
+	kvs map[string]kvState   // 用户 key -> 批内最新 KV 状态
 }
 
 func (p *Provider) newBatchState() *batchState {
@@ -703,6 +709,7 @@ func (p *Provider) newBatchState() *batchState {
 		zex: map[string]bool{},
 		zc:  map[string]int64{},
 		zct: map[string]bool{},
+		kvs: map[string]kvState{},
 	}
 }
 
@@ -773,6 +780,87 @@ func (st *batchState) zCountFinalize(b *gldb.Batch) {
 	}
 }
 
+// kvState 是批内某个用户 key 的 KV 侧状态：是否"存在且未过期"、TTL 记录的存在性
+// 与到期秒。LevelDB 的 Batch 只是写缓冲、提交前读不到，没有这层本地状态就无法在
+// 批内做条件判定——"键是否存在"决定 Expire 是否生效，"是否存在未过期 TTL"决定
+// Set 是否保留 TTL。这与队列/zset 的 batchState 合成是同一个理由（见 batchState
+// 注释），只是 KV 侧此前缺了这一层，导致批内 Expire 只能无条件写 TTL。
+type kvState struct {
+	live   bool  // 按批内视角：存在且未过期
+	hasTTL bool  // 是否存在 TTL 记录（无论是否已过期）
+	exp    int64 // TTL 记录的绝对过期秒（hasTTL 时有效）
+}
+
+// kvStateOf 返回 key 的批内最新 KV 状态：批内已触碰过则用批内值，否则读库并缓存。
+// 整批期间库不会被本批改写（写都在 Batch 缓冲里），故首次读库的缓存是安全的；
+// 之后同批 op 只改缓存，从而实现批内 read-your-writes。
+func (st *batchState) kvStateOf(key string, now int64) (kvState, error) {
+	if s, ok := st.kvs[key]; ok {
+		return s, nil
+	}
+	exp, has, err := st.p.ttlValueOf(key)
+	if err != nil {
+		return kvState{}, err
+	}
+	exists, err := st.p.db.Has(kvKey(key), nil)
+	if err != nil {
+		return kvState{}, fmt.Errorf("leveldb: batch: %w", err)
+	}
+	s := kvState{hasTTL: has, exp: exp, live: exists && !(has && exp <= now)}
+	st.kvs[key] = s
+	return s, nil
+}
+
+// kvSet 合成一次批内 Set：值覆盖；既有**未过期** TTL 保留，已过期的 TTL 记录
+// 按不存在处理并从批内删除（与单条 Set 同口径：写成功必须读得到）。
+func (st *batchState) kvSet(b *gldb.Batch, key string, value []byte, now int64) error {
+	s, err := st.kvStateOf(key, now)
+	if err != nil {
+		return err
+	}
+	b.Put(kvKey(key), value)
+	if s.hasTTL && s.exp <= now {
+		b.Delete(ttlKey(key)) // 过期 TTL 记录不继承
+		s.hasTTL, s.exp = false, 0
+	}
+	s.live = true
+	st.kvs[key] = s
+	return nil
+}
+
+// kvSetEx 合成一次批内 SetEx：值覆盖且 TTL 覆盖（含清掉旧记录的语义）。
+func (st *batchState) kvSetEx(b *gldb.Batch, key string, value []byte, ttl, now int64) {
+	exp := core.AddTTL(now, ttl)
+	b.Put(kvKey(key), value)
+	b.Put(ttlKey(key), be64(uint64(exp)))
+	st.kvs[key] = kvState{live: true, hasTTL: true, exp: exp}
+}
+
+// kvDel 合成一次批内 Del：值与 TTL 记录一并删除（批内此后按"不存在"处理）。
+func (st *batchState) kvDel(b *gldb.Batch, key string) {
+	b.Delete(kvKey(key))
+	b.Delete(ttlKey(key))
+	st.kvs[key] = kvState{}
+}
+
+// kvExpire 合成一次批内 Expire：仅当 key（按批内视角）存在且未过期时才写 TTL。
+// 不存在的键保持 no-op——不得创建 TTL 记录，更不得复活已过期的键（契约：
+// core.KvProvider.Expire 对不存在的 key 不视为错误，且"已过期 = 不存在"）。
+func (st *batchState) kvExpire(b *gldb.Batch, key string, ttl, now int64) error {
+	s, err := st.kvStateOf(key, now)
+	if err != nil {
+		return err
+	}
+	if !s.live {
+		return nil
+	}
+	exp := core.AddTTL(now, ttl)
+	b.Put(ttlKey(key), be64(uint64(exp)))
+	s.hasTTL, s.exp = true, exp
+	st.kvs[key] = s
+	return nil
+}
+
 // ApplyBatch 把整批操作收进**一个** LevelDB Batch 提交：Write 原子，因此
 // 要么全部生效、要么全部不生效。now 在批内采样一次，避免批内 TTL 语义漂移。
 //
@@ -834,20 +922,16 @@ func (p *Provider) ApplyBatch(ctx context.Context, ops []core.BatchOp) error {
 		var err error
 		switch op.Kind {
 		case core.BatchSet:
-			b.Put(kvKey(op.Key), op.Value)
-			if exp, has, herr := p.ttlValueOf(op.Key); herr != nil {
-				return herr
-			} else if has && exp <= now {
-				b.Delete(ttlKey(op.Key))
-			}
+			// 经 batchState 合成：批内前序 SetEx/Expire/Del 的效果对本条可见
+			// （否则"SetEx 后再 Set"会因读到旧的已过期 TTL 而误删新 TTL）。
+			err = st.kvSet(&b, op.Key, op.Value, now)
 		case core.BatchSetEx:
-			b.Put(kvKey(op.Key), op.Value)
-			b.Put(ttlKey(op.Key), be64(uint64(core.AddTTL(now, op.TTL))))
+			st.kvSetEx(&b, op.Key, op.Value, op.TTL, now)
 		case core.BatchDel:
-			b.Delete(kvKey(op.Key))
-			b.Delete(ttlKey(op.Key))
+			st.kvDel(&b, op.Key)
 		case core.BatchExpire:
-			b.Put(ttlKey(op.Key), be64(uint64(core.AddTTL(now, op.TTL))))
+			// 条件式：键不存在/已过期则 no-op，不写 TTL、不复活过期键。
+			err = st.kvExpire(&b, op.Key, op.TTL, now)
 		case core.BatchQPush:
 			err = st.batchQPush(&b, op.Key, op.Value, false)
 		case core.BatchQPushFront:

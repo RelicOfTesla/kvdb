@@ -169,6 +169,118 @@ func TestBatch(t *testing.T, db kvdb.DB) {
 	}
 }
 
+// TestBatchExpireMissing 钉住"批内 Expire 与单条 Expire 同语义"：对**不存在或
+// 已过期**的键，批内 Expire 必须是 no-op——既不得为新键创建 TTL 记录，也不得把
+// 已过期的键复活成"旧值 + 新 TTL"。
+//
+// 契约依据（core.KvProvider.Expire）："key 不存在时不视为错误"，配合本仓库
+// "已过期 = 不存在"的统一语义（见 core/provider.go 与 kvdbtest/ttl.go），
+// 条件式写入才是正确实现。历史上 leveldb / badger 的 ApplyBatch 对 BatchExpire
+// 是**无条件**写 TTL 记录，而 bolt / mem / jsonl / sqlstore / redis / ssdb 是
+// 条件式——同一批 op 在不同基座上语义不同。本用例把这一分歧钉死为跨基座一致。
+//
+// 同时反向钉住"条件式不得破坏批内可见性"：同批先 Set 再 Expire 必须真的设上
+// TTL（此时键在批内已存在），这正是 leveldb 的难点——它的 Batch 只写不读。
+func TestBatchExpireMissing(t *testing.T, db kvdb.DB, opt Options) {
+	ctx := context.Background()
+	if !db.Capabilities().Batch {
+		t.Skip("基座未实现 Batch 能力")
+	}
+
+	// 1) 从未存在过的键：批内 Expire 不得创建 TTL。
+	//    直接读 TTL 未必能暴露"留下了悬挂的 TTL 记录"（部分基座在无值时返回
+	//    ok=false），因此随后单条 Set 该键：若无条件写过 TTL 记录，Set 会把它
+	//    继承下来——"Set 不改变既有 TTL"的契约会让这个凭空 TTL 现形。
+	if err := db.Batch(ctx, func(b *kvdb.Batch) error {
+		b.Expire("bem:absent", 100)
+		return nil
+	}); err != nil {
+		t.Fatalf("对不存在键的批内 Expire 不应报错: %v", err)
+	}
+	if ok, err := db.Exists(ctx, "bem:absent"); err != nil || ok {
+		t.Fatalf("批内 Expire 不得创建键: Exists=%v err=%v", ok, err)
+	}
+	if err := db.Set(ctx, "bem:absent", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if secs, has, err := db.TTL(ctx, "bem:absent"); err != nil || has {
+		t.Fatalf("批内 Expire 在不存在的键上遗留了 TTL 记录（Set 后凭空获得 TTL %d）: has=%v err=%v",
+			secs, has, err)
+	}
+
+	// 2) 同批内 Expire 在前、Set 在后：条件式 Expire 先判"不存在"而 no-op，
+	//    随后 Set 创建的是**无 TTL** 的键（先 Expire 再 Set 不得凭空带 TTL）。
+	if err := db.Batch(ctx, func(b *kvdb.Batch) error {
+		b.Expire("bem:order", 100)
+		b.Set("bem:order", []byte("v"))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok, err := db.Get(ctx, "bem:order"); err != nil || !ok || string(v) != "v" {
+		t.Fatalf("批内 Expire+Set: v=%q ok=%v err=%v", v, ok, err)
+	}
+	if secs, has, err := db.TTL(ctx, "bem:order"); err != nil || has {
+		t.Fatalf("批内先 Expire 不存在的键再 Set，不应有 TTL（%d）: has=%v err=%v", secs, has, err)
+	}
+
+	// 3) 批内 Del 后再 Expire：键已被删除，Expire 必须 no-op。
+	if err := db.Set(ctx, "bem:del", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Batch(ctx, func(b *kvdb.Batch) error {
+		b.Del("bem:del")
+		b.Expire("bem:del", 100)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := db.Exists(ctx, "bem:del"); err != nil || ok {
+		t.Fatalf("批内 Del 后不应复活: Exists=%v err=%v", ok, err)
+	}
+	if err := db.Set(ctx, "bem:del", []byte("v2")); err != nil {
+		t.Fatal(err)
+	}
+	if secs, has, err := db.TTL(ctx, "bem:del"); err != nil || has {
+		t.Fatalf("批内 Del 后的 Expire 不得留下悬挂 TTL（%d）: has=%v err=%v", secs, has, err)
+	}
+
+	// 4) 已过期的键：批内 Expire 不得复活（既不得让旧值重新可读，也不得重建 TTL）。
+	if err := db.SetEx(ctx, "bem:expired", []byte("old"), 1); err != nil {
+		t.Fatal(err)
+	}
+	waitExpired(t, db, opt, "bem:expired")
+	if err := db.Batch(ctx, func(b *kvdb.Batch) error {
+		b.Expire("bem:expired", 100)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok, err := db.Get(ctx, "bem:expired"); err != nil || ok {
+		t.Fatalf("批内 Expire 复活了过期键: v=%q ok=%v err=%v", v, ok, err)
+	}
+	if ok, err := db.Exists(ctx, "bem:expired"); err != nil || ok {
+		t.Fatalf("批内 Expire 复活了过期键(Exists): ok=%v err=%v", ok, err)
+	}
+	if _, has, err := db.TTL(ctx, "bem:expired"); err != nil || has {
+		t.Fatalf("批内 Expire 为过期键重建了 TTL: has=%v err=%v", has, err)
+	}
+
+	// 5) 反向保证：条件式 Expire 不得误伤"批内刚 Set 出来的键"。同批可见性要求
+	//    Expire 看到前序 Set 的效果——这正是条件式改写的难点（leveldb 的
+	//    Batch 只写不读，需要批内覆盖层来判定存在性）。
+	if err := db.Batch(ctx, func(b *kvdb.Batch) error {
+		b.Set("bem:live", []byte("v"))
+		b.Expire("bem:live", 100)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if secs, has, err := db.TTL(ctx, "bem:live"); err != nil || !has || secs <= 0 || secs > 100 {
+		t.Fatalf("批内 Set 后 Expire 应生效（批内可见性被破坏）: %d,%v,%v", secs, has, err)
+	}
+}
+
 // TestBatchComposed 校验"批内组合结果"的跨基座行为：
 //
 //   - 声明 BatchComposed=true 的基座，组合语义必须是**确定**的：

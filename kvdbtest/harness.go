@@ -86,6 +86,7 @@ func RunWithOptions(t *testing.T, opt Options, factory func(t *testing.T) core.K
 	t.Run("ZSet", func(t *testing.T) { TestZSet(t, newDB(t, factory)) })
 	t.Run("Batch", func(t *testing.T) { TestBatch(t, newDB(t, factory)) })
 	t.Run("BatchComposed", func(t *testing.T) { TestBatchComposed(t, newDB(t, factory)) })
+	t.Run("BatchExpireMissing", func(t *testing.T) { TestBatchExpireMissing(t, newDB(t, factory), opt) })
 	t.Run("ExpiredWrites", func(t *testing.T) { TestExpiredWrites(t, newDB(t, factory), opt) })
 	t.Run("ReadOwnership", func(t *testing.T) { TestReadOwnership(t, newDB(t, factory)) })
 	t.Run("NamespaceIndependence", func(t *testing.T) { TestNamespaceIndependence(t, newDB(t, factory)) })

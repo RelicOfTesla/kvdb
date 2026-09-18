@@ -740,6 +740,13 @@ func applyOne(txn *badgerdb.Txn, op core.BatchOp, now int64) error {
 		}
 		return txn.Delete(ttlKey(op.Key))
 	case core.BatchExpire:
+		// 与单条 Expire 同语义：键不存在或已过期时按不存在处理（不复活过期键）。
+		// 读走的是同一个 Update 事务，因此批内前序的 Set/SetEx/Del 对本判定可见
+		// （Badger 事务读己之写），"同批先 Set 再 Expire"因此仍能生效。
+		live, err := kvLive(txn, op.Key, now)
+		if err != nil || !live {
+			return err
+		}
 		return txn.Set(ttlKey(op.Key), be64(uint64(core.AddTTL(now, op.TTL))))
 	case core.BatchQPush:
 		return batchQPush(txn, op.Key, op.Value, false)

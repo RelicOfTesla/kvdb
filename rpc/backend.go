@@ -58,7 +58,17 @@ func openBackend(ctx context.Context, cfg ServerConfig) (core.KvProvider, error)
 // capabilitiesOf 读取基座能力。RPC 层**如实透传**：client 的
 // Capabilities() 必须与"本地直连同一基座"得到的结果一致，
 // 包括 BatchComposed —— RPC 不替底层基座许诺它没有的性质。
+//
+// 优先采信基座自己的 Capabilities()（若实现）：那是它对本体的权威陈述，也是
+// 代理/包装型基座回答能力问题的唯一途径。忽略它会让这类声明在 RPC 边界被
+// **静默退化**成默认值（Queue/ZSet/Batch=false、IncrWraps=false、
+// IncrSyntax=GoParseInt、ZScoreFullInt64=false）——与 858a09c 在
+// adapter.Capabilities 修过的是同一类缺陷，只是低了一层。未实现该方法的
+// 直连基座才走下面的类型断言重建。
 func capabilitiesOf(p core.KvProvider) core.Caps {
+	if c, ok := p.(interface{ Capabilities() core.Caps }); ok {
+		return c.Capabilities()
+	}
 	c := core.Caps{}
 	if _, ok := p.(core.QueueProvider); ok {
 		c.Queue = true

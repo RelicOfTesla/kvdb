@@ -325,16 +325,24 @@ func (p *Provider) Scan(ctx context.Context, start, end string, limit int) ([]co
 	if len(found) > limit {
 		found = found[:limit]
 	}
+	// 成批取值：逐键 GET 会让 Scan(limit=N) 产生 N 次往返（poc/ 在真实 Redis 上
+	// 实测过这一退化；产出逐条正确，语义用例抓不到，故由
+	// TestScanDoesNotPointQueryPerRecord 按命令数钉住）。MGET 一次取一批，往返数
+	// 从 O(N) 降到 O(N/512)；扫描期间被删的键在 MGET 结果里为 nil，照旧跳过。
 	out := make([]core.KeyValue, 0, len(found))
-	for _, k := range found {
-		v, err := p.rd.Get(ctx, p.pfx.kv+k).Result()
-		if errors.Is(err, goredis.Nil) {
-			continue // 扫描期间被删，跳过
-		}
+	for lo := 0; lo < len(found); lo += scanValueBatch {
+		hi := min(lo+scanValueBatch, len(found))
+		vals, err := p.MGet(ctx, found[lo:hi]...)
 		if err != nil {
-			return nil, fmt.Errorf("redis: scan get %s: %w", k, err)
+			return nil, fmt.Errorf("redis: scan: %w", err)
 		}
-		out = append(out, core.KeyValue{Key: k, Value: []byte(v)})
+		for _, k := range found[lo:hi] {
+			v, ok := vals[k]
+			if !ok {
+				continue // 扫描期间被删，跳过
+			}
+			out = append(out, core.KeyValue{Key: k, Value: v})
+		}
 	}
 	return out, nil
 }
@@ -751,6 +759,10 @@ func notInteger(err error) bool {
 
 // ScanCount 是每轮 Redis SCAN 的 COUNT 提示值（服务端仅按它决定单轮工作量）。
 var ScanCount = 256
+
+// scanValueBatch 是 Scan 成批取值时单次 MGET 的键数上限。
+// 只影响往返次数，不影响产出；过大的命令会浪费服务端参数缓冲。
+const scanValueBatch = 512
 
 // normalizeLimit 保证 limit<=0 时使用 core.DefaultScanLimit（统一常量）。
 func normalizeLimit(limit int) int {
